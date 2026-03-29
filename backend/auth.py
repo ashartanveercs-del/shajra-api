@@ -2,7 +2,7 @@
 Shajra System — Authentication Utilities (JWT)
 """
 from datetime import datetime, timedelta, timezone
-from jose import JWTError, jwt
+import jwt
 from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRATION_MINUTES, ADMIN_USERNAME, ADMIN_PASSWORD
 
 
@@ -24,5 +24,5 @@ def decode_access_token(token: str) -> dict | None:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return payload
-    except JWTError:
+    except jwt.InvalidTokenError:
         return None
