@@ -18,7 +18,7 @@ You must:
 3. Standardize locations: extract city and country separately. Use full country names (e.g., "Pakistan" not "PK").
 4. Determine gender from context clues.
 5. Extract contact info (Email and Phone Number) and Profile Picture URL if provided in the input (often trapped in Biography notes).
-6. CRITICAL - RELATIONSHIP MATCHING & COUSIN MARRIAGES: Check if the person might already exist in the database. If this person marries their cousin (a common practice), you MUST accurately identify the exact Existing ID of the cousin as `PossibleSpouseMatch` based on their name. If parents are cousins, you MUST return both their existing IDs as `PossibleFatherMatch` and `PossibleMotherMatch` respectively. Do not merge or confuse duplicate lineages.
+6. CRITICAL - RELATIONSHIP MATCHING & DUAL PARENTS: Every child has a Father AND a Mother. You MUST identify both. Even for cousin marriages, identify both existing record IDs.
 
 Return ONLY valid JSON. It must match these exact fields:
 {
@@ -56,12 +56,14 @@ def get_existing_members_context():
         for m in members:
             name = m.get("FullName", "Unknown")
             father = m.get("FatherName", "")
+            mother = m.get("MotherName", "")
+            spouse = m.get("SpouseName", "")
             rec_id = m.get("id", "")
             gender = m.get("Gender", "")
             city = m.get("CurrentCity", "")
-            lines.append(f"- {name} (ID: {rec_id}, Father: {father}, Gender: {gender}, City: {city})")
+            lines.append(f"- {name} (ID: {rec_id}, Father: {father}, Mother: {mother}, Spouse: {spouse}, Gender: {gender}, City: {city})")
 
-        return "Existing family members (Use these IDs for possible matches):\n" + "\n".join(lines)
+        return "Existing family members (Use these IDs for ALL relationship matches):\n" + "\n".join(lines)
     except Exception as e:
         return f"Could not fetch existing members: {str(e)}"
 

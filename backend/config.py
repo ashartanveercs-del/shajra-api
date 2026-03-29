@@ -4,8 +4,10 @@ Shajra System — Configuration & Environment Variables
 import os
 from dotenv import load_dotenv
 
-# Load from project root .env
-load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+# Load .env only if it exists (local dev). On Vercel, env vars come from dashboard.
+_env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+if os.path.exists(_env_path):
+    load_dotenv(_env_path)
 
 AIRTABLE_PAT = os.getenv("AIRTABLE_PAT")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")

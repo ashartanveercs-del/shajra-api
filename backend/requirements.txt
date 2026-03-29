@@ -5,3 +5,8 @@ groq
 python-dotenv
 pydantic
 requests
+cloudinary
+python-multipart
+python-jose[cryptography]
+passlib
+bcrypt

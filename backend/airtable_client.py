@@ -16,7 +16,24 @@ approved_emails_table = api.table(AIRTABLE_BASE_ID, APPROVED_EMAILS_TABLE)
 
 
 def _flatten(r):
-    return {"id": r["id"], **r["fields"]}
+    fields = r.get("fields", {})
+    # For linked records, Airtable returns a list of IDs.
+    # We flatten these into strings for our internal search/lookup logic.
+    linked_fields = ["FatherRecordId", "MotherRecordId", "SpouseRecordId"]
+    for f in linked_fields:
+        val = fields.get(f)
+        if isinstance(val, list) and len(val) > 0:
+            fields[f] = val[0]
+        elif isinstance(val, list):
+            fields[f] = ""
+
+    # Ensure critical fields have safe defaults
+    res = {"id": r["id"], **fields}
+    if "FullName" not in res: res["FullName"] = "Unknown"
+    if "Gender" not in res: res["Gender"] = "Male"
+    if "IsAlive" not in res: res["IsAlive"] = True
+    
+    return res
 
 
 # ── Approved Members ──────────────────────────────────────────

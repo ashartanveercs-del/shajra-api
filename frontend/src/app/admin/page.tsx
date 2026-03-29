@@ -16,6 +16,8 @@ import {
   adminDeleteApprovedEmail,
   adminFetchSettings,
   adminUpdateSettings,
+  adminUndo,
+  adminHeal,
   type PendingSubmission,
   type Member,
   type ApprovedEmail,
@@ -36,7 +38,9 @@ import {
   Eye,
   Mail,
   Settings,
-  Network
+  Network,
+  Undo2,
+  HeartPulse
 } from "lucide-react";
 
 type Tab = "pending" | "members" | "tree" | "add" | "emails" | "settings";
@@ -195,8 +199,42 @@ export default function AdminPage() {
             )}
           </button>
         ))}
-        <button onClick={loadData} disabled={loading} className="ml-auto text-xs text-text-light hover:text-accent transition-heritage flex-shrink-0 pl-4">
+      <button onClick={loadData} disabled={loading} className="ml-auto text-xs text-text-light hover:text-accent transition-heritage flex-shrink-0 pl-4">
           {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Refresh"}
+        </button>
+      </div>
+
+      {/* Quick Actions Bar */}
+      <div className="flex items-center gap-2 mb-5 flex-wrap">
+        <button
+          onClick={async () => {
+            try {
+              const result = await adminUndo(token!);
+              alert(`✅ ${result.action || "Undone"}`);
+              loadData();
+            } catch (e: any) { alert(e.message); }
+          }}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-text-muted hover:text-accent hover:bg-accent/5 border border-border rounded-lg transition-heritage"
+        >
+          <Undo2 className="w-3.5 h-3.5" />
+          Undo Last Change
+        </button>
+        <button
+          onClick={async () => {
+            try {
+              const result = await adminHeal(token!);
+              if (result.fixes_applied === 0) {
+                alert("✅ Graph is healthy — no fixes needed.");
+              } else {
+                alert(`🔧 Applied ${result.fixes_applied} fix(es):\n\n${result.details.join("\n")}`);
+                loadData();
+              }
+            } catch (e: any) { alert(e.message); }
+          }}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald hover:bg-emerald/5 border border-emerald/20 rounded-lg transition-heritage"
+        >
+          <HeartPulse className="w-3.5 h-3.5" />
+          Heal Graph
         </button>
       </div>
 

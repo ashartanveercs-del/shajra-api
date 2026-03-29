@@ -29,6 +29,10 @@ export interface Member {
   Email?: string;
   PhoneNumber?: string;
   ProfileImageUrl?: string;
+  CardStyle?: string;
+  IsPlaceholder?: boolean;
+  _isSpouseRef?: boolean;
+  Spouse?: Member;
   children?: Member[];
 }
 
@@ -392,5 +396,36 @@ export async function uploadImage(file: File) {
     const error = await res.json();
     throw new Error(error.detail || "Failed to upload image");
   }
+  return res.json();
+}
+
+// ── Admin: Undo / Heal ──────────────────────────────────────────────
+
+export async function adminUndo(token: string) {
+  const res = await fetch(`${API_BASE}/api/admin/undo`, {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Nothing to undo");
+  }
+  return res.json();
+}
+
+export async function adminHeal(token: string) {
+  const res = await fetch(`${API_BASE}/api/admin/heal`, {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error("Failed to run heal");
+  return res.json();
+}
+
+export async function adminGetHistory(token: string) {
+  const res = await fetch(`${API_BASE}/api/admin/history`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) return [];
   return res.json();
 }
