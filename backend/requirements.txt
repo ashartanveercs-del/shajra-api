@@ -7,6 +7,6 @@ pydantic
 requests
 cloudinary
 python-multipart
-python-jose[cryptography]
+python-jose
 passlib
 bcrypt
