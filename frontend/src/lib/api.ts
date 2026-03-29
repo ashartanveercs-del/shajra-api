@@ -1,4 +1,5 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const _raw = process.env.NEXT_PUBLIC_API_URL || "https://shajra-api-production.up.railway.app";
+const API_BASE = _raw.replace(/\/+$/, ""); // strip any trailing slashes
 
 export interface Member {
   id: string;
