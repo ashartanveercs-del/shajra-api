@@ -416,6 +416,14 @@ def get_tree():
     final_roots = []
     processed_root_ids = set()
 
+    # Pre-mark all spouses of dependent members so they never become roots prematurely
+    for m in members:
+        father_id = get_sid(m.get("FatherRecordId"))
+        mother_id = get_sid(m.get("MotherRecordId"))
+        if (father_id and father_id in lookup) or (mother_id and mother_id in lookup):
+            if m.get("Spouse"):
+                processed_root_ids.add(m["Spouse"]["id"])
+
     def sort_key(m):
         gen = m.get("Generation", 99)
         has_parents = 0 if (m.get("FatherRecordId") or m.get("MotherRecordId")) else 1
