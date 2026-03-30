@@ -96,18 +96,17 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
 
         # The parameters exactly as requested
         completion_stream = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=1,
-            max_completion_tokens=8192,
+            temperature=0.3,
+            max_tokens=4096,
             top_p=1,
             stream=True,
             stop=None,
-            timeout=5.0,
-            extra_body={"reasoning_effort": "medium"}  # Injecting via extra_body to avoid schema type errors
+            timeout=30.0,
         )
 
         # Accumulating the stream into a single string
@@ -128,7 +127,7 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
         result = json.loads(response_text)
         return result
 
-    except (json.JSONDecodeError, Exception) as e:
+    except json.JSONDecodeError as e:
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
             "CleanFatherName": raw_data.get("RawFatherName", ""),
@@ -144,14 +143,26 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
             "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI parsing failed: {str(e)}. Using raw data.",
+            "Notes": f"AI JSON parsing failed: {str(e)}. Using raw data.",
             "IsDuplicate": False,
         }
     except Exception as e:
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
+            "CleanFatherName": raw_data.get("RawFatherName", ""),
+            "CleanMotherName": raw_data.get("RawMotherName", ""),
+            "CleanSpouseName": raw_data.get("RawSpouseName", ""),
+            "CleanDOB": raw_data.get("RawDateOfBirth", ""),
+            "CleanDOD": raw_data.get("RawDateOfDeath", ""),
+            "CleanCity": "",
+            "CleanCountry": "",
+            "CleanBurialLocation": raw_data.get("RawBurialLocation", ""),
+            "CleanGender": raw_data.get("RawGender", "Other"),
+            "CleanEmail": raw_data.get("RawEmail", ""),
+            "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
+            "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI service error or timeout: {str(e)}",
+            "Notes": f"AI service error: {str(e)}. Using raw data.",
             "IsDuplicate": False,
         }
 
