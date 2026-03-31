@@ -79,7 +79,7 @@ export default function SubmitPage() {
           <Link href="/tree" className="btn-primary">
             Back to Tree
           </Link>
-          <button onClick={() => { setSuccess(false); setFormData({} as any); }} className="btn-secondary">
+          <button onClick={() => { setSuccess(false); setFormData({ fullName: "", fatherName: "", motherName: "", spouseName: "", dateOfBirth: "", dateOfDeath: "", location: "", burialLocation: "", gender: "", biography: "", email: "", phoneNumber: "", profileImage: "" }); }} className="btn-secondary">
             Submit Another
           </button>
         </div>

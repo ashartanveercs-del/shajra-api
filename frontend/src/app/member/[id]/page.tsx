@@ -339,7 +339,7 @@ export default function MemberProfilePage() {
           ) : (
             <div className="space-y-3 animate-fadeInUp">
               <div className="flex items-center gap-2 bg-emerald-light/30 border border-emerald/20 text-emerald-dark px-3 py-2 rounded-lg text-xs font-medium mb-2">
-                Email verified. You can now post formatting.
+                Email verified. You can now post comments.
               </div>
               <input
                 type="text"
@@ -393,24 +393,39 @@ function RelationLink({ label, member }: { label?: string; member: Member }) {
 
 function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: Album[]; setAlbums: any }) {
   const [showForm, setShowForm] = useState(false);
-  const [url, setUrl] = useState("");
   const [caption, setCaption] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [uploadedUrl, setUploadedUrl] = useState("");
 
-  const handleUpload = async (e: React.FormEvent) => {
+  const handlePhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const { uploadImage } = await import("@/lib/api");
+      const data = await uploadImage(file);
+      setUploadedUrl(data.url);
+    } catch (err: any) {
+      alert(err.message || "Failed to upload image.");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!url) return;
+    if (!uploadedUrl) return;
     setUploading(true);
     try {
       const newAlbum = await uploadAlbumPhoto({
         MemberRecordId: member.id,
         MemberName: member.FullName,
-        ImageUrl: url,
+        ImageUrl: uploadedUrl,
         Caption: caption,
       });
       setAlbums([...albums, newAlbum]);
       setShowForm(false);
-      setUrl("");
+      setUploadedUrl("");
       setCaption("");
     } catch (err: any) {
       alert("Failed to upload: " + err.message);
@@ -431,18 +446,28 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
       </div>
 
       {showForm && (
-        <form onSubmit={handleUpload} className="mb-6 p-4 bg-bg-secondary rounded-xl border border-border">
+        <form onSubmit={handleSubmit} className="mb-6 p-4 bg-bg-secondary rounded-xl border border-border">
           <p className="text-xs text-text-muted mb-4 leading-relaxed">
-            Free Photo Hosting: We recommend using <a href="https://imgbb.com" target="_blank" className="text-accent underline font-semibold">ImgBB</a> to securely host your photos for free. Simply upload your image there and paste the URL here!
+            Select a photo from your device to upload it to the album.
           </p>
           <div className="space-y-3">
-            <div>
-              <input 
-                type="url" required placeholder="Image URL (e.g., https://i.ibb.co/...)" 
-                value={url} onChange={(e) => setUrl(e.target.value)} 
-                className="input-heritage w-full"
-              />
-            </div>
+            {uploadedUrl ? (
+              <div className="flex items-center gap-4 p-3 border border-border rounded-lg bg-bg-primary">
+                <img src={uploadedUrl} alt="Preview" className="w-16 h-16 rounded-lg object-cover" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-text-primary">Photo ready</p>
+                  <button type="button" onClick={() => setUploadedUrl("")} className="text-xs text-terracotta hover:underline">Remove & choose another</button>
+                </div>
+              </div>
+            ) : (
+              <div className="relative">
+                <input type="file" accept="image/*" onChange={handlePhotoSelect} disabled={uploading} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed" />
+                <div className={`w-full px-4 py-3 rounded-lg border border-border bg-bg-primary flex items-center justify-center gap-2 transition-all ${uploading ? 'opacity-50' : 'hover:border-accent hover:text-accent'}`}>
+                  {uploading ? <Loader2 className="w-4 h-4 animate-spin text-accent" /> : <Camera className="w-4 h-4 text-text-muted" />}
+                  <span className="text-sm font-medium text-text-muted">{uploading ? "Uploading..." : "Click to select a photo"}</span>
+                </div>
+              </div>
+            )}
             <div>
               <input 
                 type="text" placeholder="Caption (optional)" 
@@ -450,8 +475,8 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
                 className="input-heritage w-full"
               />
             </div>
-            <button disabled={uploading} className="btn-primary w-full">
-              {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Upload Photo"}
+            <button disabled={uploading || !uploadedUrl} className="btn-primary w-full">
+              {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Add to Album"}
             </button>
           </div>
         </form>

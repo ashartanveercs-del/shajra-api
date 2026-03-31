@@ -974,8 +974,12 @@ def approve_submission(record_id: str, admin=Depends(get_current_admin)):
         "FatherRecordId": pending.get("AIMatchedFatherId", ""),
         "MotherRecordId": pending.get("AIMatchedMotherId", ""),
         "SpouseRecordId": pending.get("AIMatchedSpouseId", ""),
-        "IsAlive": not bool(pending.get("CleanDOD", "")),
     }
+
+    # Determine IsAlive: only mark as dead if CleanDOD contains an actual date-like value
+    clean_dod = (pending.get("CleanDOD", "") or "").strip().lower()
+    has_real_dod = bool(clean_dod) and clean_dod not in ("", "n/a", "unknown", "none", "na", "-")
+    member_fields["IsAlive"] = not has_real_dod
 
     # Remove None items, keep everything else so we can clear Text fields
     member_fields = {k: v for k, v in member_fields.items() if v is not None}
