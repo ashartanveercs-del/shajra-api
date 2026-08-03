@@ -11,6 +11,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
+def _is_missing(value: str | SecretStr | None) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, SecretStr):
+        value = value.get_secret_value()
+    return not value.strip()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
@@ -46,7 +54,7 @@ class Settings(BaseSettings):
                 "JWT_SECRET": self.jwt_secret,
                 "MUTATION_PREVIEW_SECRET": self.mutation_preview_secret,
             }
-            missing = [name for name, value in required.items() if not value]
+            missing = [name for name, value in required.items() if _is_missing(value)]
             if missing:
                 raise ValueError("Missing required settings: " + ", ".join(sorted(missing)))
         return self
