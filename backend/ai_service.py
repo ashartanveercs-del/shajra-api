@@ -73,8 +73,8 @@ def get_existing_members_context():
             lines.append(f"- {name} (ID: {rec_id}, Father: {father}, Mother: {mother}, Spouse: {spouse}, Gender: {gender}, City: {city})")
 
         return "Existing family members (Use these IDs for ALL relationship matches):\n" + "\n".join(lines)
-    except Exception as e:
-        return f"Could not fetch existing members: {str(e)}"
+    except Exception as e:  # noqa: BLE001 - Preserve the v1 external datastore context fallback.
+        return f"Could not fetch existing members: {e!s}"
 
 
 def process_submission(raw_data: dict) -> dict:
@@ -154,10 +154,10 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
             "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI JSON parsing failed: {str(e)}. Using raw data.",
+            "Notes": f"AI JSON parsing failed: {e!s}. Using raw data.",
             "IsDuplicate": False,
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
             "CleanFatherName": raw_data.get("RawFatherName", ""),
@@ -173,7 +173,7 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
             "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI service error: {str(e)}. Using raw data.",
+            "Notes": f"AI service error: {e!s}. Using raw data.",
             "IsDuplicate": False,
         }
 
