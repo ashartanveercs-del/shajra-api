@@ -1,0 +1,138 @@
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+
+const TEST_API_BASE = "http://api.test";
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function loadApi() {
+  vi.stubEnv("NODE_ENV", "test");
+  vi.stubEnv("NEXT_PUBLIC_API_URL", `${TEST_API_BASE}///`);
+  vi.resetModules();
+  return import("./api");
+}
+
+describe("frontend API contracts", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  it("routes a public tree read through the HTTP boundary", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(jsonResponse([{ id: "member-1" }]));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { fetchTree } = await loadApi();
+
+    await expect(fetchTree()).resolves.toEqual([{ id: "member-1" }]);
+    expect(fetchSpy).toHaveBeenCalledWith(`${TEST_API_BASE}/api/tree`, {
+      cache: "no-store",
+    });
+  });
+
+  it("routes an admin read with its bearer token through the HTTP boundary", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(jsonResponse([{ id: "pending-1" }]));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { fetchPending } = await loadApi();
+
+    await expect(fetchPending("admin-token")).resolves.toEqual([{ id: "pending-1" }]);
+    expect(fetchSpy).toHaveBeenCalledWith(`${TEST_API_BASE}/api/admin/pending`, {
+      headers: {
+        Authorization: "Bearer admin-token",
+        "Content-Type": "application/json",
+      },
+    });
+  });
+
+  it("maps adminFetchSettings to read-only integration status", async () => {
+    const integrations = {
+      groqConfigured: true,
+      cloudinaryConfigured: false,
+      coordinationConfigured: false,
+    };
+    const fetchSpy = vi.fn().mockResolvedValue(jsonResponse(integrations));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { adminFetchSettings } = await loadApi();
+
+    await expect(adminFetchSettings("admin-token")).resolves.toEqual(integrations);
+    expect(fetchSpy).toHaveBeenCalledWith(`${TEST_API_BASE}/api/admin/integrations`, {
+      headers: {
+        Authorization: "Bearer admin-token",
+        "Content-Type": "application/json",
+      },
+    });
+  });
+
+  it("rejects adminUpdateSettings locally without issuing a request", async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    const { adminUpdateSettings } = await loadApi();
+
+    await expect(
+      adminUpdateSettings("admin-token", { GROQ_API_KEY: "test-key" }),
+    ).rejects.toMatchObject({
+      status: 410,
+      code: "SETTINGS_UPDATES_REMOVED",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves tolerant read fallbacks after HTTP failures", async () => {
+    const fetchSpy = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(
+          {
+            detail: {
+              code: "SERVICE_UNAVAILABLE",
+              message: "Service unavailable.",
+            },
+          },
+          503,
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = await loadApi();
+
+    await expect(api.searchMembers("Ali")).resolves.toEqual([]);
+    await expect(api.fetchComments("member-1")).resolves.toEqual([]);
+    await expect(api.fetchStories()).resolves.toEqual([]);
+    await expect(api.fetchAlbums()).resolves.toEqual([]);
+    await expect(api.verifyEmail("family@example.com")).resolves.toBe(false);
+    await expect(api.adminGetHistory("admin-token")).resolves.toEqual([]);
+    expect(fetchSpy).toHaveBeenCalledTimes(6);
+  });
+
+  it("models adminHeal as an error-only request", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          detail: {
+            code: "SELF_HEAL_REMOVED",
+            message: "Automatic graph healing has been removed.",
+          },
+        },
+        410,
+      ),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = await loadApi();
+
+    expectTypeOf(api.adminHeal).returns.toEqualTypeOf<Promise<never>>();
+    await expect(api.adminHeal("admin-token")).rejects.toMatchObject({
+      status: 410,
+      code: "SELF_HEAL_REMOVED",
+    });
+    expect(fetchSpy).toHaveBeenCalledWith(`${TEST_API_BASE}/api/admin/heal`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer admin-token",
+        "Content-Type": "application/json",
+      },
+    });
+  });
+});

@@ -222,14 +222,10 @@ export default function AdminPage() {
         <button
           onClick={async () => {
             try {
-              const result = await adminHeal(token!);
-              if (result.fixes_applied === 0) {
-                alert("✅ Graph is healthy — no fixes needed.");
-              } else {
-                alert(`🔧 Applied ${result.fixes_applied} fix(es):\n\n${result.details.join("\n")}`);
-                loadData();
-              }
-            } catch (e: any) { alert(e.message); }
+              await adminHeal(token!);
+            } catch (error: unknown) {
+              alert(error instanceof Error ? error.message : "Failed to run heal");
+            }
           }}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald hover:bg-emerald/5 border border-emerald/20 rounded-lg transition-heritage"
         >

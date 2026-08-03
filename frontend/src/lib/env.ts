@@ -1,6 +1,4 @@
-export function resolveApiBase(
-  env: Record<string, string | undefined> = process.env,
-): string {
+export function resolveApiBase(env: Record<string, string | undefined>): string {
   const configured = env.NEXT_PUBLIC_API_URL?.trim();
   if (configured) return configured.replace(/\/+$/, "");
   if (env.NODE_ENV === "development" || env.NODE_ENV === "test") {
@@ -9,4 +7,7 @@ export function resolveApiBase(
   throw new Error("NEXT_PUBLIC_API_URL is required outside development and test");
 }
 
-export const API_BASE = resolveApiBase();
+export const API_BASE = resolveApiBase({
+  NODE_ENV: process.env.NODE_ENV,
+  NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,
+});

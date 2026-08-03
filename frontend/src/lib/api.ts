@@ -149,11 +149,6 @@ interface AdminUndoResult {
   action?: string;
 }
 
-interface AdminHealResult {
-  fixes_applied: number;
-  details: string[];
-}
-
 // ── Public API ──────────────────────────────────────────────
 
 export function fetchMembers(): Promise<Member[]> {
@@ -378,8 +373,8 @@ export function adminUndo(token: string): Promise<AdminUndoResult> {
   });
 }
 
-export function adminHeal(token: string): Promise<AdminHealResult> {
-  return requestJson<AdminHealResult>("/api/admin/heal", {
+export function adminHeal(token: string): Promise<never> {
+  return requestJson<never>("/api/admin/heal", {
     method: "POST",
     headers: authHeaders(token),
   });
