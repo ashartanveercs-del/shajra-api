@@ -1,12 +1,19 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr, ValidationError
+import pydantic_settings
 
-from config import Settings
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from config import Settings  # noqa: E402
 
 
 VALID_RUNTIME_SETTINGS = {
@@ -28,7 +35,6 @@ REQUIRED_SETTINGS = (
 )
 
 COMPATIBILITY_ENV = {
-    "SYSTEMROOT": os.environ["SYSTEMROOT"],
     "APP_ENV": "test",
     "AIRTABLE_PAT": "synthetic-airtable-pat",
     "AIRTABLE_BASE_ID": "app-synthetic",
@@ -44,9 +50,11 @@ COMPATIBILITY_ENV = {
     "PUBLIC_WRITES_ENABLED": "false",
     "RELATIONSHIP_WRITES_ENABLED": "false",
     "NORMALIZED_READS_ENABLED": "false",
+    "PYTHONPATH": str(Path(pydantic_settings.__file__).resolve().parent.parent),
 }
 
-WORKTREE_PYTHON = Path(__file__).resolve().parents[2] / ".venv" / "Scripts" / "python.exe"
+if "SYSTEMROOT" in os.environ:
+    COMPATIBILITY_ENV["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
 
 
 def test_production_rejects_missing_secrets():
@@ -140,10 +148,10 @@ print(json.dumps({
 }))
 """
     result = subprocess.run(
-        [str(WORKTREE_PYTHON), "-c", script],
+        [sys.executable, "-c", script],
         check=True,
         capture_output=True,
-        cwd=os.getcwd(),
+        cwd=BACKEND_DIR,
         env=COMPATIBILITY_ENV,
         text=True,
     )
