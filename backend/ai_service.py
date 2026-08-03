@@ -3,12 +3,21 @@ Shajra System — AI Processing Service
 Parses raw form submissions into clean, structured data and matches relationships.
 """
 import json
-from groq import Groq
+
 import airtable_client as db
-from settings_manager import get_groq_api_key
+from config import get_settings
+from fastapi import HTTPException
+from groq import Groq
+
 
 def get_client() -> Groq:
-    return Groq(api_key=get_groq_api_key())
+    groq_api_key = get_settings().groq_api_key
+    if groq_api_key is None or not groq_api_key.get_secret_value().strip():
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "AI_NOT_CONFIGURED", "message": "AI processing is not configured."},
+        )
+    return Groq(api_key=groq_api_key.get_secret_value())
 
 SYSTEM_PROMPT = """You are a family genealogy data processing assistant. Your job is to take raw, unstructured form submissions about family members and return clean, standardized JSON.
 
@@ -127,6 +136,8 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
         result = json.loads(response_text)
         return result
 
+    except HTTPException:
+        raise
     except json.JSONDecodeError as e:
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
