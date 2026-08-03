@@ -66,3 +66,26 @@ def test_ai_fallback_notes_do_not_expose_external_exception_text(monkeypatch):
 
     assert result["Notes"] == "AI processing failed. Using raw data."
     assert synthetic_exception not in result["Notes"]
+
+
+def test_ai_client_constructor_failure_falls_back_before_database_access(monkeypatch):
+    ai_service = importlib.import_module("ai_service")
+    synthetic_exception = "synthetic-client-constructor-detail"
+    calls = 0
+
+    def failing_client_constructor():
+        raise RuntimeError(synthetic_exception)
+
+    def record_database_access():
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(ai_service, "get_client", failing_client_constructor)
+    monkeypatch.setattr(ai_service.db, "get_all_members", record_database_access)
+
+    result = ai_service.process_submission({"RawFullName": "Test Person"})
+
+    assert result["Notes"] == "AI processing failed. Using raw data."
+    assert synthetic_exception not in result["Notes"]
+    assert calls == 0

@@ -77,8 +77,35 @@ def get_existing_members_context():
         return "Existing member context is temporarily unavailable."
 
 
+def _raw_submission_fallback(raw_data: dict, notes: str) -> dict:
+    return {
+        "CleanFullName": raw_data.get("RawFullName", ""),
+        "CleanFatherName": raw_data.get("RawFatherName", ""),
+        "CleanMotherName": raw_data.get("RawMotherName", ""),
+        "CleanSpouseName": raw_data.get("RawSpouseName", ""),
+        "CleanDOB": raw_data.get("RawDateOfBirth", ""),
+        "CleanDOD": raw_data.get("RawDateOfDeath", ""),
+        "CleanCity": "",
+        "CleanCountry": "",
+        "CleanBurialLocation": raw_data.get("RawBurialLocation", ""),
+        "CleanGender": raw_data.get("RawGender", "Other"),
+        "CleanEmail": raw_data.get("RawEmail", ""),
+        "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
+        "CleanProfileImage": raw_data.get("RawProfileImage", ""),
+        "Confidence": 0.0,
+        "Notes": notes,
+        "IsDuplicate": False,
+    }
+
+
 def process_submission(raw_data: dict) -> dict:
-    client = get_client()
+    try:
+        client = get_client()
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
+        return _raw_submission_fallback(raw_data, "AI processing failed. Using raw data.")
+
     existing_context = get_existing_members_context()
 
     user_message = f"""Here is a raw family member submission:
@@ -157,24 +184,7 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "IsDuplicate": False,
         }
     except Exception:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
-        return {
-            "CleanFullName": raw_data.get("RawFullName", ""),
-            "CleanFatherName": raw_data.get("RawFatherName", ""),
-            "CleanMotherName": raw_data.get("RawMotherName", ""),
-            "CleanSpouseName": raw_data.get("RawSpouseName", ""),
-            "CleanDOB": raw_data.get("RawDateOfBirth", ""),
-            "CleanDOD": raw_data.get("RawDateOfDeath", ""),
-            "CleanCity": "",
-            "CleanCountry": "",
-            "CleanBurialLocation": raw_data.get("RawBurialLocation", ""),
-            "CleanGender": raw_data.get("RawGender", "Other"),
-            "CleanEmail": raw_data.get("RawEmail", ""),
-            "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
-            "CleanProfileImage": raw_data.get("RawProfileImage", ""),
-            "Confidence": 0.0,
-            "Notes": "AI processing failed. Using raw data.",
-            "IsDuplicate": False,
-        }
+        return _raw_submission_fallback(raw_data, "AI processing failed. Using raw data.")
 
 
 def process_and_store_submission(raw_data: dict) -> dict:
