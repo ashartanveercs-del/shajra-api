@@ -1,5 +1,4 @@
-const _raw = process.env.NEXT_PUBLIC_API_URL || "https://shajra-api-production.up.railway.app";
-const API_BASE = _raw.replace(/\/+$/, ""); // strip any trailing slashes
+import { ApiProblem, requestJson } from "./http";
 
 export interface Member {
   id: string;
@@ -142,122 +141,104 @@ export interface MapData {
   arcs: MapArc[];
 }
 
+export interface ImageUpload {
+  url: string;
+}
+
+interface AdminUndoResult {
+  action?: string;
+}
+
+interface AdminHealResult {
+  fixes_applied: number;
+  details: string[];
+}
+
 // ── Public API ──────────────────────────────────────────────
 
-export async function fetchMembers(): Promise<Member[]> {
-  const res = await fetch(`${API_BASE}/api/members`, { cache: "no-store" });
-  if (!res.ok) throw new Error("Failed to fetch members");
-  return res.json();
+export function fetchMembers(): Promise<Member[]> {
+  return requestJson<Member[]>("/api/members", { cache: "no-store" });
 }
 
-export async function fetchMember(id: string): Promise<Member> {
-  const res = await fetch(`${API_BASE}/api/members/${id}`, { cache: "no-store" });
-  if (!res.ok) throw new Error("Member not found");
-  return res.json();
+export function fetchMember(id: string): Promise<Member> {
+  return requestJson<Member>(`/api/members/${id}`, { cache: "no-store" });
 }
 
-export async function fetchTree(): Promise<Member[]> {
-  const res = await fetch(`${API_BASE}/api/tree`, { cache: "no-store" });
-  if (!res.ok) throw new Error("Failed to fetch tree");
-  return res.json();
+export function fetchTree(): Promise<Member[]> {
+  return requestJson<Member[]>("/api/tree", { cache: "no-store" });
 }
 
-export async function fetchMapMarkers(): Promise<MapData> {
-  const res = await fetch(`${API_BASE}/api/map-markers`, { cache: "no-store" });
-  if (!res.ok) throw new Error("Failed to fetch map data");
-  return res.json();
+export function fetchMapMarkers(): Promise<MapData> {
+  return requestJson<MapData>("/api/map-markers", { cache: "no-store" });
 }
 
-export async function searchMembers(query: string): Promise<Member[]> {
-  const res = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(query)}`, { cache: "no-store" });
-  if (!res.ok) return [];
-  return res.json();
+export function searchMembers(query: string): Promise<Member[]> {
+  return requestJson<Member[]>(`/api/search?q=${encodeURIComponent(query)}`, {
+    cache: "no-store",
+  }).catch(() => []);
 }
 
 // ── Comments API ────────────────────────────────────────────
 
-export async function fetchComments(memberId: string): Promise<Comment[]> {
-  const res = await fetch(`${API_BASE}/api/comments/${memberId}`, { cache: "no-store" });
-  if (!res.ok) return [];
-  return res.json();
+export function fetchComments(memberId: string): Promise<Comment[]> {
+  return requestJson<Comment[]>(`/api/comments/${memberId}`, { cache: "no-store" }).catch(
+    () => [],
+  );
 }
 
-export async function postComment(data: Partial<Comment>): Promise<Comment> {
-  const res = await fetch(`${API_BASE}/api/comments`, {
+export function postComment(data: Partial<Comment>): Promise<Comment> {
+  return requestJson<Comment>("/api/comments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || "Failed to post comment");
-  }
-  return res.json();
 }
 
-export async function verifyEmail(email: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/api/verify-email?email=${encodeURIComponent(email)}`, { cache: "no-store" });
-    if (!res.ok) return false;
-    const data = await res.json();
-    return data.approved === true;
-  } catch {
-    return false;
-  }
+export function verifyEmail(email: string): Promise<boolean> {
+  return requestJson<{ approved?: boolean }>(
+    `/api/verify-email?email=${encodeURIComponent(email)}`,
+    { cache: "no-store" },
+  )
+    .then((data) => data.approved === true)
+    .catch(() => false);
 }
 
 // ── Stories & Albums API ────────────────────────────────────
 
-export async function fetchStories(memberId?: string): Promise<Story[]> {
-  const url = memberId ? `${API_BASE}/api/stories/member/${memberId}` : `${API_BASE}/api/stories`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) return [];
-  return res.json();
+export function fetchStories(memberId?: string): Promise<Story[]> {
+  const path = memberId ? `/api/stories/member/${memberId}` : "/api/stories";
+  return requestJson<Story[]>(path, { cache: "no-store" }).catch(() => []);
 }
 
-export async function postStory(data: Partial<Story>): Promise<Story> {
-  const res = await fetch(`${API_BASE}/api/stories`, {
+export function postStory(data: Partial<Story>): Promise<Story> {
+  return requestJson<Story>("/api/stories", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || "Failed to post story");
-  }
-  return res.json();
 }
 
-export async function fetchAlbums(memberId?: string): Promise<Album[]> {
-  const url = memberId ? `${API_BASE}/api/albums/member/${memberId}` : `${API_BASE}/api/albums`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) return [];
-  return res.json();
+export function fetchAlbums(memberId?: string): Promise<Album[]> {
+  const path = memberId ? `/api/albums/member/${memberId}` : "/api/albums";
+  return requestJson<Album[]>(path, { cache: "no-store" }).catch(() => []);
 }
 
-export async function uploadAlbumPhoto(data: Partial<Album>): Promise<Album> {
-  const res = await fetch(`${API_BASE}/api/albums`, {
+export function uploadAlbumPhoto(data: Partial<Album>): Promise<Album> {
+  return requestJson<Album>("/api/albums", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error("Failed to upload photo");
-  return res.json();
 }
 
 // ── Form Submission API ─────────────────────────────────────
 
-export async function submitDirectForm(data: any): Promise<any> {
-  const res = await fetch(`${API_BASE}/api/submit`, {
+export function submitDirectForm(data: unknown): Promise<unknown> {
+  return requestJson<unknown>("/api/submit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || "Form submission failed");
-  }
-  return res.json();
 }
 
 // ── Admin API ───────────────────────────────────────────────
@@ -270,163 +251,142 @@ function authHeaders(token: string) {
 }
 
 export async function adminLogin(username: string, password: string): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/admin/login`, {
+  const data = await requestJson<{ access_token: string }>("/api/admin/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   });
-  if (!res.ok) throw new Error("Invalid credentials");
-  const data = await res.json();
   return data.access_token;
 }
 
-export async function fetchPending(token: string): Promise<PendingSubmission[]> {
-  const res = await fetch(`${API_BASE}/api/admin/pending`, {
+export function fetchPending(token: string): Promise<PendingSubmission[]> {
+  return requestJson<PendingSubmission[]>("/api/admin/pending", {
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to fetch pending");
-  return res.json();
 }
 
-export async function approveSubmission(token: string, recordId: string) {
-  const res = await fetch(`${API_BASE}/api/admin/approve/${recordId}`, {
+export function approveSubmission(token: string, recordId: string): Promise<unknown> {
+  return requestJson<unknown>(`/api/admin/approve/${recordId}`, {
     method: "POST",
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to approve");
-  return res.json();
 }
 
-export async function rejectSubmission(token: string, recordId: string) {
-  const res = await fetch(`${API_BASE}/api/admin/reject/${recordId}`, {
+export function rejectSubmission(token: string, recordId: string): Promise<unknown> {
+  return requestJson<unknown>(`/api/admin/reject/${recordId}`, {
     method: "POST",
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to reject");
-  return res.json();
 }
 
-export async function adminCreateMember(token: string, fields: Partial<Member>) {
-  const res = await fetch(`${API_BASE}/api/admin/members`, {
+export function adminCreateMember(token: string, fields: Partial<Member>): Promise<Member> {
+  return requestJson<Member>("/api/admin/members", {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(fields),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Failed to create member");
-  }
-  return res.json();
 }
 
-export async function adminUpdateMember(token: string, recordId: string, fields: Partial<Member>) {
-  const res = await fetch(`${API_BASE}/api/admin/members/${recordId}`, {
+export function adminUpdateMember(
+  token: string,
+  recordId: string,
+  fields: Partial<Member>,
+): Promise<Member> {
+  return requestJson<Member>(`/api/admin/members/${recordId}`, {
     method: "PUT",
     headers: authHeaders(token),
     body: JSON.stringify(fields),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Failed to update member");
-  }
-  return res.json();
 }
 
-export async function adminDeleteMember(token: string, recordId: string) {
-  const res = await fetch(`${API_BASE}/api/admin/members/${recordId}`, {
+export function adminDeleteMember(token: string, recordId: string): Promise<unknown> {
+  return requestJson<unknown>(`/api/admin/members/${recordId}`, {
     method: "DELETE",
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to delete member");
-  return res.json();
 }
 
-export async function adminFetchApprovedEmails(token: string): Promise<ApprovedEmail[]> {
-  const res = await fetch(`${API_BASE}/api/admin/approved-emails`, {
+export function adminFetchApprovedEmails(token: string): Promise<ApprovedEmail[]> {
+  return requestJson<ApprovedEmail[]>("/api/admin/approved-emails", {
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to fetch emails");
-  return res.json();
 }
 
-export async function adminAddApprovedEmail(token: string, email: string, name: string = "", notes: string = "") {
-  const res = await fetch(`${API_BASE}/api/admin/approved-emails`, {
+export function adminAddApprovedEmail(
+  token: string,
+  email: string,
+  name: string = "",
+  notes: string = "",
+): Promise<ApprovedEmail> {
+  return requestJson<ApprovedEmail>("/api/admin/approved-emails", {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify({ Email: email, Name: name, Notes: notes }),
   });
-  if (!res.ok) throw new Error("Failed to add email");
-  return res.json();
 }
 
-export async function adminDeleteApprovedEmail(token: string, recordId: string) {
-  const res = await fetch(`${API_BASE}/api/admin/approved-emails/${recordId}`, {
+export function adminDeleteApprovedEmail(token: string, recordId: string): Promise<unknown> {
+  return requestJson<unknown>(`/api/admin/approved-emails/${recordId}`, {
     method: "DELETE",
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to delete email");
-  return res.json();
 }
 
-export async function adminFetchSettings(token: string) {
-  const res = await fetch(`${API_BASE}/api/admin/settings`, {
+export interface AdminIntegrations {
+  groqConfigured: boolean;
+  cloudinaryConfigured: boolean;
+  coordinationConfigured: boolean;
+  GROQ_API_KEY?: never;
+}
+
+export function adminFetchSettings(token: string): Promise<AdminIntegrations> {
+  return requestJson<AdminIntegrations>("/api/admin/integrations", {
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to fetch settings");
-  return res.json();
 }
 
-export async function adminUpdateSettings(token: string, settings: { GROQ_API_KEY: string }) {
-  const res = await fetch(`${API_BASE}/api/admin/settings`, {
-    method: "POST",
-    headers: authHeaders(token),
-    body: JSON.stringify(settings),
-  });
-  if (!res.ok) throw new Error("Failed to update settings");
-  return res.json();
+export function adminUpdateSettings(
+  token: string,
+  settings: { GROQ_API_KEY: string },
+): Promise<never> {
+  void token;
+  void settings;
+  return Promise.reject(
+    new ApiProblem(
+      410,
+      "SETTINGS_UPDATES_REMOVED",
+      "Integration credentials can no longer be updated from the frontend.",
+    ),
+  );
 }
 
-export async function uploadImage(file: File) {
+export function uploadImage(file: File): Promise<ImageUpload> {
   const formData = new FormData();
   formData.append("file", file);
-  const res = await fetch(`${API_BASE}/api/upload-image`, {
+  return requestJson<ImageUpload>("/api/upload-image", {
     method: "POST",
     body: formData,
   });
-  if (!res.ok) {
-    const error = await res.json();
-    throw new Error(error.detail || "Failed to upload image");
-  }
-  return res.json();
 }
 
 // ── Admin: Undo / Heal ──────────────────────────────────────────────
 
-export async function adminUndo(token: string) {
-  const res = await fetch(`${API_BASE}/api/admin/undo`, {
+export function adminUndo(token: string): Promise<AdminUndoResult> {
+  return requestJson<AdminUndoResult>("/api/admin/undo", {
     method: "POST",
     headers: authHeaders(token),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Nothing to undo");
-  }
-  return res.json();
 }
 
-export async function adminHeal(token: string) {
-  const res = await fetch(`${API_BASE}/api/admin/heal`, {
+export function adminHeal(token: string): Promise<AdminHealResult> {
+  return requestJson<AdminHealResult>("/api/admin/heal", {
     method: "POST",
     headers: authHeaders(token),
   });
-  if (!res.ok) throw new Error("Failed to run heal");
-  return res.json();
 }
 
-export async function adminGetHistory(token: string) {
-  const res = await fetch(`${API_BASE}/api/admin/history`, {
+export function adminGetHistory(token: string): Promise<unknown[]> {
+  return requestJson<unknown[]>("/api/admin/history", {
     headers: authHeaders(token),
-  });
-  if (!res.ok) return [];
-  return res.json();
+  }).catch(() => []);
 }
