@@ -9,3 +9,4 @@ cloudinary
 python-multipart
 PyJWT
 gunicorn
+pydantic-settings==2.14.2
