@@ -1,0 +1,12 @@
+[lint]
+select = ["E9", "F", "B", "BLE", "RUF"]
+ignore = ["B008"]
+
+[lint.per-file-ignores]
+# Legacy external adapters and one-off diagnostics preserve their v1 fallback behavior.
+"backend/airtable_client.py" = ["BLE001"]
+"backend/create_ashar.py" = ["BLE001"]
+"backend/debug_error.py" = ["BLE001"]
+"backend/seed_tree.py" = ["BLE001"]
+"backend/test.py" = ["BLE001"]
+"backend/test_flow.py" = ["BLE001"]

@@ -73,11 +73,12 @@ def get_existing_members_context():
             lines.append(f"- {name} (ID: {rec_id}, Father: {father}, Mother: {mother}, Spouse: {spouse}, Gender: {gender}, City: {city})")
 
         return "Existing family members (Use these IDs for ALL relationship matches):\n" + "\n".join(lines)
-    except Exception as e:  # noqa: BLE001 - Preserve the v1 external datastore context fallback.
-        return f"Could not fetch existing members: {e!s}"
+    except Exception:  # noqa: BLE001 - Preserve the v1 external datastore context fallback.
+        return "Existing member context is temporarily unavailable."
 
 
 def process_submission(raw_data: dict) -> dict:
+    client = get_client()
     existing_context = get_existing_members_context()
 
     user_message = f"""Here is a raw family member submission:
@@ -101,8 +102,6 @@ Biography/Notes: {raw_data.get('RawBiography', '')}
 Please clean and standardize this data, handle cousin linkages properly, and suggest relationship matches. Return ONLY valid JSON."""
 
     try:
-        client = get_client()
-
         # The parameters exactly as requested
         completion_stream = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -138,7 +137,7 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
 
     except HTTPException:
         raise
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError:
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
             "CleanFatherName": raw_data.get("RawFatherName", ""),
@@ -154,10 +153,10 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
             "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI JSON parsing failed: {e!s}. Using raw data.",
+            "Notes": "AI response could not be parsed. Using raw data.",
             "IsDuplicate": False,
         }
-    except Exception as e:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
+    except Exception:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
             "CleanFatherName": raw_data.get("RawFatherName", ""),
@@ -173,7 +172,7 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
             "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI service error: {e!s}. Using raw data.",
+            "Notes": "AI processing failed. Using raw data.",
             "IsDuplicate": False,
         }
 

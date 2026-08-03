@@ -1,5 +1,4 @@
 import urllib.request
-import time
 
 print("Testing GET /api/tree...")
 try:

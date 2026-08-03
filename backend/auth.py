@@ -24,7 +24,12 @@ def verify_admin(username: str, password: str) -> bool:
     settings = get_settings()
     configured_username = settings.admin_username
     configured_password = settings.admin_password_hash
-    if configured_username is None or configured_password is None:
+    if (
+        configured_username is None
+        or not configured_username.strip()
+        or configured_password is None
+        or not configured_password.get_secret_value().strip()
+    ):
         return False
     return hmac.compare_digest(username, configured_username) and hmac.compare_digest(
         password, configured_password.get_secret_value()

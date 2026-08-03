@@ -83,7 +83,7 @@ def search_tree(nodes, name):
     for n in nodes:
         if n.get("FullName") == name:
             return True
-        if "children" in n and n["children"]:
+        if n.get("children"):
             if search_tree(n["children"], name):
                 return True
     return False

@@ -357,7 +357,6 @@ def get_tree():
         m[id_field] = fake_id
 
     for m in members:
-        f_id = get_sid(m.get("FatherRecordId"))
         mo_id = get_sid(m.get("MotherRecordId"))
         # Resolve father (pass mother as other parent for cross-check)
         find_or_create_parent(m, "FatherName", "FatherRecordId", "Male", mo_id)
@@ -736,7 +735,10 @@ async def direct_submit(payload: DirectSubmission, _=Depends(require_public_writ
             "pendingId": result.get("id"),
         }
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error in PendingSubmissions: {e.response.text}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Airtable Schema Error in PendingSubmissions: {e.response.text}",
+        ) from e
 
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...), _=Depends(require_public_writes)):
@@ -752,7 +754,7 @@ async def upload_image(file: UploadFile = File(...), _=Depends(require_public_wr
         res = cloudinary.uploader.upload(file_content, folder="shajra_system")
         return {"url": res.get("secure_url")}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cloudinary Upload Failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Cloudinary upload failed.") from e
 
 
 # ══════════════════════════════════════════════════════════════
@@ -786,7 +788,7 @@ def _snapshot_member(record_id: str) -> dict | None:
     """Take a snapshot of a member before mutation."""
     try:
         return db.get_member_by_id(record_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - Preserve the v1 missing-member snapshot fallback.
         return None
 
 
@@ -896,7 +898,7 @@ def admin_create_member(
         _push_history("create", new_member["id"], None, new_member)
         return new_member
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}")
+        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}") from e
 
 @app.put("/api/admin/members/{record_id}")
 def admin_update_member(
@@ -913,7 +915,7 @@ def admin_update_member(
         _push_history("update", record_id, before, result)
         return result
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}")
+        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}") from e
 
 
 @app.delete("/api/admin/members/{record_id}")
@@ -977,7 +979,7 @@ def undo_last_change(
     except Exception as e:
         # Put entry back if undo failed
         _change_history.append(entry)
-        raise HTTPException(status_code=500, detail=f"Undo failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Undo failed.") from e
 
 
 # ── Manual Heal Endpoint ──────────────────────────────────────────────

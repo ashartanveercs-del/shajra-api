@@ -13,7 +13,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from config import Settings  # noqa: E402
+from config import Settings
 
 
 VALID_RUNTIME_SETTINGS = {
