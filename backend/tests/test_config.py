@@ -1,7 +1,11 @@
+import json
+import os
+import subprocess
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
-import config
 from config import Settings
 
 
@@ -22,6 +26,27 @@ REQUIRED_SETTINGS = (
     "jwt_secret",
     "mutation_preview_secret",
 )
+
+COMPATIBILITY_ENV = {
+    "SYSTEMROOT": os.environ["SYSTEMROOT"],
+    "APP_ENV": "test",
+    "AIRTABLE_PAT": "synthetic-airtable-pat",
+    "AIRTABLE_BASE_ID": "app-synthetic",
+    "GROQ_API_KEY": "synthetic-groq-key",
+    "CLOUDINARY_URL": "synthetic-cloudinary-url",
+    "ADMIN_USERNAME": "synthetic-admin",
+    "ADMIN_PASSWORD_HASH": "synthetic-password-hash",
+    "JWT_SECRET": "synthetic-jwt-secret",
+    "MUTATION_PREVIEW_SECRET": "synthetic-mutation-preview-secret",
+    "JWT_ISSUER": "synthetic-issuer",
+    "JWT_AUDIENCE": "synthetic-audience",
+    "CORS_ALLOWED_ORIGINS": "https://synthetic.example",
+    "PUBLIC_WRITES_ENABLED": "false",
+    "RELATIONSHIP_WRITES_ENABLED": "false",
+    "NORMALIZED_READS_ENABLED": "false",
+}
+
+WORKTREE_PYTHON = Path(__file__).resolve().parents[2] / ".venv" / "Scripts" / "python.exe"
 
 
 def test_production_rejects_missing_secrets():
@@ -74,31 +99,61 @@ def test_allowed_origins_trims_and_drops_empty_values():
 
 
 def test_legacy_compatibility_exports_supply_current_v1_runtime_values():
-    assert config.AIRTABLE_PAT == "test-token"
-    assert config.AIRTABLE_BASE_ID == "app-test"
-    assert config.GROQ_API_KEY is None
-    assert config.ADMIN_USERNAME == "admin-test"
-    assert config.ADMIN_PASSWORD == "test-only-hash"
-    assert config.JWT_SECRET == "test-secret-at-least-32-characters-long"
-    assert config.JWT_ALGORITHM == "HS256"
-    assert config.JWT_EXPIRATION_MINUTES == 60 * 24
-    assert config.APPROVED_MEMBERS_TABLE == "ApprovedMembers"
-    assert config.PENDING_SUBMISSIONS_TABLE == "PendingSubmissions"
-    assert config.APPROVED_EMAILS_TABLE == "ApprovedEmails"
-    assert config.ALBUMS_TABLE == "Albums"
-    assert config.PHOTOS_TABLE == "Photos"
+    script = """
+import json
+import config
 
-    assert all(
-        isinstance(value, str)
-        for value in (
-            config.AIRTABLE_PAT,
-            config.AIRTABLE_BASE_ID,
-            config.ADMIN_USERNAME,
-            config.ADMIN_PASSWORD,
-            config.JWT_SECRET,
-        )
+expected_values = {
+    "AIRTABLE_PAT": "synthetic-airtable-pat",
+    "AIRTABLE_BASE_ID": "app-synthetic",
+    "GROQ_API_KEY": "synthetic-groq-key",
+    "ADMIN_USERNAME": "synthetic-admin",
+    "ADMIN_PASSWORD": "synthetic-password-hash",
+    "JWT_SECRET": "synthetic-jwt-secret",
+    "JWT_ALGORITHM": "HS256",
+    "JWT_EXPIRATION_MINUTES": 60 * 24,
+    "APPROVED_MEMBERS_TABLE": "ApprovedMembers",
+    "PENDING_SUBMISSIONS_TABLE": "PendingSubmissions",
+    "APPROVED_EMAILS_TABLE": "ApprovedEmails",
+    "ALBUMS_TABLE": "Albums",
+    "PHOTOS_TABLE": "Photos",
+}
+string_exports = (
+    "AIRTABLE_PAT",
+    "AIRTABLE_BASE_ID",
+    "GROQ_API_KEY",
+    "ADMIN_USERNAME",
+    "ADMIN_PASSWORD",
+    "JWT_SECRET",
+    "JWT_ALGORITHM",
+    "APPROVED_MEMBERS_TABLE",
+    "PENDING_SUBMISSIONS_TABLE",
+    "APPROVED_EMAILS_TABLE",
+    "ALBUMS_TABLE",
+    "PHOTOS_TABLE",
+)
+
+print(json.dumps({
+    "values_match": all(getattr(config, name) == value for name, value in expected_values.items()),
+    "string_exports": all(isinstance(getattr(config, name), str) for name in string_exports),
+    "expiration_is_int": isinstance(config.JWT_EXPIRATION_MINUTES, int),
+}))
+"""
+    result = subprocess.run(
+        [str(WORKTREE_PYTHON), "-c", script],
+        check=True,
+        capture_output=True,
+        cwd=os.getcwd(),
+        env=COMPATIBILITY_ENV,
+        text=True,
     )
+    exports = json.loads(result.stdout)
 
+    assert exports == {
+        "values_match": True,
+        "string_exports": True,
+        "expiration_is_int": True,
+    }
 
 def test_test_environment_defaults_all_writes_off():
     settings = Settings(
