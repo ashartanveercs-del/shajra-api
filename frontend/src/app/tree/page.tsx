@@ -150,13 +150,18 @@ export default function TreePage() {
   const [treeState, setTreeState] = useState<Loadable<Member[]>>({ status: "loading" });
   const treeRequest = useRef(0);
   const suggestionTrigger = useRef<HTMLButtonElement | null>(null);
+  const dialogSession = useRef(0);
+  const dialogMemberId = useRef<string | null>(null);
+  const successTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [editingMember, setEditingMember] = useState<Member | null>(null);
   const [suggestForm, setSuggestForm] = useState<SuggestionForm>(EMPTY_SUGGESTION);
   const [submitting, setSubmitting] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [selectedPhotoFile, setSelectedPhotoFile] = useState<File | null>(null);
   const [showSuccess, setShowSuccess] = useState(false);
   const [suggestionProblem, setSuggestionProblem] = useState<string | null>(null);
+  const [uploadProblem, setUploadProblem] = useState<string | null>(null);
 
   const loadTree = useCallback(() => {
     const request = ++treeRequest.current;
@@ -182,6 +187,17 @@ export default function TreePage() {
     };
   }, [loadTree]);
 
+  useEffect(
+    () => () => {
+      dialogSession.current += 1;
+      dialogMemberId.current = null;
+      if (successTimer.current !== null) {
+        clearTimeout(successTimer.current);
+      }
+    },
+    [],
+  );
+
   const retryTree = () => {
     setTreeState({ status: "loading" });
     loadTree();
@@ -189,46 +205,116 @@ export default function TreePage() {
 
   const tree = "data" in treeState ? treeState.data : [];
 
-  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploadingImage(true);
-    setSuggestionProblem(null);
-    try {
-      const data = await uploadImage(file);
-      setSuggestForm((current) => ({ ...current, profileImage: data.url }));
-    } catch (error: unknown) {
-      setSuggestionProblem(
-        asApiProblem(error, "The photo could not be uploaded. Please try again.").message,
-      );
-    } finally {
-      setUploadingImage(false);
+  const clearSuccessTimer = () => {
+    if (successTimer.current !== null) {
+      clearTimeout(successTimer.current);
+      successTimer.current = null;
     }
   };
 
+  const isActiveDialog = (session: number, memberId: string) =>
+    dialogSession.current === session && dialogMemberId.current === memberId;
+
+  const uploadSuggestionPhoto = async (file: File) => {
+    if (!editingMember) return;
+    const session = dialogSession.current;
+    const memberId = editingMember.id;
+    setUploadingImage(true);
+    setUploadProblem(null);
+    try {
+      const data = await uploadImage(file);
+      if (!isActiveDialog(session, memberId)) return;
+      setSuggestForm((current) => ({ ...current, profileImage: data.url }));
+    } catch (error: unknown) {
+      if (!isActiveDialog(session, memberId)) return;
+      setUploadProblem(
+        asApiProblem(error, "The photo could not be uploaded. Please try again.").message,
+      );
+    } finally {
+      if (isActiveDialog(session, memberId)) {
+        setUploadingImage(false);
+      }
+    }
+  };
+
+  const handlePhotoUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setSelectedPhotoFile(file);
+    event.target.value = "";
+    void uploadSuggestionPhoto(file);
+  };
+
   const handleSubmitSuggestion = async () => {
+    if (!editingMember) return;
+    const session = dialogSession.current;
+    const memberId = editingMember.id;
     setSubmitting(true);
     setSuggestionProblem(null);
     try {
       await submitDirectForm(suggestForm);
+      if (!isActiveDialog(session, memberId)) return;
       setShowSuccess(true);
-      setTimeout(() => {
+      clearSuccessTimer();
+      successTimer.current = setTimeout(() => {
+        if (!isActiveDialog(session, memberId)) return;
+        dialogSession.current += 1;
+        dialogMemberId.current = null;
+        successTimer.current = null;
         setShowSuccess(false);
         setEditingMember(null);
       }, 3000);
     } catch (error: unknown) {
+      if (!isActiveDialog(session, memberId)) return;
       setSuggestionProblem(
         asApiProblem(error, "The suggestion could not be submitted. Please try again.")
           .message,
       );
     } finally {
-      setSubmitting(false);
+      if (isActiveDialog(session, memberId)) {
+        setSubmitting(false);
+      }
     }
   };
 
   const closeSuggestion = () => {
+    dialogSession.current += 1;
+    dialogMemberId.current = null;
+    clearSuccessTimer();
     setEditingMember(null);
+    setShowSuccess(false);
+    setSuggestionProblem(null);
+    setUploadProblem(null);
+    setSelectedPhotoFile(null);
+    setSubmitting(false);
+    setUploadingImage(false);
     suggestionTrigger.current?.focus();
+  };
+
+  const openSuggestion = (member: Member, trigger: HTMLButtonElement) => {
+    dialogSession.current += 1;
+    dialogMemberId.current = member.id;
+    clearSuccessTimer();
+    suggestionTrigger.current = trigger;
+    setEditingMember(member);
+    setShowSuccess(false);
+    setSuggestionProblem(null);
+    setUploadProblem(null);
+    setSelectedPhotoFile(null);
+    setSubmitting(false);
+    setUploadingImage(false);
+    setSuggestForm({
+      fullName: member.FullName || "",
+      fatherName: member.FatherName || "",
+      motherName: member.MotherName || "",
+      spouseName: member.SpouseName || "",
+      dateOfBirth: member.DateOfBirth || "",
+      dateOfDeath: member.DateOfDeath || "",
+      location: member.CurrentCity || "",
+      biography: member.Biography || "",
+      gender: member.Gender || "Male",
+      profileImage: member.ProfileImageUrl || "",
+    });
   };
 
   return (
@@ -335,22 +421,7 @@ export default function TreePage() {
                         <FamilyTreeNode
                           key={root.id}
                           member={root}
-                          onSuggestEdit={(m, trigger) => {
-                            suggestionTrigger.current = trigger;
-                            setEditingMember(m);
-                            setSuggestForm({
-                              fullName: m.FullName || "",
-                              fatherName: m.FatherName || "",
-                              motherName: m.MotherName || "",
-                              spouseName: m.SpouseName || "",
-                              dateOfBirth: m.DateOfBirth || "",
-                              dateOfDeath: m.DateOfDeath || "",
-                              location: m.CurrentCity || "",
-                              biography: m.Biography || "",
-                              gender: m.Gender || "Male",
-                              profileImage: m.ProfileImageUrl || "",
-                            });
-                          }}
+                          onSuggestEdit={openSuggestion}
                         />
                       ))}
                     </ul>
@@ -382,9 +453,9 @@ export default function TreePage() {
                 </div>
               ) : (
                 <>
-                  {suggestionProblem && (
+                  {(suggestionProblem || uploadProblem) && (
                     <div role="alert" className="rounded-lg border border-terracotta-light bg-terracotta-light/30 p-3 text-sm text-terracotta">
-                      {suggestionProblem}
+                      {uploadProblem ?? suggestionProblem}
                     </div>
                   )}
                   <div className="bg-sky/5 p-4 rounded-lg border border-sky/20 mb-4 text-xs text-sky-900 leading-relaxed italic">
@@ -429,7 +500,17 @@ export default function TreePage() {
                       {suggestForm.profileImage ? (
                         <div className="flex items-center gap-4 p-3 border border-border rounded-lg bg-bg-primary">
                           <div role="img" aria-label="Profile preview" className="h-12 w-12 rounded-full bg-cover bg-center" style={{ backgroundImage: `url(${suggestForm.profileImage})` }} />
-                          <button type="button" onClick={() => setSuggestForm({ ...suggestForm, profileImage: "" })} className="text-xs text-terracotta hover:underline">Remove</button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSuggestForm({ ...suggestForm, profileImage: "" });
+                              setSelectedPhotoFile(null);
+                              setUploadProblem(null);
+                            }}
+                            className="text-xs text-terracotta hover:underline"
+                          >
+                            Remove
+                          </button>
                         </div>
                       ) : (
                         <div className="relative">
@@ -438,6 +519,16 @@ export default function TreePage() {
                             {uploadingImage ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
                             <span className="text-sm font-medium text-text-muted">Upload Photo</span>
                           </div>
+                          {selectedPhotoFile && uploadProblem && (
+                            <button
+                              type="button"
+                              onClick={() => void uploadSuggestionPhoto(selectedPhotoFile)}
+                              disabled={uploadingImage}
+                              className="btn-secondary mt-2 w-full"
+                            >
+                              Retry Upload
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>

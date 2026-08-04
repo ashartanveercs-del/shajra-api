@@ -67,14 +67,15 @@ export default function MapPage() {
     });
   }, []);
 
-  const mapData = "data" in mapState ? mapState.data : { markers: [], arcs: [] };
-  const markers = mapData.markers;
+  const hasMapData = mapState.status === "ready" || mapState.status === "empty";
+  const mapData = hasMapData ? mapState.data : null;
+  const markers = mapData?.markers ?? [];
   const filteredMarkers =
     filter === "all" ? markers : markers.filter((m) => m.type === filter);
 
   const filteredData = {
     markers: filteredMarkers,
-    arcs: filter === "all" ? mapData.arcs : [], // Only show arcs on "all"
+    arcs: filter === "all" ? mapData?.arcs ?? [] : [], // Only show arcs on "all"
   };
 
   const residenceCount = markers.filter((m) => m.type === "residence").length;
@@ -122,9 +123,15 @@ export default function MapPage() {
       {/* Filter */}
       <div className="flex items-center gap-2 mb-5">
         {[
-          { key: "all", label: `All (${markers.length})` },
-          { key: "residence", label: `Residences (${residenceCount})` },
-          { key: "burial", label: `Burial Sites (${burialCount})` },
+          { key: "all", label: hasMapData ? `All (${markers.length})` : "All" },
+          {
+            key: "residence",
+            label: hasMapData ? `Residences (${residenceCount})` : "Residences",
+          },
+          {
+            key: "burial",
+            label: hasMapData ? `Burial Sites (${burialCount})` : "Burial Sites",
+          },
         ].map((tab) => (
           <button
             type="button"
@@ -143,7 +150,7 @@ export default function MapPage() {
       </div>
 
       {/* Map */}
-      <div className="rendering-wrapper relative h-[62vh] min-h-[28rem] overflow-hidden rounded-lg border border-border bg-bg-card shadow-card">
+      <div className="rendering-wrapper relative h-[62vh] min-h-[18rem] overflow-hidden rounded-lg border border-border bg-bg-card shadow-card sm:min-h-[28rem]">
         {mapState.status === "loading" ||
         ((mapState.status === "ready" || mapState.status === "empty") &&
           !is3D &&

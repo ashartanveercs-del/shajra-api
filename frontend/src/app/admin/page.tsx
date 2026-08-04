@@ -116,6 +116,19 @@ function dashboardStateFrom(results: Awaited<ReturnType<typeof fetchDashboard>>)
     : { status: "ready", data };
 }
 
+function dashboardStateFor(data: DashboardData, problem?: ReturnType<typeof asApiProblem>): Loadable<DashboardData> {
+  if (data.unavailable.size > 0) {
+    return {
+      status: "partial",
+      data,
+      problem: problem ?? asApiProblem(undefined, "Some admin data could not be loaded."),
+    };
+  }
+  return data.pending.length === 0 && data.members.length === 0 && data.emails.length === 0
+    ? { status: "empty", data }
+    : { status: "ready", data };
+}
+
 export default function AdminPage() {
   const [token, setToken] = useState<string | null>(() =>
     typeof window === "undefined" ? null : localStorage.getItem("shajra_admin_token"),
@@ -129,94 +142,204 @@ export default function AdminPage() {
     status: "loading",
   });
   const [refreshing, setRefreshing] = useState(false);
+  const [retryingSections, setRetryingSections] = useState<Set<DashboardSection>>(new Set());
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const dashboardRequest = useRef(0);
+  const sessionEpoch = useRef(0);
+  const activeToken = useRef(token);
+  const loginRequest = useRef(0);
+  const loginInFlight = useRef(false);
+  const retryingSectionsRef = useRef<Set<DashboardSection>>(new Set());
+
+  const sessionIsCurrent = useCallback((epoch: number, expectedToken: string) => (
+    sessionEpoch.current === epoch && activeToken.current === expectedToken
+  ), []);
+
+  const resetPendingState = useCallback(() => {
+    retryingSectionsRef.current = new Set();
+    setRetryingSections(new Set());
+    setRefreshing(false);
+    setActionLoading(null);
+    setActionError(null);
+  }, []);
 
   const handleLogin = async () => {
+    if (loginInFlight.current) return;
+    loginInFlight.current = true;
+    const request = ++loginRequest.current;
+    const epoch = sessionEpoch.current;
     setLoginLoading(true);
     setLoginError("");
     try {
       const t = await adminLogin(username, password);
+      if (request !== loginRequest.current || epoch !== sessionEpoch.current) return;
+      sessionEpoch.current += 1;
+      dashboardRequest.current += 1;
+      activeToken.current = t;
+      resetPendingState();
       setDashboardState({ status: "loading" });
       setToken(t);
       localStorage.setItem("shajra_admin_token", t);
     } catch {
+      if (request !== loginRequest.current || epoch !== sessionEpoch.current) return;
       setLoginError("Invalid username or password");
     } finally {
-      setLoginLoading(false);
+      if (request === loginRequest.current) {
+        loginInFlight.current = false;
+        setLoginLoading(false);
+      }
     }
   };
 
   const handleLogout = () => {
+    sessionEpoch.current += 1;
+    dashboardRequest.current += 1;
+    loginRequest.current += 1;
+    loginInFlight.current = false;
+    activeToken.current = null;
+    resetPendingState();
+    setLoginLoading(false);
+    setDashboardState({ status: "loading" });
     setToken(null);
     localStorage.removeItem("shajra_admin_token");
   };
 
   const loadData = useCallback(async (block = false) => {
-    if (!token) return;
+    if (!token || activeToken.current !== token) return;
+    const epoch = sessionEpoch.current;
     const request = ++dashboardRequest.current;
     if (block) setDashboardState({ status: "loading" });
     setRefreshing(true);
     try {
       const results = await fetchDashboard(token);
-      if (request !== dashboardRequest.current) return;
+      if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
       setDashboardState(dashboardStateFrom(results));
     } finally {
-      if (request === dashboardRequest.current) setRefreshing(false);
+      if (request === dashboardRequest.current && sessionIsCurrent(epoch, token)) setRefreshing(false);
     }
-  }, [token]);
+  }, [sessionIsCurrent, token]);
+
+  const retrySection = useCallback(async (section: DashboardSection) => {
+    if (!token || activeToken.current !== token || retryingSectionsRef.current.has(section)) return;
+    const epoch = sessionEpoch.current;
+    const request = ++dashboardRequest.current;
+    retryingSectionsRef.current = new Set(retryingSectionsRef.current).add(section);
+    setRetryingSections(new Set(retryingSectionsRef.current));
+
+    try {
+      let applyResult: (data: DashboardData) => DashboardData;
+      if (section === "pending") {
+        const pending = await fetchPending(token);
+        applyResult = (data) => ({ ...data, pending });
+      } else if (section === "members") {
+        const members = await fetchMembers();
+        applyResult = (data) => ({ ...data, members });
+      } else {
+        const emails = await adminFetchApprovedEmails(token);
+        applyResult = (data) => ({ ...data, emails });
+      }
+      if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
+      setDashboardState((current) => {
+        const retained = "data" in current ? current.data : EMPTY_DASHBOARD;
+        const unavailable = new Set(retained.unavailable);
+        unavailable.delete(section);
+        return dashboardStateFor(applyResult({ ...retained, unavailable }));
+      });
+    } catch (error: unknown) {
+      if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
+      setDashboardState((current) => {
+        const retained = "data" in current ? current.data : EMPTY_DASHBOARD;
+        const unavailable = new Set(retained.unavailable).add(section);
+        return dashboardStateFor(
+          { ...retained, unavailable },
+          asApiProblem(error, "This admin section could not be loaded."),
+        );
+      });
+    } finally {
+      if (request === dashboardRequest.current && sessionIsCurrent(epoch, token)) {
+        const next = new Set(retryingSectionsRef.current);
+        next.delete(section);
+        retryingSectionsRef.current = next;
+        setRetryingSections(new Set(next));
+      }
+    }
+  }, [sessionIsCurrent, token]);
 
   useEffect(() => {
-    if (!token) return;
+    if (!token || activeToken.current !== token) return;
+    const epoch = sessionEpoch.current;
     const request = ++dashboardRequest.current;
     fetchDashboard(token).then((results) => {
-      if (request !== dashboardRequest.current) return;
+      if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
       setDashboardState(dashboardStateFrom(results));
     });
     return () => {
       dashboardRequest.current += 1;
     };
-  }, [token]);
+  }, [sessionIsCurrent, token]);
 
   const handleApprove = async (id: string) => {
     if (!token) return;
+    const epoch = sessionEpoch.current;
     setActionLoading(id);
     setActionError(null);
-    try { await approveSubmission(token, id); await loadData(); }
-    catch (error: unknown) { setActionError(asApiProblem(error, "The submission could not be approved.").message); }
-    finally { setActionLoading(null); }
+    try {
+      await approveSubmission(token, id);
+      if (!sessionIsCurrent(epoch, token)) return;
+      await loadData();
+    } catch (error: unknown) {
+      if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The submission could not be approved.").message);
+    } finally {
+      if (sessionIsCurrent(epoch, token)) setActionLoading(null);
+    }
   };
 
   const handleReject = async (id: string) => {
     if (!token) return;
+    const epoch = sessionEpoch.current;
     setActionLoading(id);
     setActionError(null);
-    try { await rejectSubmission(token, id); await loadData(); }
-    catch (error: unknown) { setActionError(asApiProblem(error, "The submission could not be rejected.").message); }
-    finally { setActionLoading(null); }
+    try {
+      await rejectSubmission(token, id);
+      if (!sessionIsCurrent(epoch, token)) return;
+      await loadData();
+    } catch (error: unknown) {
+      if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The submission could not be rejected.").message);
+    } finally {
+      if (sessionIsCurrent(epoch, token)) setActionLoading(null);
+    }
   };
 
   const handleDelete = async (id: string) => {
     if (!token || !confirm("Delete this member permanently?")) return;
+    const epoch = sessionEpoch.current;
     setActionLoading(id);
     setActionError(null);
-    try { await adminDeleteMember(token, id); await loadData(); }
-    catch (error: unknown) { setActionError(asApiProblem(error, "The member could not be deleted.").message); }
-    finally { setActionLoading(null); }
+    try {
+      await adminDeleteMember(token, id);
+      if (!sessionIsCurrent(epoch, token)) return;
+      await loadData();
+    } catch (error: unknown) {
+      if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The member could not be deleted.").message);
+    } finally {
+      if (sessionIsCurrent(epoch, token)) setActionLoading(null);
+    }
   };
 
   const handleUndo = async () => {
     if (!token) return;
+    const epoch = sessionEpoch.current;
     setActionLoading("undo");
     setActionError(null);
     try {
       await adminUndo(token);
+      if (!sessionIsCurrent(epoch, token)) return;
       await loadData();
     } catch (error: unknown) {
-      setActionError(asApiProblem(error, "The last change could not be undone.").message);
+      if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The last change could not be undone.").message);
     } finally {
-      setActionLoading(null);
+      if (sessionIsCurrent(epoch, token)) setActionLoading(null);
     }
   };
 
@@ -346,11 +469,11 @@ export default function AdminPage() {
 
       {dashboardState.status !== "loading" && dashboardState.status !== "error" && (
         <>
-          {tab === "pending" && (unavailable.has("pending") ? <AdminSectionUnavailable title="Submissions unavailable" onRetry={() => loadData()} /> : <PendingTab submissions={pendingOnly} actionLoading={actionLoading} onApprove={handleApprove} onReject={handleReject} />)}
-          {tab === "members" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" onRetry={() => loadData()} /> : <MembersTab members={members} actionLoading={actionLoading} onDelete={handleDelete} />)}
+          {tab === "pending" && (unavailable.has("pending") ? <AdminSectionUnavailable title="Submissions unavailable" pending={retryingSections.has("pending")} onRetry={() => void retrySection("pending")} /> : <PendingTab submissions={pendingOnly} actionLoading={actionLoading} onApprove={handleApprove} onReject={handleReject} />)}
+          {tab === "members" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" pending={retryingSections.has("members")} onRetry={() => void retrySection("members")} /> : <MembersTab members={members} actionLoading={actionLoading} onDelete={handleDelete} />)}
           {tab === "tree" && <AdminTreeEditor token={token} onUpdated={() => loadData()} />}
-          {tab === "add" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" onRetry={() => loadData()} /> : <AddMemberTab token={token} onCreated={() => loadData()} members={members} />)}
-          {tab === "emails" && (unavailable.has("emails") ? <AdminSectionUnavailable title="Approved emails unavailable" onRetry={() => loadData()} /> : <EmailsTab emails={emails} token={token} onUpdated={() => loadData()} />)}
+          {tab === "add" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" pending={retryingSections.has("members")} onRetry={() => void retrySection("members")} /> : <AddMemberTab token={token} onCreated={() => loadData()} members={members} />)}
+          {tab === "emails" && (unavailable.has("emails") ? <AdminSectionUnavailable title="Approved emails unavailable" pending={retryingSections.has("emails")} onRetry={() => void retrySection("emails")} /> : <EmailsTab emails={emails} token={token} onUpdated={() => loadData()} />)}
           {tab === "integrations" && <IntegrationsTab token={token} />}
         </>
       )}
@@ -358,8 +481,20 @@ export default function AdminPage() {
   );
 }
 
-function AdminSectionUnavailable({ title, onRetry }: { title: string; onRetry: () => void }) {
-  return <AsyncState state="error" title={title} message="This section could not be loaded." actionLabel="Retry" onAction={onRetry} />;
+function AdminSectionUnavailable({ title, pending, onRetry }: { title: string; pending: boolean; onRetry: () => void }) {
+  return (
+    <div role="alert" className="flex min-h-[11rem] w-full flex-col items-center justify-center px-5 py-8 text-center">
+      <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-lg bg-bg-secondary text-text-light">
+        <AlertTriangle aria-hidden="true" className="h-5 w-5" />
+      </div>
+      <h2 className="font-serif text-xl font-semibold text-text-primary">{title}</h2>
+      <p className="mt-2 max-w-md text-sm leading-relaxed text-text-muted">This section could not be loaded.</p>
+      <button type="button" onClick={onRetry} disabled={pending} className="btn-secondary mt-5 min-h-10 px-4">
+        {pending && <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />}
+        Retry
+      </button>
+    </div>
+  );
 }
 
 function EmailsTab({ emails, token, onUpdated }: { emails: ApprovedEmail[]; token: string; onUpdated: () => void }) {
@@ -570,8 +705,22 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const successTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearSuccess = useCallback(() => {
+    if (successTimer.current !== null) {
+      clearTimeout(successTimer.current);
+      successTimer.current = null;
+    }
+    setSuccess(false);
+  }, []);
+
+  useEffect(() => () => {
+    if (successTimer.current !== null) clearTimeout(successTimer.current);
+  }, []);
 
   const handleSubmit = async () => {
+    clearSuccess();
     if (!form.FullName.trim()) {
       setFormError("Full Name is required.");
       return;
@@ -587,7 +736,10 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
       setSuccess(true);
       setForm({ FullName: "", FatherName: "", MotherName: "", SpouseName: "", DateOfBirth: "", DateOfDeath: "", CurrentCity: "", CurrentCountry: "", BurialLocation: "", Biography: "", Gender: "", Generation: "", Branch: "", FatherRecordId: "", MotherRecordId: "", SpouseRecordId: "", IsAlive: true });
       onCreated();
-      setTimeout(() => setSuccess(false), 3000);
+      successTimer.current = setTimeout(() => {
+        successTimer.current = null;
+        setSuccess(false);
+      }, 3000);
     } catch (error: unknown) {
       setFormError(asApiProblem(error, "The member could not be added.").message);
     } finally {
@@ -611,7 +763,7 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
         </div>
       )}
 
-      <div className="grid sm:grid-cols-2 gap-4">
+      <div className="grid sm:grid-cols-2 gap-4" onChangeCapture={clearSuccess}>
         <div><label htmlFor="admin-member-name" className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Full Name *</label><input id="admin-member-name" type="text" value={form.FullName} onChange={(e) => setForm({ ...form, FullName: e.target.value })} className="input-heritage" placeholder="Muhammad Ali Khan" /></div>
         <div><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Gender</label><select value={form.Gender} onChange={(e) => setForm({ ...form, Gender: e.target.value })} className="input-heritage"><option value="">Select</option><option value="Male">Male</option><option value="Female">Female</option><option value="Other">Other</option></select></div>
         <div><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Father Name</label><input type="text" value={form.FatherName} onChange={(e) => setForm({ ...form, FatherName: e.target.value })} className="input-heritage" placeholder="Father's name" /></div>
@@ -628,7 +780,7 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
         <div className="flex items-end pb-1"><label className="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" checked={form.IsAlive} onChange={(e) => setForm({ ...form, IsAlive: e.target.checked })} className="w-4 h-4 accent-[#8b6f47]" /> Is Alive</label></div>
       </div>
 
-      <div className="mt-4"><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Biography</label><textarea value={form.Biography} onChange={(e) => setForm({ ...form, Biography: e.target.value })} rows={3} className="input-heritage" placeholder="Notes about this family member..." /></div>
+      <div className="mt-4" onChangeCapture={clearSuccess}><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Biography</label><textarea value={form.Biography} onChange={(e) => setForm({ ...form, Biography: e.target.value })} rows={3} className="input-heritage" placeholder="Notes about this family member..." /></div>
 
       <button type="button" aria-label="Create member record" onClick={handleSubmit} disabled={saving} className="btn-primary mt-6">
         {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}

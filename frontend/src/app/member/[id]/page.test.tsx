@@ -24,6 +24,14 @@ import MemberProfilePage from "./page";
 
 const member = { id: "member-1", FullName: "Ali Khan", Biography: "Family historian" };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
 describe("MemberProfilePage load states", () => {
   beforeEach(() => {
     Object.values(apiMocks).forEach((mock) => mock.mockReset());
@@ -95,6 +103,133 @@ describe("MemberProfilePage load states", () => {
     expect(screen.queryByRole("heading", { name: "Ali Khan" })).not.toBeInTheDocument();
   });
 
+  it("immediately hides the old profile while a new member route is pending", async () => {
+    const secondMember = deferred<typeof member>();
+    apiMocks.fetchMember
+      .mockResolvedValueOnce(member)
+      .mockImplementationOnce(() => secondMember.promise);
+
+    const view = render(<MemberProfilePage />);
+    expect(await screen.findByRole("heading", { name: "Ali Khan" })).toBeInTheDocument();
+
+    navigationMocks.id = "member-2";
+    view.rerender(<MemberProfilePage />);
+
+    expect(screen.getByText("Loading member profile")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Ali Khan" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Photo" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      secondMember.resolve({ ...member, id: "member-2", FullName: "Sara Khan" });
+    });
+    expect(await screen.findByRole("heading", { name: "Sara Khan" })).toBeInTheDocument();
+  });
+
+  it("does not carry an album draft to a different member", async () => {
+    apiMocks.fetchMember
+      .mockResolvedValueOnce(member)
+      .mockResolvedValueOnce({ ...member, id: "member-2", FullName: "Sara Khan" });
+    const user = userEvent.setup();
+
+    const view = render(<MemberProfilePage />);
+    await screen.findByRole("heading", { name: "Ali Khan" });
+    await user.click(screen.getByRole("button", { name: "Add Photo" }));
+    await user.type(screen.getByLabelText("Photo caption"), "Ali's family gathering");
+
+    navigationMocks.id = "member-2";
+    view.rerender(<MemberProfilePage />);
+
+    await screen.findByRole("heading", { name: "Sara Khan" });
+    await user.click(screen.getByRole("button", { name: "Add Photo" }));
+    expect(screen.getByLabelText("Photo caption")).toHaveValue("");
+  });
+
+  it("retries comments locally while retaining an uploaded album draft", async () => {
+    apiMocks.fetchMember.mockResolvedValue(member);
+    apiMocks.fetchComments
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "raw comments detail"))
+      .mockResolvedValueOnce([
+        {
+          id: "comment-1",
+          CommentText: "A remembered story",
+          AuthorName: "Ayesha",
+          MemberRecordId: "member-1",
+        },
+      ]);
+    apiMocks.uploadImage.mockResolvedValue({ url: "https://images.example/family.jpg" });
+    const user = userEvent.setup();
+
+    render(<MemberProfilePage />);
+    await screen.findByRole("heading", { name: "Ali Khan" });
+    await user.click(screen.getByRole("button", { name: "Add Photo" }));
+    await user.upload(
+      screen.getByLabelText("Choose album photo"),
+      new File(["photo"], "family.jpg", { type: "image/jpeg" }),
+    );
+    await user.type(screen.getByLabelText("Photo caption"), "Family gathering");
+
+    await user.click(screen.getByRole("button", { name: "Retry comments" }));
+
+    expect(await screen.findByText("A remembered story")).toBeInTheDocument();
+    expect(screen.getByLabelText("Photo caption")).toHaveValue("Family gathering");
+    expect(screen.getByText("Photo ready")).toBeInTheDocument();
+    expect(apiMocks.fetchMember).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchComments).toHaveBeenCalledTimes(2);
+    expect(apiMocks.fetchAlbums).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries relationship and album reads through only their owned GETs", async () => {
+    apiMocks.fetchMember.mockResolvedValue(member);
+    apiMocks.fetchMembers
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "raw relationships detail"))
+      .mockResolvedValueOnce([]);
+    apiMocks.fetchAlbums
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "raw albums detail"))
+      .mockResolvedValueOnce([]);
+    const user = userEvent.setup();
+
+    render(<MemberProfilePage />);
+    await screen.findByRole("heading", { name: "Ali Khan" });
+
+    await user.click(screen.getByRole("button", { name: "Retry relationships" }));
+    await waitFor(() => {
+      expect(screen.queryByText("Relationships unavailable")).not.toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "Retry albums" }));
+    await waitFor(() => {
+      expect(screen.queryByText("Albums unavailable")).not.toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("heading", { name: "Ali Khan" })).toBeInTheDocument();
+    expect(apiMocks.fetchMember).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(2);
+    expect(apiMocks.fetchComments).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchAlbums).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not verify an edited email from an older deferred response", async () => {
+    const verification = deferred<boolean>();
+    apiMocks.fetchMember.mockResolvedValue(member);
+    apiMocks.verifyEmail.mockImplementation(() => verification.promise);
+    const user = userEvent.setup();
+
+    render(<MemberProfilePage />);
+    await screen.findByRole("heading", { name: "Ali Khan" });
+    const emailInput = screen.getByLabelText("Family email");
+    await user.type(emailInput, "First@Example.com");
+    await user.click(screen.getByRole("button", { name: "Verify" }));
+    await user.clear(emailInput);
+    await user.type(emailInput, "second@example.com");
+
+    await act(async () => {
+      verification.resolve(true);
+    });
+
+    expect(screen.queryByText("Email verified. You can now post comments.")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Family email")).toHaveValue("second@example.com");
+  });
+
   it("keeps comment fields after a safe inline posting failure", async () => {
     apiMocks.fetchMember.mockResolvedValue(member);
     apiMocks.verifyEmail.mockResolvedValue(true);
@@ -148,6 +283,31 @@ describe("MemberProfilePage load states", () => {
     expect(screen.getByText("Photo ready")).toBeInTheDocument();
     expect(alertSpy).not.toHaveBeenCalled();
     alertSpy.mockRestore();
+  });
+
+  it("retries a failed album upload with the same selected file", async () => {
+    apiMocks.fetchMember.mockResolvedValue(member);
+    apiMocks.uploadImage
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "raw upload detail"))
+      .mockResolvedValueOnce({ url: "https://images.example/family.jpg" });
+    const user = userEvent.setup();
+    const file = new File(["photo"], "family.jpg", { type: "image/jpeg" });
+
+    render(<MemberProfilePage />);
+    await screen.findByRole("heading", { name: "Ali Khan" });
+    await user.click(screen.getByRole("button", { name: "Add Photo" }));
+    await user.type(screen.getByLabelText("Photo caption"), "Family gathering");
+    await user.upload(screen.getByLabelText("Choose album photo"), file);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The photo could not be uploaded.",
+    );
+    await user.click(screen.getByRole("button", { name: "Retry Upload" }));
+
+    expect(await screen.findByText("Photo ready")).toBeInTheDocument();
+    expect(screen.getByLabelText("Photo caption")).toHaveValue("Family gathering");
+    expect(apiMocks.uploadImage).toHaveBeenNthCalledWith(1, file);
+    expect(apiMocks.uploadImage).toHaveBeenNthCalledWith(2, file);
   });
 
   it("keeps a 404 as a not-found state without retry", async () => {

@@ -121,6 +121,7 @@ export default function SearchPage() {
       <div className="flex flex-wrap items-center gap-2.5 mb-8">
         <Filter className="w-3.5 h-3.5 text-text-light" />
         <select
+          aria-label="City"
           value={filterCity}
           onChange={(e) => setFilterCity(e.target.value)}
           className="input-heritage w-auto text-[13px] py-2"
@@ -133,6 +134,7 @@ export default function SearchPage() {
 
         {branches.length > 0 && (
           <select
+            aria-label="Branch"
             value={filterBranch}
             onChange={(e) => setFilterBranch(e.target.value)}
             className="input-heritage w-auto text-[13px] py-2"
@@ -146,6 +148,7 @@ export default function SearchPage() {
 
         {generations.length > 0 && (
           <select
+            aria-label="Generation"
             value={filterGeneration}
             onChange={(e) => setFilterGeneration(e.target.value)}
             className="input-heritage w-auto text-[13px] py-2"

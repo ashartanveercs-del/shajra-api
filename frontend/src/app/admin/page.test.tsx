@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,6 +23,16 @@ vi.mock("@/lib/api", () => apiMocks);
 vi.mock("@/components/AdminTreeEditor", () => ({ default: () => null }));
 
 import AdminPage from "./page";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("AdminPage reliability states", () => {
   beforeEach(() => {
@@ -51,6 +61,116 @@ describe("AdminPage reliability states", () => {
     expect(screen.getByText("Members unavailable")).toBeInTheDocument();
     expect(screen.queryByText("No members yet")).not.toBeInTheDocument();
     expect(apiMocks.adminLogin).not.toHaveBeenCalled();
+  });
+
+  it("retries only the failed section while retaining sibling dashboard data", async () => {
+    const membersRetry = deferred<Array<{ id: string; FullName: string }>>();
+    apiMocks.fetchPending.mockResolvedValue([
+      { id: "submission-1", Status: "Pending", RawFullName: "Ali Pending" },
+    ]);
+    apiMocks.fetchMembers
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "member read failed"))
+      .mockImplementationOnce(() => membersRetry.promise);
+    apiMocks.adminFetchApprovedEmails.mockResolvedValue([
+      { id: "email-1", Email: "family@example.com", Name: "Family" },
+    ]);
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+
+    await user.click(await screen.findByRole("button", { name: /^Members/ }));
+    const retry = screen.getByRole("button", { name: "Retry" });
+    await user.click(retry);
+
+    expect(retry).toBeDisabled();
+    expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(2);
+    expect(apiMocks.fetchPending).toHaveBeenCalledTimes(1);
+    expect(apiMocks.adminFetchApprovedEmails).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: /^Pending/ }));
+    expect(screen.getByText("Ali Pending")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Approved Emails/ }));
+    expect(screen.getByText("family@example.com")).toBeInTheDocument();
+
+    membersRetry.resolve([{ id: "member-1", FullName: "Sara Khan" }]);
+    await user.click(screen.getByRole("button", { name: /^Members/ }));
+    expect(await screen.findByText("Sara Khan")).toBeInTheDocument();
+  });
+
+  it("resets a deferred refresh when logout starts a newer session", async () => {
+    const oldRefresh = deferred<Array<{ id: string; FullName: string }>>();
+    apiMocks.fetchMembers
+      .mockResolvedValueOnce([{ id: "old-member", FullName: "Old Session" }])
+      .mockImplementationOnce(() => oldRefresh.promise)
+      .mockResolvedValue([{ id: "new-member", FullName: "New Session" }]);
+    apiMocks.adminLogin.mockResolvedValue("new-token");
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+
+    await screen.findByRole("button", { name: /^Members/ });
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "Logout" }));
+    await user.type(screen.getByRole("textbox", { name: "Username" }), "admin");
+    await user.type(screen.getByLabelText("Password"), "password");
+    await user.click(screen.getByRole("button", { name: "Sign In" }));
+    await user.click(await screen.findByRole("button", { name: /^Members/ }));
+
+    expect(await screen.findByText("New Session")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+
+    oldRefresh.resolve([{ id: "stale-refresh", FullName: "Stale Refresh" }]);
+    await waitFor(() => expect(screen.queryByText("Stale Refresh")).not.toBeInTheDocument());
+    expect(screen.getByText("New Session")).toBeInTheDocument();
+  });
+
+  it("ignores an old mutation completion after logout and a second login", async () => {
+    const oldUndo = deferred<void>();
+    apiMocks.fetchMembers
+      .mockResolvedValueOnce([{ id: "old-member", FullName: "Old Session" }])
+      .mockResolvedValueOnce([{ id: "new-member", FullName: "New Session" }])
+      .mockResolvedValue([{ id: "stale-member", FullName: "Stale Mutation Refresh" }]);
+    apiMocks.adminUndo.mockImplementationOnce(() => oldUndo.promise);
+    apiMocks.adminLogin.mockResolvedValue("new-token");
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+
+    await screen.findByRole("button", { name: /^Members/ });
+    await user.click(screen.getByRole("button", { name: "Undo Last Change" }));
+    await user.click(screen.getByRole("button", { name: "Logout" }));
+    await user.type(screen.getByRole("textbox", { name: "Username" }), "admin");
+    await user.type(screen.getByLabelText("Password"), "password");
+    await user.click(screen.getByRole("button", { name: "Sign In" }));
+    await user.click(await screen.findByRole("button", { name: /^Members/ }));
+    expect(await screen.findByText("New Session")).toBeInTheDocument();
+
+    oldUndo.resolve();
+
+    await waitFor(() => expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Stale Mutation Refresh")).not.toBeInTheDocument();
+    expect(screen.getByText("New Session")).toBeInTheDocument();
+  });
+
+  it("guards login reentry while the first login is pending", async () => {
+    localStorage.clear();
+    const login = deferred<string>();
+    apiMocks.adminLogin.mockImplementation(() => login.promise);
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+
+    await user.type(screen.getByRole("textbox", { name: "Username" }), "admin");
+    const password = screen.getByLabelText("Password");
+    await user.type(password, "password");
+    await user.click(screen.getByRole("button", { name: "Sign In" }));
+    await user.type(password, "{Enter}");
+
+    expect(apiMocks.adminLogin).toHaveBeenCalledTimes(1);
+
+    login.resolve("new-token");
+    expect(await screen.findByText("Admin Dashboard")).toBeInTheDocument();
   });
 
   it("shows read-only integration booleans without heal or secret controls", async () => {
@@ -135,5 +255,30 @@ describe("AdminPage reliability states", () => {
     expect(fullName).toHaveValue("Sara Khan");
     expect(alertSpy).not.toHaveBeenCalled();
     alertSpy.mockRestore();
+  });
+
+  it("clears an earlier add-member success before a later attempt fails", async () => {
+    apiMocks.adminCreateMember
+      .mockResolvedValueOnce({ id: "member-1" })
+      .mockRejectedValueOnce(
+        new ApiProblem(503, "PUBLIC_WRITES_DISABLED", "raw member write detail"),
+      );
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+    await user.click(await screen.findByRole("button", { name: "Add Member" }));
+    const fullName = screen.getByRole("textbox", { name: /^Full Name/ });
+    await user.type(fullName, "First Member");
+    await user.click(screen.getByRole("button", { name: "Create member record" }));
+    expect(await screen.findByText("Member added successfully!")).toBeInTheDocument();
+
+    await user.type(fullName, "Second Member");
+    await user.click(screen.getByRole("button", { name: "Create member record" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Submissions are temporarily unavailable.",
+    );
+    expect(screen.queryByText("Member added successfully!")).not.toBeInTheDocument();
+    expect(fullName).toHaveValue("Second Member");
   });
 });

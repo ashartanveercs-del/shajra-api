@@ -9,6 +9,7 @@ import {
   type CSSProperties,
   type ChangeEvent,
   type DragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import {
   Edit3,
@@ -45,10 +46,38 @@ function parseCardStyle(member: Member): CardStyle | null {
   if (!member.CardStyle) return null;
   try {
     const parsed: unknown = JSON.parse(member.CardStyle);
-    return parsed && typeof parsed === "object" ? (parsed as CardStyle) : null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const badge = Reflect.get(parsed, "badge");
+    const badgeColor = Reflect.get(parsed, "badgeColor");
+    const bg = Reflect.get(parsed, "bg");
+    const borderColor = Reflect.get(parsed, "borderColor");
+    const glow = Reflect.get(parsed, "glow");
+    const className = Reflect.get(parsed, "className");
+    const style: CardStyle = {
+      ...(typeof badge === "string" ? { badge } : {}),
+      ...(typeof badgeColor === "string" ? { badgeColor } : {}),
+      ...(typeof bg === "string" ? { bg } : {}),
+      ...(typeof borderColor === "string" ? { borderColor } : {}),
+      ...(typeof glow === "string" ? { glow } : {}),
+      ...(typeof className === "string" ? { className } : {}),
+    };
+    return Object.keys(style).length > 0 ? style : null;
   } catch {
     return null;
   }
+}
+
+type ParentRelationship = Pick<Partial<Member>, "FatherRecordId" | "MotherRecordId">;
+
+function legacyParentRelationship(parent: Member): ParentRelationship {
+  if (parent.Spouse) {
+    return parent.Gender === "Male"
+      ? { FatherRecordId: parent.id, MotherRecordId: parent.Spouse.id }
+      : { MotherRecordId: parent.id, FatherRecordId: parent.Spouse.id };
+  }
+  return parent.Gender === "Female"
+    ? { MotherRecordId: parent.id }
+    : { FatherRecordId: parent.id };
 }
 
 function flattenTree(nodes: Member[]): Member[] {
@@ -73,7 +102,7 @@ function PersonCard({
 }: {
   member: Member;
   style: CardStyle | null;
-  onSelect: (member: Member) => void;
+  onSelect: (member: Member, invoker: HTMLElement) => void;
 }) {
   const isCreator = (member.FullName ?? "").trim().includes("Ashar Tanveer");
   const badge = style?.badge || (isCreator ? "CREATOR" : null);
@@ -84,7 +113,7 @@ function PersonCard({
       type="button"
       onClick={(event) => {
         event.stopPropagation();
-        onSelect(member);
+        onSelect(member, event.currentTarget);
       }}
       className="relative flex min-w-[90px] flex-col items-center"
       aria-label={`Edit ${member.FullName || "member"}`}
@@ -121,11 +150,11 @@ function PersonCard({
 }
 
 type TreeActions = {
-  onNodeClick: (member: Member) => void;
+  onNodeClick: (member: Member, invoker: HTMLElement) => void;
   onDropNode: (draggedId: string, targetId: string) => void;
   onDelete: (id: string) => void;
   onUnlink: (id: string) => void;
-  onAddChild: (member: Member) => void;
+  onAddChild: (member: Member, invoker: HTMLElement) => void;
 };
 
 function AdminTreeCard({
@@ -183,7 +212,7 @@ function AdminTreeCard({
             type="button"
             onClick={(event) => {
               event.stopPropagation();
-              onAddChild(member);
+              onAddChild(member, event.currentTarget);
             }}
             className="rounded p-1 text-emerald hover:bg-emerald/10"
             aria-label={`Add child to ${member.FullName || "member"}`}
@@ -209,7 +238,7 @@ function AdminTreeCard({
               type="button"
               onClick={(event) => {
                 event.stopPropagation();
-                onNodeClick(member.Spouse as Member);
+                onNodeClick(member.Spouse as Member, event.currentTarget);
               }}
               className="rounded p-1 text-plum-700 hover:bg-plum/10"
               aria-label={`Edit ${member.Spouse.FullName || "spouse"}`}
@@ -296,8 +325,17 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
   const [editForm, setEditForm] = useState<Partial<Member>>({});
   const [uploadingImage, setUploadingImage] = useState(false);
   const treeRequest = useRef(0);
+  const modalGeneration = useRef(0);
+  const editingMemberRef = useRef<Member | null>(null);
+  const modalInvokerRef = useRef<HTMLElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const tree = useMemo(() => ("data" in treeState ? treeState.data : []), [treeState]);
   const allMembers = useMemo(() => flattenTree(tree), [tree]);
+
+  const modalIsCurrent = useCallback((generation: number, memberId: string) => (
+    modalGeneration.current === generation && editingMemberRef.current?.id === memberId
+  ), []);
 
   const loadData = useCallback(async (showLoading = false) => {
     const requestId = ++treeRequest.current;
@@ -322,6 +360,10 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     };
   }, [loadData]);
 
+  useEffect(() => {
+    if (editingMember) closeButtonRef.current?.focus();
+  }, [editingMember]);
+
   const refreshAfterWrite = () => {
     void loadData();
     onUpdated?.();
@@ -329,30 +371,28 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
 
   const handlePhotoUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (!file) return;
+    const member = editingMemberRef.current;
+    if (!file || !member) return;
+    const generation = modalGeneration.current;
+    const memberId = member.id;
     setUploadingImage(true);
     setActionError("");
     try {
       const data = await uploadImage(file);
+      if (!modalIsCurrent(generation, memberId)) return;
       setEditForm((current) => ({ ...current, ProfileImageUrl: data.url }));
     } catch (error: unknown) {
-      setActionError(asApiProblem(error, "The image could not be uploaded.").message);
+      if (modalIsCurrent(generation, memberId)) {
+        setActionError(asApiProblem(error, "The image could not be uploaded.").message);
+      }
     } finally {
-      setUploadingImage(false);
+      if (modalIsCurrent(generation, memberId)) setUploadingImage(false);
     }
   };
 
   const handleDropNode = async (draggedId: string, targetId: string) => {
     const target = allMembers.find((member) => member.id === targetId);
-    const updates: Partial<Member> = {};
-    if (target?.Spouse) {
-      updates.FatherRecordId = target.Gender === "Male" ? target.id : target.Spouse.id;
-      updates.MotherRecordId = target.Gender === "Female" ? target.id : target.Spouse.id;
-    } else if (target?.Gender === "Female") {
-      updates.MotherRecordId = target.id;
-    } else if (target) {
-      updates.FatherRecordId = target.id;
-    }
+    const updates = target ? legacyParentRelationship(target) : {};
 
     setActionLoading(true);
     setActionError("");
@@ -367,17 +407,23 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
   };
 
   const handleSaveEdit = async () => {
-    if (!editingMember) return;
+    const member = editingMemberRef.current;
+    if (!member) return;
+    const generation = modalGeneration.current;
+    const memberId = member.id;
     setActionLoading(true);
     setActionError("");
     try {
-      await adminUpdateMember(token, editingMember.id, editForm);
-      setEditingMember(null);
+      await adminUpdateMember(token, memberId, editForm);
+      if (!modalIsCurrent(generation, memberId)) return;
+      closeEditor();
       refreshAfterWrite();
     } catch (error: unknown) {
-      setActionError(asApiProblem(error, "The member changes could not be saved.").message);
+      if (modalIsCurrent(generation, memberId)) {
+        setActionError(asApiProblem(error, "The member changes could not be saved.").message);
+      }
     } finally {
-      setActionLoading(false);
+      if (modalIsCurrent(generation, memberId)) setActionLoading(false);
     }
   };
 
@@ -409,43 +455,88 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     }
   };
 
-  const openNewMember = (parent?: Member) => {
+  const openEditor = (member: Member, draft: Partial<Member>, invoker: HTMLElement) => {
+    modalGeneration.current += 1;
+    editingMemberRef.current = member;
+    modalInvokerRef.current = invoker;
+    setActionLoading(false);
+    setUploadingImage(false);
+    setActionError("");
+    setEditingMember(member);
+    setEditForm(draft);
+  };
+
+  const openNewMember = (parent: Member | undefined, invoker: HTMLElement) => {
     const draft: Partial<Member> = {
       FullName: "",
       Gender: "Male",
       IsAlive: true,
       ProfileImageUrl: "",
       ...(parent ? { Generation: (parent.Generation || 1) + 1 } : {}),
+      ...(parent ? legacyParentRelationship(parent) : {}),
     };
-    if (parent?.Gender === "Female") {
-      draft.MotherRecordId = parent.id;
-      draft.FatherRecordId = parent.Spouse?.id;
-    } else if (parent) {
-      draft.FatherRecordId = parent.id;
-      draft.MotherRecordId = parent.Spouse?.id;
-    }
-    setActionError("");
-    setEditingMember({ id: "new", FullName: "" });
-    setEditForm(draft);
+    openEditor({ id: "new", FullName: "" }, draft, invoker);
   };
 
   const handleCreateNew = async () => {
+    const member = editingMemberRef.current;
+    if (!member) return;
+    const generation = modalGeneration.current;
+    const memberId = member.id;
     setActionLoading(true);
     setActionError("");
     try {
       await adminCreateMember(token, editForm);
-      setEditingMember(null);
+      if (!modalIsCurrent(generation, memberId)) return;
+      closeEditor();
       refreshAfterWrite();
     } catch (error: unknown) {
-      setActionError(asApiProblem(error, "The member could not be created.").message);
+      if (modalIsCurrent(generation, memberId)) {
+        setActionError(asApiProblem(error, "The member could not be created.").message);
+      }
     } finally {
-      setActionLoading(false);
+      if (modalIsCurrent(generation, memberId)) setActionLoading(false);
     }
   };
 
   const closeEditor = () => {
+    const invoker = modalInvokerRef.current;
+    modalGeneration.current += 1;
+    editingMemberRef.current = null;
     setEditingMember(null);
+    setActionLoading(false);
+    setUploadingImage(false);
     setActionError("");
+    queueMicrotask(() => {
+      if (invoker?.isConnected) invoker.focus();
+    });
+  };
+
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeEditor();
+      return;
+    }
+    if (event.key !== "Tab") return;
+
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+      "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+    )).filter((element) => !element.hasAttribute("hidden"));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialog.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
   };
 
   return (
@@ -467,7 +558,11 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
         .family-tree ul ul::before { content: ''; position: absolute; top: 0; left: 50%; border-left: 2px solid #cbd5e1; width: 0; height: 30px; transform: translateX(-1px); }
       ` }} />
 
-      <div className="relative flex h-[65vh] min-h-[28rem] flex-col overflow-hidden rounded-lg border border-border bg-[#f8f6f0] shadow-inner">
+      <div
+        aria-hidden={editingMember ? true : undefined}
+        inert={editingMember ? true : undefined}
+        className="relative flex h-[65vh] min-h-0 supports-[height:100dvh]:h-[65dvh] flex-col overflow-hidden rounded-lg border border-border bg-[#f8f6f0] shadow-inner"
+      >
         <div className="z-10 flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-border bg-white/80 px-4 py-3 backdrop-blur sm:px-5">
           <h3 className="flex min-w-0 items-center gap-2 font-serif text-base font-bold sm:text-lg">
             <span className="truncate">Interactive Heritage Tree</span>
@@ -475,7 +570,8 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
           </h3>
           <button
             type="button"
-            onClick={() => openNewMember()}
+            onClick={(event) => openNewMember(undefined, event.currentTarget)}
+            aria-label="Add New Member"
             className="btn-primary min-h-10 shrink-0 px-3 text-sm sm:px-4"
           >
             <UserPlus aria-hidden="true" className="h-4 w-4" />
@@ -516,11 +612,7 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
                     onDelete={(id) => void handleDeleteMember(id)}
                     onUnlink={(id) => void handleUnlinkMember(id)}
                     onAddChild={openNewMember}
-                    onNodeClick={(member) => {
-                      setActionError("");
-                      setEditingMember(member);
-                      setEditForm(memberDraft(member));
-                    }}
+                    onNodeClick={(member, invoker) => openEditor(member, memberDraft(member), invoker)}
                     onDropNode={(draggedId, targetId) => void handleDropNode(draggedId, targetId)}
                   />
                 ))}
@@ -533,16 +625,18 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
       {editingMember && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
           <div
+            ref={dialogRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby="member-editor-title"
+            onKeyDown={handleDialogKeyDown}
             className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg bg-white shadow-xl"
           >
             <div className="flex shrink-0 items-center justify-between border-b border-border bg-bg-secondary p-4">
               <h3 id="member-editor-title" className="font-serif text-lg font-bold text-text-primary">
                 Edit Member Info
               </h3>
-              <button type="button" onClick={closeEditor} className="p-1 text-text-muted hover:text-text-primary" aria-label="Close member editor">
+              <button ref={closeButtonRef} type="button" onClick={closeEditor} className="p-1 text-text-muted hover:text-text-primary" aria-label="Close member editor">
                 <X aria-hidden="true" className="h-5 w-5" />
               </button>
             </div>

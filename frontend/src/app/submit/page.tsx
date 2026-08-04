@@ -30,15 +30,13 @@ export default function SubmitPage() {
   const [success, setSuccess] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [selectedPhotoFile, setSelectedPhotoFile] = useState<File | null>(null);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
     setFormData((current) => ({ ...current, [e.target.name]: e.target.value }));
   };
 
-  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  const uploadPhoto = async (file: File) => {
     setUploadingImage(true);
     setUploadError(null);
     try {
@@ -49,6 +47,14 @@ export default function SubmitPage() {
     } finally {
       setUploadingImage(false);
     }
+  };
+
+  const handlePhotoUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setSelectedPhotoFile(file);
+    event.target.value = "";
+    void uploadPhoto(file);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -116,7 +122,17 @@ export default function SubmitPage() {
         
         {uploadError && (
           <div role="alert" aria-label="Photo upload failed" className="bg-terracotta-light/30 border border-terracotta-light text-terracotta text-sm p-4 rounded-lg">
-            {uploadError}
+            <p>{uploadError}</p>
+            {selectedPhotoFile && (
+              <button
+                type="button"
+                onClick={() => void uploadPhoto(selectedPhotoFile)}
+                disabled={uploadingImage}
+                className="btn-secondary mt-3"
+              >
+                Retry Upload
+              </button>
+            )}
           </div>
         )}
 
@@ -161,7 +177,16 @@ export default function SubmitPage() {
                   <div role="img" aria-label="Profile preview" className="h-12 w-12 rounded-full bg-cover bg-center" style={{ backgroundImage: `url(${formData.profileImage})` }} />
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-text-primary truncate">Image Uploaded</p>
-                    <button type="button" onClick={() => setFormData({ ...formData, profileImage: "" })} className="text-xs text-terracotta hover:underline">Remove</button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFormData({ ...formData, profileImage: "" });
+                        setSelectedPhotoFile(null);
+                      }}
+                      className="text-xs text-terracotta hover:underline"
+                    >
+                      Remove
+                    </button>
                   </div>
                 </div>
               ) : (

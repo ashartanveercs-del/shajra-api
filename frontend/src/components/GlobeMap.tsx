@@ -49,24 +49,36 @@ export default function GlobeMap({ data }: { data: MapData }) {
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    let active = true;
 
-    const updateSize = () => {
+    const updateSize = (observedWidth?: number, observedHeight?: number) => {
+      if (!active) return;
       const bounds = container.getBoundingClientRect();
       setSize({
-        width: Math.max(1, Math.floor(bounds.width || container.clientWidth)),
-        height: Math.max(1, Math.floor(bounds.height || container.clientHeight)),
+        width: Math.max(1, Math.floor(observedWidth || bounds.width || container.clientWidth)),
+        height: Math.max(1, Math.floor(observedHeight || bounds.height || container.clientHeight)),
       });
     };
 
     updateSize();
     if (typeof ResizeObserver === "undefined") {
-      window.addEventListener("resize", updateSize);
-      return () => window.removeEventListener("resize", updateSize);
+      const handleWindowResize = () => updateSize();
+      window.addEventListener("resize", handleWindowResize);
+      return () => {
+        active = false;
+        window.removeEventListener("resize", handleWindowResize);
+      };
     }
 
-    const observer = new ResizeObserver(updateSize);
+    const observer = new ResizeObserver((entries) => {
+      const bounds = entries[0]?.contentRect;
+      updateSize(bounds?.width, bounds?.height);
+    });
     observer.observe(container);
-    return () => observer.disconnect();
+    return () => {
+      active = false;
+      observer.disconnect();
+    };
   }, []);
 
   const handleReady = () => {

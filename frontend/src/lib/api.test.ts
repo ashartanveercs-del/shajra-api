@@ -114,4 +114,22 @@ describe("frontend API contracts", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(6);
   });
 
+  it("preserves legitimate empty reads and an unapproved email response", async () => {
+    const fetchSpy = vi.fn().mockImplementation((input: string) =>
+      Promise.resolve(
+        jsonResponse(input.includes("/api/verify-email") ? { approved: false } : []),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = await loadApi();
+
+    await expect(api.searchMembers("Nobody")).resolves.toEqual([]);
+    await expect(api.fetchComments("member-1")).resolves.toEqual([]);
+    await expect(api.fetchStories()).resolves.toEqual([]);
+    await expect(api.fetchAlbums()).resolves.toEqual([]);
+    await expect(api.adminGetHistory("admin-token")).resolves.toEqual([]);
+    await expect(api.verifyEmail("family@example.com")).resolves.toBe(false);
+    expect(fetchSpy).toHaveBeenCalledTimes(6);
+  });
+
 });

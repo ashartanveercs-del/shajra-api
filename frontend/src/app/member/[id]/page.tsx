@@ -47,42 +47,49 @@ type MemberProfileData = {
   unavailable: Set<AuxiliarySection>;
 };
 
+type StoredProfileState = {
+  requestedId: string;
+  load: Loadable<MemberProfileData, null>;
+};
+
+type AuxiliaryData = Member[] | Comment[] | Album[];
+
 export default function MemberProfilePage() {
   const params = useParams();
   const id = params.id as string;
-  const [profileState, setProfileState] = useState<Loadable<MemberProfileData, null>>({
-    status: "loading",
+  const [storedProfile, setStoredProfile] = useState<StoredProfileState>({
+    requestedId: id,
+    load: { status: "loading" },
   });
   const profileRequest = useRef(0);
+  const auxiliaryRequests = useRef<Record<AuxiliarySection, number>>({
+    relationships: 0,
+    comments: 0,
+    albums: 0,
+  });
+  const profileState: Loadable<MemberProfileData, null> =
+    storedProfile.requestedId === id ? storedProfile.load : { status: "loading" };
 
-  // Comment form state
-  const [commentText, setCommentText] = useState("");
-  const [authorName, setAuthorName] = useState("");
-  const [authorEmail, setAuthorEmail] = useState("");
-  const [verifyingEmail, setVerifyingEmail] = useState(false);
-  const [emailError, setEmailError] = useState("");
-  const [isEmailVerified, setIsEmailVerified] = useState(false);
-  const [submittingComment, setSubmittingComment] = useState(false);
-  const [commentError, setCommentError] = useState<string | null>(null);
-
-  const loadProfile = useCallback(() => {
+  const loadProfile = useCallback((requestedId: string) => {
     const request = ++profileRequest.current;
     Promise.allSettled([
-      fetchMember(id),
+      fetchMember(requestedId),
       fetchMembers(),
-      fetchComments(id),
-      fetchAlbums(id),
+      fetchComments(requestedId),
+      fetchAlbums(requestedId),
     ] as const).then((results) => {
       if (request !== profileRequest.current) return;
 
       const [memberResult, membersResult, commentsResult, albumsResult] = results;
       if (memberResult.status === "rejected") {
         const problem = asApiProblem(memberResult.reason, "This member could not be loaded.");
-        setProfileState(
-          problem.status === 404
-            ? { status: "empty", data: null }
-            : { status: "error", problem },
-        );
+        setStoredProfile({
+          requestedId,
+          load:
+            problem.status === 404
+              ? { status: "empty", data: null }
+              : { status: "error", problem },
+        });
         return;
       }
 
@@ -100,89 +107,136 @@ export default function MemberProfilePage() {
       };
 
       if (unavailable.size === 0) {
-        setProfileState({ status: "ready", data });
+        setStoredProfile({ requestedId, load: { status: "ready", data } });
         return;
       }
 
       const firstFailure = [membersResult, commentsResult, albumsResult].find(
         (result) => result.status === "rejected",
       );
-      setProfileState({
-        status: "partial",
-        data,
-        problem: asApiProblem(
-          firstFailure?.status === "rejected" ? firstFailure.reason : undefined,
-          "Some profile details could not be loaded.",
-        ),
+      setStoredProfile({
+        requestedId,
+        load: {
+          status: "partial",
+          data,
+          problem: asApiProblem(
+            firstFailure?.status === "rejected" ? firstFailure.reason : undefined,
+            "Some profile details could not be loaded.",
+          ),
+        },
       });
     });
-  }, [id]);
+  }, []);
 
   useEffect(() => {
-    loadProfile();
+    const requests = auxiliaryRequests.current;
+    loadProfile(id);
     return () => {
       profileRequest.current += 1;
+      requests.relationships += 1;
+      requests.comments += 1;
+      requests.albums += 1;
     };
-  }, [loadProfile]);
+  }, [id, loadProfile]);
 
   const retryProfile = () => {
-    setProfileState({ status: "loading" });
-    loadProfile();
+    setStoredProfile({ requestedId: id, load: { status: "loading" } });
+    loadProfile(id);
   };
 
-  const addAlbum = (album: Album) => {
-    setProfileState((current) => {
-      if (current.status !== "ready" && current.status !== "partial") return current;
+  const mergeAuxiliaryData = (
+    requestedId: string,
+    section: AuxiliarySection,
+    value: AuxiliaryData,
+  ) => {
+    setStoredProfile((current) => {
+      if (current.requestedId !== requestedId) return current;
+      if (current.load.status !== "ready" && current.load.status !== "partial") return current;
+
+      const unavailable = new Set(current.load.data.unavailable);
+      unavailable.delete(section);
+      const data: MemberProfileData = {
+        ...current.load.data,
+        unavailable,
+        ...(section === "relationships" ? { allMembers: value as Member[] } : {}),
+        ...(section === "comments" ? { comments: value as Comment[] } : {}),
+        ...(section === "albums" ? { albums: value as Album[] } : {}),
+      };
+
       return {
-        ...current,
-        data: { ...current.data, albums: [...current.data.albums, album] },
+        requestedId,
+        load:
+          unavailable.size === 0
+            ? { status: "ready", data }
+            : {
+                status: "partial",
+                data,
+                problem:
+                  current.load.status === "partial"
+                    ? current.load.problem
+                    : asApiProblem(undefined, "Some profile details could not be loaded."),
+              },
       };
     });
   };
 
-  const handleVerifyEmail = async () => {
-    if (!authorEmail) return;
-    setVerifyingEmail(true);
-    setEmailError("");
-    try {
-      const isApproved = await verifyEmail(authorEmail);
-      if (isApproved) {
-        setIsEmailVerified(true);
-      } else {
-        setEmailError("This email is not on the approved family members list.");
-      }
-    } catch (error: unknown) {
-      setEmailError(asApiProblem(error, "Email verification could not be completed.").message);
-    } finally {
-      setVerifyingEmail(false);
-    }
+  const retryAuxiliary = (section: AuxiliarySection) => {
+    const requestedId = id;
+    const request = ++auxiliaryRequests.current[section];
+    const read =
+      section === "relationships"
+        ? fetchMembers()
+        : section === "comments"
+          ? fetchComments(requestedId)
+          : fetchAlbums(requestedId);
+
+    read.then(
+      (value) => {
+        if (request !== auxiliaryRequests.current[section]) return;
+        mergeAuxiliaryData(requestedId, section, value);
+      },
+      () => {
+        // Retain the existing partial state and member draft for another local retry.
+      },
+    );
   };
 
-  const submitComment = async () => {
-    if (!commentText || !authorName || !isEmailVerified || !member) return;
-    setSubmittingComment(true);
-    setCommentError(null);
-    try {
-      const newComment = await postComment({
-        MemberRecordId: member.id,
-        MemberName: member.FullName,
-        AuthorName: authorName,
-        AuthorEmail: authorEmail,
-        CommentText: commentText,
-      });
-      setProfileState((current) => {
-        if (current.status !== "ready" && current.status !== "partial") return current;
-        return {
-          ...current,
-          data: { ...current.data, comments: [...current.data.comments, newComment] },
-        };
-      });
-      setCommentText("");
-    } catch (error: unknown) {
-      setCommentError(asApiProblem(error, "The comment could not be posted.").message);
-    } finally {
-      setSubmittingComment(false);
-    }
+  const addAlbum = (album: Album) => {
+    setStoredProfile((current) => {
+      if (current.requestedId !== id) return current;
+      if (current.load.status !== "ready" && current.load.status !== "partial") return current;
+      if (album.MemberRecordId && album.MemberRecordId !== current.load.data.member.id) {
+        return current;
+      }
+      return {
+        ...current,
+        load: {
+          ...current.load,
+          data: {
+            ...current.load.data,
+            albums: [...current.load.data.albums, album],
+          },
+        },
+      };
+    });
+  };
+
+  const addComment = (comment: Comment) => {
+    setStoredProfile((current) => {
+      if (current.requestedId !== id) return current;
+      if (current.load.status !== "ready" && current.load.status !== "partial") return current;
+      if (comment.MemberRecordId !== current.load.data.member.id) return current;
+      return {
+        ...current,
+        load: {
+          ...current.load,
+          data: {
+            ...current.load.data,
+            comments: [...current.load.data.comments, comment],
+          },
+        },
+      };
+    });
   };
 
   if (profileState.status === "loading") {
@@ -341,7 +395,11 @@ export default function MemberProfilePage() {
           </h2>
           <div className="space-y-2.5">
             {unavailable.has("relationships") ? (
-              <SectionUnavailable title="Relationships unavailable" onRetry={retryProfile} />
+              <SectionUnavailable
+                title="Relationships unavailable"
+                retryLabel="Retry relationships"
+                onRetry={() => retryAuxiliary("relationships")}
+              />
             ) : (
               <>
                 {father && <RelationLink label="Father" member={father} />}
@@ -400,11 +458,12 @@ export default function MemberProfilePage() {
 
       {/* Interactive Albums Section */}
       <AlbumSection
+        key={member.id}
         member={member}
         albums={albums}
         unavailable={unavailable.has("albums")}
         onAlbumAdded={addAlbum}
-        onRetry={retryProfile}
+        onRetry={() => retryAuxiliary("albums")}
       />
 
       {/* Comments Section */}
@@ -417,7 +476,11 @@ export default function MemberProfilePage() {
         {/* List Comments */}
         <div className="space-y-4 mb-8">
           {unavailable.has("comments") ? (
-            <SectionUnavailable title="Comments unavailable" onRetry={retryProfile} />
+            <SectionUnavailable
+              title="Comments unavailable"
+              retryLabel="Retry comments"
+              onRetry={() => retryAuxiliary("comments")}
+            />
           ) : comments.length === 0 ? (
             <p className="text-sm text-text-light italic">No comments yet. Be the first to share a memory.</p>
           ) : (
@@ -440,82 +503,198 @@ export default function MemberProfilePage() {
           )}
         </div>
 
-        {/* Comment Form */}
-        <div className="bg-bg-secondary p-5 rounded-xl border border-border shadow-inner">
-          <h3 className="font-serif font-semibold text-text-primary mb-2 flex items-center gap-2">
-            Leave a memory
-          </h3>
-          <p className="text-xs text-text-muted mb-4 opacity-80">
-            For privacy, only verified family members can leave comments.
-          </p>
-
-          {!isEmailVerified ? (
-            <div className="flex flex-col gap-3">
-              <div>
-                <p className="text-xs font-medium text-text-primary mb-1">Verify your family email</p>
-                <div className="flex gap-2">
-                  <input
-                    type="email"
-                    aria-label="Family email"
-                    value={authorEmail}
-                    onChange={(e) => setAuthorEmail(e.target.value)}
-                    placeholder="name@example.com"
-                    className="flex-1 px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleVerifyEmail}
-                    disabled={verifyingEmail || !authorEmail}
-                    className="btn-primary"
-                  >
-                    {verifyingEmail ? <Loader2 className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
-                    Verify
-                  </button>
-                </div>
-                {emailError && <p role="alert" className="text-terracotta text-xs mt-1.5">{emailError}</p>}
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-3 animate-fadeInUp">
-              <div className="flex items-center gap-2 bg-emerald-light/30 border border-emerald/20 text-emerald-dark px-3 py-2 rounded-lg text-xs font-medium mb-2">
-                Email verified. You can now post comments.
-              </div>
-              <input
-                type="text"
-                aria-label="Your name"
-                value={authorName}
-                onChange={(e) => setAuthorName(e.target.value)}
-                placeholder="Your Name"
-                className="w-full px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent"
-              />
-              <textarea
-                aria-label="Memory or story"
-                value={commentText}
-                onChange={(e) => setCommentText(e.target.value)}
-                placeholder="Share a memory or story..."
-                rows={3}
-                className="w-full px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent resize-y"
-              />
-              <div className="flex justify-end">
-                {commentError && (
-                  <p role="alert" className="mr-auto self-center text-xs text-terracotta">
-                    {commentError}
-                  </p>
-                )}
-                <button
-                  type="button"
-                  onClick={submitComment}
-                  disabled={submittingComment || !commentText || !authorName}
-                  className="btn-primary"
-                >
-                  {submittingComment ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                  Post Comment
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
+        <CommentForm key={member.id} member={member} onCommentAdded={addComment} />
       </div>
+    </div>
+  );
+}
+
+function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function CommentForm({
+  member,
+  onCommentAdded,
+}: {
+  member: Member;
+  onCommentAdded: (comment: Comment) => void;
+}) {
+  const [commentText, setCommentText] = useState("");
+  const [authorName, setAuthorName] = useState("");
+  const [authorEmail, setAuthorEmail] = useState("");
+  const [verifyingEmail, setVerifyingEmail] = useState(false);
+  const [emailError, setEmailError] = useState("");
+  const [verifiedEmail, setVerifiedEmail] = useState<string | null>(null);
+  const [submittingComment, setSubmittingComment] = useState(false);
+  const [commentError, setCommentError] = useState<string | null>(null);
+  const authorEmailRef = useRef("");
+  const verificationRequest = useRef(0);
+  const commentRequest = useRef(0);
+
+  useEffect(
+    () => () => {
+      verificationRequest.current += 1;
+      commentRequest.current += 1;
+    },
+    [],
+  );
+
+  const handleEmailChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const value = event.target.value;
+    authorEmailRef.current = value;
+    verificationRequest.current += 1;
+    setAuthorEmail(value);
+    setVerifiedEmail(null);
+    setVerifyingEmail(false);
+    setEmailError("");
+  };
+
+  const handleVerifyEmail = async () => {
+    const requestedEmail = normalizeEmail(authorEmail);
+    if (!requestedEmail) return;
+    const request = ++verificationRequest.current;
+    setVerifyingEmail(true);
+    setEmailError("");
+    try {
+      const isApproved = await verifyEmail(requestedEmail);
+      if (
+        request !== verificationRequest.current ||
+        normalizeEmail(authorEmailRef.current) !== requestedEmail
+      ) {
+        return;
+      }
+      if (isApproved) {
+        setVerifiedEmail(requestedEmail);
+      } else {
+        setVerifiedEmail(null);
+        setEmailError("This email is not on the approved family members list.");
+      }
+    } catch (error: unknown) {
+      if (request !== verificationRequest.current) return;
+      setEmailError(asApiProblem(error, "Email verification could not be completed.").message);
+    } finally {
+      if (request === verificationRequest.current) {
+        setVerifyingEmail(false);
+      }
+    }
+  };
+
+  const isEmailVerified =
+    verifiedEmail !== null && verifiedEmail === normalizeEmail(authorEmail);
+
+  const submitComment = async () => {
+    if (!commentText || !authorName || !isEmailVerified || !verifiedEmail) return;
+    const request = ++commentRequest.current;
+    setSubmittingComment(true);
+    setCommentError(null);
+    try {
+      const newComment = await postComment({
+        MemberRecordId: member.id,
+        MemberName: member.FullName,
+        AuthorName: authorName,
+        AuthorEmail: verifiedEmail,
+        CommentText: commentText,
+      });
+      if (request !== commentRequest.current) return;
+      onCommentAdded(newComment);
+      setCommentText("");
+    } catch (error: unknown) {
+      if (request !== commentRequest.current) return;
+      setCommentError(asApiProblem(error, "The comment could not be posted.").message);
+    } finally {
+      if (request === commentRequest.current) {
+        setSubmittingComment(false);
+      }
+    }
+  };
+
+  return (
+    <div className="bg-bg-secondary p-5 rounded-xl border border-border shadow-inner">
+      <h3 className="font-serif font-semibold text-text-primary mb-2 flex items-center gap-2">
+        Leave a memory
+      </h3>
+      <p className="text-xs text-text-muted mb-4 opacity-80">
+        For privacy, only verified family members can leave comments.
+      </p>
+
+      {!isEmailVerified ? (
+        <div className="flex flex-col gap-3">
+          <div>
+            <p className="text-xs font-medium text-text-primary mb-1">Verify your family email</p>
+            <div className="flex gap-2">
+              <input
+                type="email"
+                aria-label="Family email"
+                value={authorEmail}
+                onChange={handleEmailChange}
+                placeholder="name@example.com"
+                className="flex-1 px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent"
+              />
+              <button
+                type="button"
+                onClick={handleVerifyEmail}
+                disabled={verifyingEmail || !normalizeEmail(authorEmail)}
+                className="btn-primary"
+              >
+                {verifyingEmail ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Lock className="w-4 h-4" />
+                )}
+                Verify
+              </button>
+            </div>
+            {emailError && (
+              <p role="alert" className="text-terracotta text-xs mt-1.5">
+                {emailError}
+              </p>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-3 animate-fadeInUp">
+          <div className="flex items-center gap-2 bg-emerald-light/30 border border-emerald/20 text-emerald-dark px-3 py-2 rounded-lg text-xs font-medium mb-2">
+            Email verified. You can now post comments.
+          </div>
+          <input
+            type="text"
+            aria-label="Your name"
+            value={authorName}
+            onChange={(event) => setAuthorName(event.target.value)}
+            placeholder="Your Name"
+            className="w-full px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent"
+          />
+          <textarea
+            aria-label="Memory or story"
+            value={commentText}
+            onChange={(event) => setCommentText(event.target.value)}
+            placeholder="Share a memory or story..."
+            rows={3}
+            className="w-full px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent resize-y"
+          />
+          <div className="flex justify-end">
+            {commentError && (
+              <p role="alert" className="mr-auto self-center text-xs text-terracotta">
+                {commentError}
+              </p>
+            )}
+            <button
+              type="button"
+              onClick={submitComment}
+              disabled={submittingComment || !commentText || !authorName}
+              className="btn-primary"
+            >
+              {submittingComment ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
+              Post Comment
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -538,7 +717,15 @@ function RelationLink({ label, member }: { label?: string; member: Member }) {
   );
 }
 
-function SectionUnavailable({ title, onRetry }: { title: string; onRetry: () => void }) {
+function SectionUnavailable({
+  title,
+  retryLabel,
+  onRetry,
+}: {
+  title: string;
+  retryLabel: string;
+  onRetry: () => void;
+}) {
   return (
     <div className="rounded-lg border border-terracotta-light bg-terracotta-light/20 p-3">
       <p className="text-sm font-medium text-text-primary">{title}</p>
@@ -547,7 +734,7 @@ function SectionUnavailable({ title, onRetry }: { title: string; onRetry: () => 
         onClick={onRetry}
         className="mt-2 text-xs font-medium text-accent underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
       >
-        Retry profile details
+        {retryLabel}
       </button>
     </div>
   );
@@ -579,25 +766,46 @@ function AlbumSection({
   const [uploading, setUploading] = useState(false);
   const [uploadedUrl, setUploadedUrl] = useState("");
   const [albumError, setAlbumError] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const albumRequest = useRef(0);
 
-  const handlePhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  useEffect(
+    () => () => {
+      albumRequest.current += 1;
+    },
+    [],
+  );
+
+  const uploadPhoto = async (file: File) => {
+    const request = ++albumRequest.current;
     setUploading(true);
     setAlbumError(null);
     try {
       const data = await uploadImage(file);
+      if (request !== albumRequest.current) return;
       setUploadedUrl(data.url);
     } catch (error: unknown) {
+      if (request !== albumRequest.current) return;
       setAlbumError(asApiProblem(error, "The photo could not be uploaded.").message);
     } finally {
-      setUploading(false);
+      if (request === albumRequest.current) {
+        setUploading(false);
+      }
     }
+  };
+
+  const handlePhotoSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setSelectedFile(file);
+    event.target.value = "";
+    void uploadPhoto(file);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!uploadedUrl) return;
+    const request = ++albumRequest.current;
     setUploading(true);
     setAlbumError(null);
     try {
@@ -607,14 +815,19 @@ function AlbumSection({
         ImageUrl: uploadedUrl,
         Caption: caption,
       });
+      if (request !== albumRequest.current) return;
       onAlbumAdded(newAlbum);
       setShowForm(false);
       setUploadedUrl("");
       setCaption("");
+      setSelectedFile(null);
     } catch (error: unknown) {
+      if (request !== albumRequest.current) return;
       setAlbumError(asApiProblem(error, "The photo could not be added to the album.").message);
     } finally {
-      setUploading(false);
+      if (request === albumRequest.current) {
+        setUploading(false);
+      }
     }
   };
 
@@ -633,7 +846,11 @@ function AlbumSection({
       </div>
 
       {unavailable ? (
-        <SectionUnavailable title="Albums unavailable" onRetry={onRetry} />
+        <SectionUnavailable
+          title="Albums unavailable"
+          retryLabel="Retry albums"
+          onRetry={onRetry}
+        />
       ) : showForm && (
         <form onSubmit={handleSubmit} className="mb-6 p-4 bg-bg-secondary rounded-lg border border-border">
           <p className="text-xs text-text-muted mb-4 leading-relaxed">
@@ -650,7 +867,16 @@ function AlbumSection({
                 />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-text-primary">Photo ready</p>
-                  <button type="button" onClick={() => setUploadedUrl("")} className="text-xs text-terracotta hover:underline">Remove & choose another</button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUploadedUrl("");
+                      setSelectedFile(null);
+                    }}
+                    className="text-xs text-terracotta hover:underline"
+                  >
+                    Remove &amp; choose another
+                  </button>
                 </div>
               </div>
             ) : (
@@ -671,6 +897,16 @@ function AlbumSection({
               />
             </div>
             {albumError && <p role="alert" className="text-sm text-terracotta">{albumError}</p>}
+            {!uploadedUrl && selectedFile && albumError && (
+              <button
+                type="button"
+                onClick={() => void uploadPhoto(selectedFile)}
+                disabled={uploading}
+                className="btn-secondary w-full"
+              >
+                Retry Upload
+              </button>
+            )}
             <button type="submit" disabled={uploading || !uploadedUrl} className="btn-primary w-full">
               {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Add to Album"}
             </button>
