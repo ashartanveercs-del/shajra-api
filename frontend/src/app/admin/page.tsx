@@ -1,8 +1,9 @@
 "use client";
 
 import AdminTreeEditor from "@/components/AdminTreeEditor";
+import AsyncState from "@/components/feedback/AsyncState";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   adminLogin,
   fetchPending,
@@ -14,14 +15,14 @@ import {
   adminFetchApprovedEmails,
   adminAddApprovedEmail,
   adminDeleteApprovedEmail,
-  adminFetchSettings,
-  adminUpdateSettings,
+  adminFetchIntegrations,
   adminUndo,
-  adminHeal,
+  type AdminIntegrations,
   type PendingSubmission,
   type Member,
   type ApprovedEmail,
 } from "@/lib/api";
+import { asApiProblem, type Loadable } from "@/lib/loadable";
 import {
   ShieldCheck,
   LogIn,
@@ -40,40 +41,111 @@ import {
   Settings,
   Network,
   Undo2,
-  HeartPulse
 } from "lucide-react";
 
-type Tab = "pending" | "members" | "tree" | "add" | "emails" | "settings";
+type Tab = "pending" | "members" | "tree" | "add" | "emails" | "integrations";
+type DashboardSection = "pending" | "members" | "emails";
+
+const INTEGRATION_ROWS = [
+  ["Groq", "groqConfigured"],
+  ["Cloudinary", "cloudinaryConfigured"],
+  ["Coordination", "coordinationConfigured"],
+] as const satisfies ReadonlyArray<readonly [string, keyof AdminIntegrations]>;
+
+type DashboardData = {
+  pending: PendingSubmission[];
+  members: Member[];
+  emails: ApprovedEmail[];
+  unavailable: Set<DashboardSection>;
+};
+
+const EMPTY_DASHBOARD: DashboardData = {
+  pending: [],
+  members: [],
+  emails: [],
+  unavailable: new Set(),
+};
+
+function fetchDashboard(token: string) {
+  return Promise.allSettled([
+    fetchPending(token),
+    fetchMembers(),
+    adminFetchApprovedEmails(token),
+  ] as const);
+}
+
+function dashboardStateFrom(results: Awaited<ReturnType<typeof fetchDashboard>>): Loadable<DashboardData> {
+  const [pendingResult, membersResult, emailsResult] = results;
+  const unavailable = new Set<DashboardSection>();
+  if (pendingResult.status === "rejected") unavailable.add("pending");
+  if (membersResult.status === "rejected") unavailable.add("members");
+  if (emailsResult.status === "rejected") unavailable.add("emails");
+
+  if (unavailable.size === results.length) {
+    const firstFailure = results.find((result) => result.status === "rejected");
+    return {
+      status: "error",
+      problem: asApiProblem(
+        firstFailure?.status === "rejected" ? firstFailure.reason : undefined,
+        "Admin data could not be loaded.",
+      ),
+    };
+  }
+
+  const data: DashboardData = {
+    pending: pendingResult.status === "fulfilled" ? pendingResult.value : [],
+    members: membersResult.status === "fulfilled" ? membersResult.value : [],
+    emails: emailsResult.status === "fulfilled" ? emailsResult.value : [],
+    unavailable,
+  };
+
+  if (unavailable.size > 0) {
+    const firstFailure = results.find((result) => result.status === "rejected");
+    return {
+      status: "partial",
+      data,
+      problem: asApiProblem(
+        firstFailure?.status === "rejected" ? firstFailure.reason : undefined,
+        "Some admin data could not be loaded.",
+      ),
+    };
+  }
+
+  return data.pending.length === 0 && data.members.length === 0 && data.emails.length === 0
+    ? { status: "empty", data }
+    : { status: "ready", data };
+}
 
 export default function AdminPage() {
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setToken] = useState<string | null>(() =>
+    typeof window === "undefined" ? null : localStorage.getItem("shajra_admin_token"),
+  );
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
   const [tab, setTab] = useState<Tab>("pending");
-  const [pending, setPending] = useState<PendingSubmission[]>([]);
-  const [members, setMembers] = useState<Member[]>([]);
-  const [emails, setEmails] = useState<ApprovedEmail[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [dashboardState, setDashboardState] = useState<Loadable<DashboardData>>({
+    status: "loading",
+  });
+  const [refreshing, setRefreshing] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-
-  useEffect(() => {
-    const saved = localStorage.getItem("shajra_admin_token");
-    if (saved) setToken(saved);
-  }, []);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const dashboardRequest = useRef(0);
 
   const handleLogin = async () => {
     setLoginLoading(true);
     setLoginError("");
     try {
       const t = await adminLogin(username, password);
+      setDashboardState({ status: "loading" });
       setToken(t);
       localStorage.setItem("shajra_admin_token", t);
     } catch {
       setLoginError("Invalid username or password");
+    } finally {
+      setLoginLoading(false);
     }
-    setLoginLoading(false);
   };
 
   const handleLogout = () => {
@@ -81,42 +153,71 @@ export default function AdminPage() {
     localStorage.removeItem("shajra_admin_token");
   };
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (block = false) => {
     if (!token) return;
-    setLoading(true);
+    const request = ++dashboardRequest.current;
+    if (block) setDashboardState({ status: "loading" });
+    setRefreshing(true);
     try {
-      const [p, m, e] = await Promise.all([fetchPending(token), fetchMembers(), adminFetchApprovedEmails(token)]);
-      setPending(p);
-      setMembers(m);
-      setEmails(e);
-    } catch { /* token expired */ }
-    setLoading(false);
+      const results = await fetchDashboard(token);
+      if (request !== dashboardRequest.current) return;
+      setDashboardState(dashboardStateFrom(results));
+    } finally {
+      if (request === dashboardRequest.current) setRefreshing(false);
+    }
   }, [token]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    if (!token) return;
+    const request = ++dashboardRequest.current;
+    fetchDashboard(token).then((results) => {
+      if (request !== dashboardRequest.current) return;
+      setDashboardState(dashboardStateFrom(results));
+    });
+    return () => {
+      dashboardRequest.current += 1;
+    };
+  }, [token]);
 
   const handleApprove = async (id: string) => {
     if (!token) return;
     setActionLoading(id);
+    setActionError(null);
     try { await approveSubmission(token, id); await loadData(); }
-    catch (e) { alert("Failed: " + (e as Error).message); }
-    setActionLoading(null);
+    catch (error: unknown) { setActionError(asApiProblem(error, "The submission could not be approved.").message); }
+    finally { setActionLoading(null); }
   };
 
   const handleReject = async (id: string) => {
     if (!token) return;
     setActionLoading(id);
+    setActionError(null);
     try { await rejectSubmission(token, id); await loadData(); }
-    catch (e) { alert("Failed: " + (e as Error).message); }
-    setActionLoading(null);
+    catch (error: unknown) { setActionError(asApiProblem(error, "The submission could not be rejected.").message); }
+    finally { setActionLoading(null); }
   };
 
   const handleDelete = async (id: string) => {
     if (!token || !confirm("Delete this member permanently?")) return;
     setActionLoading(id);
+    setActionError(null);
     try { await adminDeleteMember(token, id); await loadData(); }
-    catch (e) { alert("Failed: " + (e as Error).message); }
-    setActionLoading(null);
+    catch (error: unknown) { setActionError(asApiProblem(error, "The member could not be deleted.").message); }
+    finally { setActionLoading(null); }
+  };
+
+  const handleUndo = async () => {
+    if (!token) return;
+    setActionLoading("undo");
+    setActionError(null);
+    try {
+      await adminUndo(token);
+      await loadData();
+    } catch (error: unknown) {
+      setActionError(asApiProblem(error, "The last change could not be undone.").message);
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   // ── Login ──
@@ -134,20 +235,20 @@ export default function AdminPage() {
 
           <div className="space-y-4">
             <div>
-              <label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Username</label>
-              <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLogin()} className="input-heritage" placeholder="admin" />
+              <label htmlFor="admin-username" className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Username</label>
+              <input id="admin-username" type="text" value={username} onChange={(e) => setUsername(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLogin()} className="input-heritage" placeholder="admin" />
             </div>
             <div>
-              <label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Password</label>
-              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLogin()} className="input-heritage" placeholder="Enter password" />
+              <label htmlFor="admin-password" className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Password</label>
+              <input id="admin-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLogin()} className="input-heritage" placeholder="Enter password" />
             </div>
             {loginError && (
-              <div className="flex items-center gap-2 text-terracotta text-sm bg-terracotta-light p-3 rounded-lg">
+              <div role="alert" className="flex items-center gap-2 text-terracotta text-sm bg-terracotta-light p-3 rounded-lg">
                 <AlertTriangle className="w-4 h-4" />
                 {loginError}
               </div>
             )}
-            <button onClick={handleLogin} disabled={loginLoading} className="btn-primary w-full justify-center py-3">
+            <button type="button" onClick={handleLogin} disabled={loginLoading} className="btn-primary w-full justify-center py-3">
               {loginLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
               Sign In
             </button>
@@ -158,6 +259,8 @@ export default function AdminPage() {
   }
 
   // ── Dashboard ──
+  const dashboard = "data" in dashboardState ? dashboardState.data : EMPTY_DASHBOARD;
+  const { pending, members, emails, unavailable } = dashboard;
   const pendingOnly = pending.filter((p) => p.Status === "Pending");
 
   return (
@@ -167,7 +270,7 @@ export default function AdminPage() {
           <h1 className="heading-serif text-2xl sm:text-3xl font-bold">Admin Dashboard</h1>
           <p className="text-text-muted text-sm mt-1">Manage submissions, members, and access</p>
         </div>
-        <button onClick={handleLogout} className="flex items-center gap-1.5 px-3 py-2 text-sm text-text-muted hover:text-terracotta hover:bg-terracotta-light rounded-lg transition-heritage">
+        <button type="button" onClick={handleLogout} className="flex items-center gap-1.5 px-3 py-2 text-sm text-text-muted hover:text-terracotta hover:bg-terracotta-light rounded-lg transition-heritage">
           <LogOut className="w-4 h-4" />
           Logout
         </button>
@@ -181,9 +284,10 @@ export default function AdminPage() {
           { key: "tree", label: "Tree Editor", icon: Network },
           { key: "add", label: "Add Member", icon: Plus },
           { key: "emails", label: "Approved Emails", icon: Mail, badge: emails.length },
-          { key: "settings", label: "Settings", icon: Settings },
+          { key: "integrations", label: "Integrations", icon: Settings },
         ].map((t) => (
           <button
+            type="button"
             key={t.key}
             onClick={() => setTab(t.key as Tab)}
             className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition-heritage whitespace-nowrap ${
@@ -199,76 +303,99 @@ export default function AdminPage() {
             )}
           </button>
         ))}
-      <button onClick={loadData} disabled={loading} className="ml-auto text-xs text-text-light hover:text-accent transition-heritage flex-shrink-0 pl-4">
-          {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Refresh"}
+        <button
+          type="button"
+          onClick={() => loadData()}
+          disabled={refreshing}
+          className="ml-auto flex-shrink-0 pl-4 text-xs text-text-light transition-heritage hover:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          {refreshing ? <Loader2 aria-label="Refreshing dashboard" className="h-3.5 w-3.5 animate-spin" /> : "Refresh"}
         </button>
       </div>
 
       {/* Quick Actions Bar */}
       <div className="flex items-center gap-2 mb-5 flex-wrap">
         <button
-          onClick={async () => {
-            try {
-              const result = await adminUndo(token!);
-              alert(`✅ ${result.action || "Undone"}`);
-              loadData();
-            } catch (e: any) { alert(e.message); }
-          }}
+          type="button"
+          onClick={handleUndo}
+          disabled={actionLoading === "undo"}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-text-muted hover:text-accent hover:bg-accent/5 border border-border rounded-lg transition-heritage"
         >
-          <Undo2 className="w-3.5 h-3.5" />
+          {actionLoading === "undo" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Undo2 className="w-3.5 h-3.5" />}
           Undo Last Change
-        </button>
-        <button
-          onClick={async () => {
-            try {
-              await adminHeal(token!);
-            } catch (error: unknown) {
-              alert(error instanceof Error ? error.message : "Failed to run heal");
-            }
-          }}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald hover:bg-emerald/5 border border-emerald/20 rounded-lg transition-heritage"
-        >
-          <HeartPulse className="w-3.5 h-3.5" />
-          Heal Graph
         </button>
       </div>
 
-      {tab === "pending" && <PendingTab submissions={pendingOnly} actionLoading={actionLoading} onApprove={handleApprove} onReject={handleReject} />}
-      {tab === "members" && <MembersTab members={members} actionLoading={actionLoading} onDelete={handleDelete} />}
-      {tab === "tree" && <AdminTreeEditor token={token!} onUpdated={loadData} />}
-      {tab === "add" && <AddMemberTab token={token} onCreated={loadData} members={members} />}
-      {tab === "emails" && <EmailsTab emails={emails} token={token} onUpdated={loadData} />}
-      {tab === "settings" && <SettingsTab token={token} />}
+      {actionError && (
+        <div role="alert" className="mb-5 rounded-lg border border-terracotta-light bg-terracotta-light/30 p-3 text-sm text-terracotta">
+          {actionError}
+        </div>
+      )}
+
+      {dashboardState.status === "partial" && (
+        <div role="status" className="mb-5 rounded-lg border border-terracotta-light bg-terracotta-light/20 p-3">
+          <p className="text-sm font-medium text-text-primary">Some dashboard data is unavailable</p>
+          <p className="mt-1 text-xs text-text-muted">{dashboardState.problem.message}</p>
+        </div>
+      )}
+
+      {dashboardState.status === "loading" && <AsyncState state="loading" title="Loading admin data" />}
+      {dashboardState.status === "error" && (
+        <AsyncState state="error" title="Admin data unavailable" message={dashboardState.problem.message} actionLabel="Retry" onAction={() => loadData(true)} />
+      )}
+
+      {dashboardState.status !== "loading" && dashboardState.status !== "error" && (
+        <>
+          {tab === "pending" && (unavailable.has("pending") ? <AdminSectionUnavailable title="Submissions unavailable" onRetry={() => loadData()} /> : <PendingTab submissions={pendingOnly} actionLoading={actionLoading} onApprove={handleApprove} onReject={handleReject} />)}
+          {tab === "members" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" onRetry={() => loadData()} /> : <MembersTab members={members} actionLoading={actionLoading} onDelete={handleDelete} />)}
+          {tab === "tree" && <AdminTreeEditor token={token} onUpdated={() => loadData()} />}
+          {tab === "add" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" onRetry={() => loadData()} /> : <AddMemberTab token={token} onCreated={() => loadData()} members={members} />)}
+          {tab === "emails" && (unavailable.has("emails") ? <AdminSectionUnavailable title="Approved emails unavailable" onRetry={() => loadData()} /> : <EmailsTab emails={emails} token={token} onUpdated={() => loadData()} />)}
+          {tab === "integrations" && <IntegrationsTab token={token} />}
+        </>
+      )}
     </div>
   );
+}
+
+function AdminSectionUnavailable({ title, onRetry }: { title: string; onRetry: () => void }) {
+  return <AsyncState state="error" title={title} message="This section could not be loaded." actionLabel="Retry" onAction={onRetry} />;
 }
 
 function EmailsTab({ emails, token, onUpdated }: { emails: ApprovedEmail[]; token: string; onUpdated: () => void }) {
   const [newEmail, setNewEmail] = useState("");
   const [newName, setNewName] = useState("");
   const [loadingId, setLoadingId] = useState<string|null>(null);
+  const [emailError, setEmailError] = useState<string | null>(null);
 
   const handleAdd = async () => {
     if (!newEmail) return;
     setLoadingId("add");
+    setEmailError(null);
     try {
       await adminAddApprovedEmail(token, newEmail, newName);
       setNewEmail("");
       setNewName("");
       onUpdated();
-    } catch (e: any) { alert(e.message); }
-    setLoadingId(null);
+    } catch (error: unknown) {
+      setEmailError(asApiProblem(error, "The approved email could not be added.").message);
+    } finally {
+      setLoadingId(null);
+    }
   };
 
   const handleRemove = async (id: string) => {
     if (!confirm("Remove this email?")) return;
     setLoadingId(id);
+    setEmailError(null);
     try {
       await adminDeleteApprovedEmail(token, id);
       onUpdated();
-    } catch (e: any) { alert(e.message); }
-    setLoadingId(null);
+    } catch (error: unknown) {
+      setEmailError(asApiProblem(error, "The approved email could not be removed.").message);
+    } finally {
+      setLoadingId(null);
+    }
   };
 
   return (
@@ -279,10 +406,13 @@ function EmailsTab({ emails, token, onUpdated }: { emails: ApprovedEmail[]; toke
           To prevent spam and protect privacy, only users whose email is on this list can leave comments or post stories on profiles.
         </p>
 
+        {emailError && <div role="alert" className="mb-4 rounded-lg border border-terracotta-light bg-terracotta-light/30 p-3 text-sm text-terracotta">{emailError}</div>}
         <div className="flex flex-col sm:flex-row gap-3">
-          <input type="text" placeholder="Name (optional)" value={newName} onChange={e=>setNewName(e.target.value)} className="input-heritage sm:w-1/3" />
-          <input type="email" placeholder="name@example.com *" value={newEmail} onChange={e=>setNewEmail(e.target.value)} className="input-heritage flex-1" />
-          <button onClick={handleAdd} disabled={!newEmail || loadingId === "add"} className="btn-primary whitespace-nowrap">
+          <label className="sr-only" htmlFor="approved-email-name">Name</label>
+          <input id="approved-email-name" type="text" placeholder="Name (optional)" value={newName} onChange={e=>setNewName(e.target.value)} className="input-heritage sm:w-1/3" />
+          <label className="sr-only" htmlFor="approved-email-address">Email</label>
+          <input id="approved-email-address" type="email" placeholder="name@example.com *" value={newEmail} onChange={e=>setNewEmail(e.target.value)} className="input-heritage flex-1" />
+          <button type="button" onClick={handleAdd} disabled={!newEmail || loadingId === "add"} className="btn-primary whitespace-nowrap">
             {loadingId === "add" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} Add Email
           </button>
         </div>
@@ -306,7 +436,7 @@ function EmailsTab({ emails, token, onUpdated }: { emails: ApprovedEmail[]; toke
                   <td className="px-6 py-4 font-medium text-text-primary">{e.Email}</td>
                   <td className="px-6 py-4 text-text-muted">{e.Name || "—"}</td>
                   <td className="px-6 py-4 text-right">
-                    <button onClick={() => handleRemove(e.id)} disabled={loadingId === e.id} className="text-text-light hover:text-terracotta p-2 rounded-lg hover:bg-terracotta/10 transition-colors">
+                    <button type="button" aria-label={`Remove ${e.Email}`} onClick={() => handleRemove(e.id)} disabled={loadingId === e.id} className="text-text-light hover:text-terracotta p-2 rounded-lg hover:bg-terracotta/10 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
                       {loadingId === e.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
                     </button>
                   </td>
@@ -318,6 +448,10 @@ function EmailsTab({ emails, token, onUpdated }: { emails: ApprovedEmail[]; toke
       </div>
     </div>
   );
+}
+
+function submissionName(submission: PendingSubmission): string {
+  return submission.CleanFullName || submission.RawFullName || "Unknown";
 }
 
 function PendingTab({ submissions, actionLoading, onApprove, onReject }: { submissions: PendingSubmission[]; actionLoading: string | null; onApprove: (id: string) => void; onReject: (id: string) => void }) {
@@ -340,7 +474,7 @@ function PendingTab({ submissions, actionLoading, onApprove, onReject }: { submi
           <div className="flex items-start justify-between gap-4">
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2.5 mb-2 flex-wrap">
-                <h3 className="font-serif font-semibold text-lg text-text-primary">{sub.CleanFullName || sub.RawFullName || "Unknown"}</h3>
+                <h3 className="font-serif font-semibold text-lg text-text-primary">{submissionName(sub)}</h3>
                 {sub.AIDuplicateFlag && (
                   <span className="flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-full bg-terracotta-light text-terracotta font-medium">
                     <AlertTriangle className="w-3 h-3" /> Duplicate?
@@ -365,14 +499,14 @@ function PendingTab({ submissions, actionLoading, onApprove, onReject }: { submi
               )}
             </div>
             <div className="flex items-center gap-2 flex-shrink-0">
-              <button onClick={() => setExpanded(expanded === sub.id ? null : sub.id)} className="p-2 rounded-lg text-text-light hover:text-text-primary hover:bg-bg-secondary transition-heritage" title="View details">
-                <Eye className="w-4 h-4" />
+              <button type="button" aria-label={`View ${submissionName(sub)} details`} onClick={() => setExpanded(expanded === sub.id ? null : sub.id)} className="p-2 rounded-lg text-text-light hover:text-text-primary hover:bg-bg-secondary transition-heritage">
+                <Eye aria-hidden="true" className="w-4 h-4" />
               </button>
-              <button onClick={() => onApprove(sub.id)} disabled={actionLoading === sub.id} className="flex items-center gap-1 px-3 py-2 bg-emerald-light text-emerald rounded-lg text-xs font-medium hover:bg-emerald hover:text-white transition-heritage disabled:opacity-50">
-                {actionLoading === sub.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} Approve
+              <button type="button" aria-label={`Approve ${submissionName(sub)}`} onClick={() => onApprove(sub.id)} disabled={actionLoading === sub.id} className="flex items-center gap-1 px-3 py-2 bg-emerald-light text-emerald rounded-lg text-xs font-medium hover:bg-emerald hover:text-white transition-heritage disabled:opacity-50">
+                {actionLoading === sub.id ? <Loader2 aria-hidden="true" className="w-3.5 h-3.5 animate-spin" /> : <Check aria-hidden="true" className="w-3.5 h-3.5" />} Approve
               </button>
-              <button onClick={() => onReject(sub.id)} disabled={actionLoading === sub.id} className="flex items-center gap-1 px-3 py-2 bg-terracotta-light text-terracotta rounded-lg text-xs font-medium hover:bg-terracotta hover:text-white transition-heritage disabled:opacity-50">
-                <X className="w-3.5 h-3.5" /> Reject
+              <button type="button" aria-label={`Reject ${submissionName(sub)}`} onClick={() => onReject(sub.id)} disabled={actionLoading === sub.id} className="flex items-center gap-1 px-3 py-2 bg-terracotta-light text-terracotta rounded-lg text-xs font-medium hover:bg-terracotta hover:text-white transition-heritage disabled:opacity-50">
+                <X aria-hidden="true" className="w-3.5 h-3.5" /> Reject
               </button>
             </div>
           </div>
@@ -418,8 +552,8 @@ function MembersTab({ members, actionLoading, onDelete }: { members: Member[]; a
               <div className="text-xs text-text-muted truncate">{m.CurrentCity || ""}{m.CurrentCountry ? ` | ${m.CurrentCountry}` : ""}{m.Generation ? ` | Gen ${m.Generation}` : ""}</div>
             </div>
           </div>
-          <button onClick={() => onDelete(m.id)} disabled={actionLoading === m.id} className="p-2 text-text-light hover:text-terracotta hover:bg-terracotta-light rounded-lg transition-heritage">
-            {actionLoading === m.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+          <button type="button" aria-label={`Delete ${m.FullName || "member"}`} onClick={() => onDelete(m.id)} disabled={actionLoading === m.id} className="p-2 text-text-light hover:text-terracotta hover:bg-terracotta-light rounded-lg transition-heritage">
+            {actionLoading === m.id ? <Loader2 aria-hidden="true" className="w-4 h-4 animate-spin" /> : <Trash2 aria-hidden="true" className="w-4 h-4" />}
           </button>
         </div>
       ))}
@@ -435,10 +569,15 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
   });
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
-    if (!form.FullName.trim()) return alert("Full Name is required");
+    if (!form.FullName.trim()) {
+      setFormError("Full Name is required.");
+      return;
+    }
     setSaving(true);
+    setFormError(null);
     try {
       const fields: Record<string, unknown> = { ...form };
       if (form.Generation) fields.Generation = parseInt(form.Generation);
@@ -449,8 +588,11 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
       setForm({ FullName: "", FatherName: "", MotherName: "", SpouseName: "", DateOfBirth: "", DateOfDeath: "", CurrentCity: "", CurrentCountry: "", BurialLocation: "", Biography: "", Gender: "", Generation: "", Branch: "", FatherRecordId: "", MotherRecordId: "", SpouseRecordId: "", IsAlive: true });
       onCreated();
       setTimeout(() => setSuccess(false), 3000);
-    } catch (e) { alert("Failed: " + (e as Error).message); }
-    setSaving(false);
+    } catch (error: unknown) {
+      setFormError(asApiProblem(error, "The member could not be added.").message);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -463,8 +605,14 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
         </div>
       )}
 
+      {formError && (
+        <div role="alert" className="mb-6 rounded-lg border border-terracotta-light bg-terracotta-light/30 px-4 py-3 text-sm text-terracotta">
+          {formError}
+        </div>
+      )}
+
       <div className="grid sm:grid-cols-2 gap-4">
-        <div><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Full Name *</label><input type="text" value={form.FullName} onChange={(e) => setForm({ ...form, FullName: e.target.value })} className="input-heritage" placeholder="Muhammad Ali Khan" /></div>
+        <div><label htmlFor="admin-member-name" className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Full Name *</label><input id="admin-member-name" type="text" value={form.FullName} onChange={(e) => setForm({ ...form, FullName: e.target.value })} className="input-heritage" placeholder="Muhammad Ali Khan" /></div>
         <div><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Gender</label><select value={form.Gender} onChange={(e) => setForm({ ...form, Gender: e.target.value })} className="input-heritage"><option value="">Select</option><option value="Male">Male</option><option value="Female">Female</option><option value="Other">Other</option></select></div>
         <div><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Father Name</label><input type="text" value={form.FatherName} onChange={(e) => setForm({ ...form, FatherName: e.target.value })} className="input-heritage" placeholder="Father's name" /></div>
         <div><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Link to Father</label><select value={form.FatherRecordId} onChange={(e) => setForm({ ...form, FatherRecordId: e.target.value })} className="input-heritage"><option value="">-- Select --</option>{members.filter(m => m.Gender !== "Female").map((m) => (<option key={m.id} value={m.id}>{m.FullName}</option>))}</select></div>
@@ -482,7 +630,7 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
 
       <div className="mt-4"><label className="text-[11px] text-text-light uppercase tracking-wide mb-1.5 block">Biography</label><textarea value={form.Biography} onChange={(e) => setForm({ ...form, Biography: e.target.value })} rows={3} className="input-heritage" placeholder="Notes about this family member..." /></div>
 
-      <button onClick={handleSubmit} disabled={saving} className="btn-primary mt-6">
+      <button type="button" aria-label="Create member record" onClick={handleSubmit} disabled={saving} className="btn-primary mt-6">
         {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
         Add Member
       </button>
@@ -490,74 +638,64 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
   );
 }
 
-function SettingsTab({ token }: { token: string }) {
-  const [groqKey, setGroqKey] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [success, setSuccess] = useState(false);
+function IntegrationsTab({ token }: { token: string }) {
+  const [integrationState, setIntegrationState] = useState<Loadable<AdminIntegrations>>({
+    status: "loading",
+  });
+  const integrationRequest = useRef(0);
 
-  useEffect(() => {
-    setLoading(true);
-    adminFetchSettings(token)
-      .then((data) => setGroqKey(data.GROQ_API_KEY || ""))
-      .catch((e) => console.error("Could not fetch settings", e))
-      .finally(() => setLoading(false));
+  const loadIntegrations = useCallback(() => {
+    const request = ++integrationRequest.current;
+    adminFetchIntegrations(token).then(
+      (data) => {
+        if (request !== integrationRequest.current) return;
+        setIntegrationState({ status: "ready", data });
+      },
+      (error: unknown) => {
+        if (request !== integrationRequest.current) return;
+        setIntegrationState({
+          status: "error",
+          problem: asApiProblem(error, "Integration status could not be loaded."),
+        });
+      },
+    );
   }, [token]);
 
-  const handleSave = async () => {
-    setSaving(true);
-    setSuccess(false);
-    try {
-      await adminUpdateSettings(token, { GROQ_API_KEY: groqKey });
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 3000);
-    } catch (e: any) {
-      alert("Failed to save settings: " + e.message);
-    }
-    setSaving(false);
+  useEffect(() => {
+    loadIntegrations();
+    return () => {
+      integrationRequest.current += 1;
+    };
+  }, [loadIntegrations]);
+
+  const retryIntegrations = () => {
+    setIntegrationState({ status: "loading" });
+    loadIntegrations();
   };
 
   return (
-    <div className="heritage-card p-7 max-w-2xl animate-fadeInUp">
-      <h2 className="font-serif text-xl font-semibold mb-2">Backend Settings</h2>
+    <div className="max-w-2xl rounded-lg border border-border bg-bg-card p-7 shadow-card animate-fadeInUp">
+      <h2 className="font-serif text-xl font-semibold mb-2">Integration Status</h2>
       <p className="text-text-muted text-sm mb-6 pb-6 border-b border-border">
-        Configure API integrations and advanced system settings dynamically without restarting the server.
+        Backend integrations are configured outside this application.
       </p>
 
-      {success && (
-        <div className="mb-6 flex items-center gap-2 px-4 py-3 rounded-lg bg-emerald-light text-emerald text-sm font-medium">
-          <Check className="w-4 h-4" /> Settings updated successfully!
-        </div>
-      )}
-
-      {loading ? (
-        <div className="flex items-center gap-2 text-text-muted">
-          <Loader2 className="w-4 h-4 animate-spin" /> Loading settings...
-        </div>
-      ) : (
-        <div className="space-y-4">
-          <div>
-            <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block font-semibold">
-              Groq API Key (AI Processing)
-            </label>
-            <input 
-              type="password" 
-              value={groqKey} 
-              onChange={(e) => setGroqKey(e.target.value)} 
-              className="input-heritage w-full font-mono text-sm" 
-              placeholder="gsk_..." 
-            />
-            <p className="text-xs text-text-muted mt-2">
-              Used by the backend to parse unstructured form submissions into standard JSON lineage using the LLaMa-3 model.
-            </p>
-          </div>
-
-          <div className="pt-4">
-            <button onClick={handleSave} disabled={saving} className="btn-primary">
-              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : "Save Settings"}
-            </button>
-          </div>
-        </div>
+      {integrationState.status === "loading" && <AsyncState state="loading" title="Loading integration status" />}
+      {integrationState.status === "error" && <AsyncState state="error" title="Integration status unavailable" message={integrationState.problem.message} actionLabel="Retry" onAction={retryIntegrations} />}
+      {integrationState.status === "ready" && (
+        <dl className="divide-y divide-border">
+          {INTEGRATION_ROWS.map(([label, key]) => {
+            const configured = integrationState.data[key];
+            return (
+              <div key={key} className="flex items-center justify-between gap-4 py-4 first:pt-0 last:pb-0">
+                <dt className="text-sm font-medium text-text-primary">{label}</dt>
+                <dd className={configured ? "text-sm font-medium text-emerald" : "text-sm font-medium text-text-muted"}>
+                  {configured ? "Configured" : "Not configured"}
+                </dd>
+              </div>
+            );
+          })}
+        </dl>
       )}
     </div>
   );

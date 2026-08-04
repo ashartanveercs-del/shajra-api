@@ -1,38 +1,72 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { fetchTree, submitDirectForm, uploadImage, type Member } from "@/lib/api";
+import AsyncState from "@/components/feedback/AsyncState";
+import { asApiProblem, type Loadable } from "@/lib/loadable";
 import { User, Heart, Loader2, Plus, ZoomIn, ZoomOut, Maximize, Edit3, X, Save } from "lucide-react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 
-function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Member }, onSuggestEdit: (m: Member) => void }) {
+type SuggestionForm = {
+  fullName: string;
+  fatherName: string;
+  motherName: string;
+  spouseName: string;
+  dateOfBirth: string;
+  dateOfDeath: string;
+  location: string;
+  biography: string;
+  gender: string;
+  profileImage: string;
+};
+
+const EMPTY_SUGGESTION: SuggestionForm = {
+  fullName: "",
+  fatherName: "",
+  motherName: "",
+  spouseName: "",
+  dateOfBirth: "",
+  dateOfDeath: "",
+  location: "",
+  biography: "",
+  gender: "Male",
+  profileImage: "",
+};
+
+function AvatarCircle({ member }: { member: Member }) {
+  return (
+    <div className="flex flex-col items-center">
+      <div
+        className="relative z-10 mb-1.5 flex h-10 w-10 items-center justify-center rounded-full border border-black/5 bg-white/70 bg-cover bg-center font-serif text-base font-bold shadow-sm sm:h-12 sm:w-12 sm:text-lg"
+        style={
+          member.ProfileImageUrl
+            ? { backgroundImage: `url(${member.ProfileImageUrl})` }
+            : undefined
+        }
+      >
+        {!member.ProfileImageUrl && (member.FullName || "?")[0]}
+        {member.IsAlive && (
+          <div className="absolute -right-1 -top-1 z-20 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-emerald/20 bg-white shadow-sm">
+            <Heart className="h-2 w-2 fill-emerald text-emerald" />
+          </div>
+        )}
+      </div>
+      <div className="max-w-[80px] truncate text-center text-[11px] font-semibold leading-none opacity-90 sm:text-xs">
+        {member.FullName?.split(" ")[0]}
+      </div>
+    </div>
+  );
+}
+
+function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Member }, onSuggestEdit: (m: Member, trigger: HTMLButtonElement) => void }) {
   const isCouple = !!member.Spouse;
-  
+
   const getGenderBg = (gender?: string) => {
     if (gender === "Male") return "bg-sky-light/80 border-sky/30 text-sky-900";
     if (gender === "Female") return "bg-plum-light/80 border-plum/30 text-plum-900";
     return "bg-bg-secondary border-border text-text-primary";
   };
-
-  const AvatarCircle = ({ m, label }: { m: Member, label?: string }) => (
-    <div className="flex flex-col items-center">
-      <div
-        className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-white/70 flex items-center justify-center text-base sm:text-lg font-serif font-bold mb-1.5 bg-cover bg-center relative z-10 border border-black/5 shadow-sm"
-        style={m.ProfileImageUrl ? { backgroundImage: `url(${m.ProfileImageUrl})` } : {}}
-      >
-        {!m.ProfileImageUrl && (m.FullName || "?")[0]}
-        {m.IsAlive && (
-          <div className="absolute -top-1 -right-1 z-20 w-3.5 h-3.5 rounded-full bg-white flex items-center justify-center border border-emerald/20 shadow-sm">
-            <Heart className="w-2 h-2 text-emerald fill-emerald" />
-          </div>
-        )}
-      </div>
-      <div className="font-semibold text-[11px] sm:text-xs leading-none max-w-[80px] truncate text-center opacity-90">
-        {m.FullName?.split(" ")[0]}
-      </div>
-    </div>
-  );
 
   return (
     <div className="group inline-block">
@@ -46,9 +80,10 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
           </div>
         )}
         <button 
+          type="button"
           onClick={(e) => {
             e.preventDefault();
-            onSuggestEdit(member);
+            onSuggestEdit(member, e.currentTarget);
           }}
           className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all flex items-center gap-1.5 p-1.5 bg-white/90 backdrop-blur rounded-lg text-text-primary shadow-lg border border-accent/20 z-30 hover:bg-white"
           title="Suggest an improvement"
@@ -58,7 +93,7 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
         </button>
 
         <div className="flex items-start gap-4 mb-2">
-          <AvatarCircle m={member} />
+          <AvatarCircle member={member} />
           {member.Spouse && (
             <>
               <div className="h-10 sm:h-12 flex items-center justify-center">
@@ -71,7 +106,7 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
                 {member.Spouse.FullName === "Ashar Tanveer" && (
                    <div className="absolute -top-6 left-1/2 -translate-x-1/2 bg-accent text-white px-2 py-0.5 rounded-full text-[8px] font-bold shadow-lg z-[110]">CREATOR</div>
                 )}
-                <AvatarCircle m={member.Spouse} />
+                <AvatarCircle member={member.Spouse} />
               </div>
             </>
           )}
@@ -93,7 +128,7 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
   );
 }
 
-function FamilyTreeNode({ member, onSuggestEdit }: { member: Member, onSuggestEdit: (m: Member) => void }) {
+function FamilyTreeNode({ member, onSuggestEdit }: { member: Member, onSuggestEdit: (m: Member, trigger: HTMLButtonElement) => void }) {
   const isCouple = !!member.Spouse;
   const linePos = isCouple ? 'calc(50% - 64px)' : '50%';
 
@@ -112,37 +147,60 @@ function FamilyTreeNode({ member, onSuggestEdit }: { member: Member, onSuggestEd
 }
 
 export default function TreePage() {
-  const [tree, setTree] = useState<Member[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  
+  const [treeState, setTreeState] = useState<Loadable<Member[]>>({ status: "loading" });
+  const treeRequest = useRef(0);
+  const suggestionTrigger = useRef<HTMLButtonElement | null>(null);
+
   const [editingMember, setEditingMember] = useState<Member | null>(null);
-  const [suggestForm, setSuggestForm] = useState<any>({});
+  const [suggestForm, setSuggestForm] = useState<SuggestionForm>(EMPTY_SUGGESTION);
   const [submitting, setSubmitting] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
+  const [suggestionProblem, setSuggestionProblem] = useState<string | null>(null);
 
-  const loadTree = () => {
-    setLoading(true);
-    fetchTree()
-      .then(setTree)
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  };
+  const loadTree = useCallback(() => {
+    const request = ++treeRequest.current;
+    fetchTree().then(
+      (data) => {
+        if (request !== treeRequest.current) return;
+        setTreeState(data.length > 0 ? { status: "ready", data } : { status: "empty", data });
+      },
+      (error: unknown) => {
+        if (request !== treeRequest.current) return;
+        setTreeState({
+          status: "error",
+          problem: asApiProblem(error, "Family records could not be loaded."),
+        });
+      },
+    );
+  }, []);
 
   useEffect(() => {
     loadTree();
-  }, []);
+    return () => {
+      treeRequest.current += 1;
+    };
+  }, [loadTree]);
+
+  const retryTree = () => {
+    setTreeState({ status: "loading" });
+    loadTree();
+  };
+
+  const tree = "data" in treeState ? treeState.data : [];
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploadingImage(true);
+    setSuggestionProblem(null);
     try {
       const data = await uploadImage(file);
-      setSuggestForm({ ...suggestForm, profileImage: data.url });
-    } catch (err: any) {
-      alert(err.message || "Failed to upload image.");
+      setSuggestForm((current) => ({ ...current, profileImage: data.url }));
+    } catch (error: unknown) {
+      setSuggestionProblem(
+        asApiProblem(error, "The photo could not be uploaded. Please try again.").message,
+      );
     } finally {
       setUploadingImage(false);
     }
@@ -150,6 +208,7 @@ export default function TreePage() {
 
   const handleSubmitSuggestion = async () => {
     setSubmitting(true);
+    setSuggestionProblem(null);
     try {
       await submitDirectForm(suggestForm);
       setShowSuccess(true);
@@ -157,10 +216,19 @@ export default function TreePage() {
         setShowSuccess(false);
         setEditingMember(null);
       }, 3000);
-    } catch (e: any) {
-      alert("Failed to submit: " + e.message);
+    } catch (error: unknown) {
+      setSuggestionProblem(
+        asApiProblem(error, "The suggestion could not be submitted. Please try again.")
+          .message,
+      );
+    } finally {
+      setSubmitting(false);
     }
-    setSubmitting(false);
+  };
+
+  const closeSuggestion = () => {
+    setEditingMember(null);
+    suggestionTrigger.current?.focus();
   };
 
   return (
@@ -204,30 +272,40 @@ export default function TreePage() {
         .family-tree ul ul::before { content: ''; position: absolute; top: 0; left: 50%; border-left: 2px solid #dcd7cf; width: 0; height: 30px; transform: translateX(-1px); }
       `}} />
 
-      {loading && (
-        <div className="flex items-center justify-center py-20">
-          <Loader2 className="w-6 h-6 animate-spin text-accent" />
-        </div>
-      )}
+      <div
+        className="relative h-[65vh] overflow-hidden rounded-lg border border-border bg-bg-secondary/30 animate-fadeInUp"
+      >
+        {treeState.status === "loading" && (
+          <AsyncState state="loading" title="Loading family tree" />
+        )}
 
-      {!loading && !error && tree.length === 0 && (
-        <div className="heritage-card p-14 text-center animate-fadeInUp">
-          <div className="w-16 h-16 mx-auto mb-5 rounded-2xl bg-bg-secondary flex items-center justify-center">
-            <User className="w-7 h-7 text-text-light" />
+        {treeState.status === "error" && (
+          <AsyncState
+            state="error"
+            title="Tree unavailable"
+            message={treeState.problem.message}
+            actionLabel="Retry"
+            onAction={retryTree}
+          />
+        )}
+
+        {treeState.status === "empty" && (
+          <div className="flex h-full flex-col items-center justify-center px-5 text-center">
+            <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-lg bg-bg-secondary">
+              <User className="h-7 w-7 text-text-light" />
+            </div>
+            <h2 className="font-serif text-xl font-semibold mb-2">No family members yet</h2>
+            <p className="text-text-muted text-sm mb-7 max-w-sm mx-auto">
+              Start building your family tree by adding the very first member of your heritage.
+            </p>
+            <Link href="/submit" className="btn-primary">
+              <Plus className="w-4 h-4" />
+              Add First Member
+            </Link>
           </div>
-          <h2 className="font-serif text-xl font-semibold mb-2">No family members yet</h2>
-          <p className="text-text-muted text-sm mb-7 max-w-sm mx-auto">
-            Start building your family tree by adding the very first member of your heritage.
-          </p>
-          <Link href="/submit" className="btn-primary">
-            <Plus className="w-4 h-4" />
-            Add First Member
-          </Link>
-        </div>
-      )}
+        )}
 
-      {!loading && tree.length > 0 && (
-        <div className="relative animate-fadeInUp bg-bg-secondary/30 rounded-3xl border border-border overflow-hidden" style={{ height: "65vh" }}>
+        {treeState.status === "ready" && (
           <TransformWrapper
             initialScale={1}
             minScale={0.2}
@@ -237,15 +315,15 @@ export default function TreePage() {
           >
             {({ zoomIn, zoomOut, resetTransform }) => (
               <>
-                <div className="absolute top-4 right-4 z-10 flex flex-col gap-1.5 bg-white/90 backdrop-blur-sm p-1.5 rounded-xl shadow-sm border border-border">
-                  <button onClick={() => zoomIn()} className="p-2 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-text-primary transition-colors" title="Zoom In">
+                <div className="absolute top-4 right-4 z-10 flex flex-col gap-1.5 bg-white/90 backdrop-blur-sm p-1.5 rounded-lg shadow-sm border border-border">
+                  <button type="button" aria-label="Zoom in" onClick={() => zoomIn()} className="p-2 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-text-primary transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent" title="Zoom In">
                     <ZoomIn className="w-5 h-5" />
                   </button>
-                  <button onClick={() => zoomOut()} className="p-2 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-text-primary transition-colors" title="Zoom Out">
+                  <button type="button" aria-label="Zoom out" onClick={() => zoomOut()} className="p-2 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-text-primary transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent" title="Zoom Out">
                     <ZoomOut className="w-5 h-5" />
                   </button>
                   <div className="h-px bg-border/50 w-full my-0.5"></div>
-                  <button onClick={() => resetTransform()} className="p-2 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-text-primary transition-colors" title="Reset View">
+                  <button type="button" aria-label="Reset view" onClick={() => resetTransform()} className="p-2 hover:bg-bg-secondary rounded-lg text-text-muted hover:text-text-primary transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent" title="Reset View">
                     <Maximize className="w-4 h-4" />
                   </button>
                 </div>
@@ -257,10 +335,11 @@ export default function TreePage() {
                         <FamilyTreeNode
                           key={root.id}
                           member={root}
-                          onSuggestEdit={(m) => {
+                          onSuggestEdit={(m, trigger) => {
+                            suggestionTrigger.current = trigger;
                             setEditingMember(m);
                             setSuggestForm({
-                              fullName: m.FullName,
+                              fullName: m.FullName || "",
                               fatherName: m.FatherName || "",
                               motherName: m.MotherName || "",
                               spouseName: m.SpouseName || "",
@@ -280,14 +359,14 @@ export default function TreePage() {
               </>
             )}
           </TransformWrapper>
-        </div>
-      )}
+        )}
+      </div>
       {editingMember && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden animate-fadeInUp">
+          <div role="dialog" aria-modal="true" aria-labelledby="suggestion-dialog-title" className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden animate-fadeInUp">
             <div className="flex items-center justify-between p-4 border-b border-border bg-bg-secondary sticky top-0 shrink-0">
-              <h3 className="font-serif font-bold text-lg text-text-primary">Suggest an Update</h3>
-              <button disabled={submitting} onClick={() => setEditingMember(null)} className="p-1 text-text-muted hover:text-text-primary">
+              <h3 id="suggestion-dialog-title" className="font-serif font-bold text-lg text-text-primary">Suggest an Update</h3>
+              <button type="button" aria-label="Close suggestion" disabled={submitting} onClick={closeSuggestion} className="p-1 text-text-muted hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent">
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -303,53 +382,58 @@ export default function TreePage() {
                 </div>
               ) : (
                 <>
-                  <div className="bg-sky/5 p-4 rounded-xl border border-sky/20 mb-4 text-xs text-sky-900 leading-relaxed italic">
+                  {suggestionProblem && (
+                    <div role="alert" className="rounded-lg border border-terracotta-light bg-terracotta-light/30 p-3 text-sm text-terracotta">
+                      {suggestionProblem}
+                    </div>
+                  )}
+                  <div className="bg-sky/5 p-4 rounded-lg border border-sky/20 mb-4 text-xs text-sky-900 leading-relaxed italic">
                     Note: Your changes will appear on the tree once they are reviewed and approved by the family administrator.
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
                     <div className="sm:col-span-2">
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Full Name</label>
-                      <input type="text" value={suggestForm.fullName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, fullName: e.target.value })} className="input-heritage w-full" />
+                      <label htmlFor="suggest-full-name" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Full Name</label>
+                      <input id="suggest-full-name" type="text" value={suggestForm.fullName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, fullName: e.target.value })} className="input-heritage w-full" />
                     </div>
 
                     <div>
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Birth Year</label>
-                      <input type="text" value={suggestForm.dateOfBirth || ""} onChange={(e) => setSuggestForm({ ...suggestForm, dateOfBirth: e.target.value })} className="input-heritage w-full" placeholder="e.g. 1950" />
+                      <label htmlFor="suggest-birth-year" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Birth Year</label>
+                      <input id="suggest-birth-year" type="text" value={suggestForm.dateOfBirth || ""} onChange={(e) => setSuggestForm({ ...suggestForm, dateOfBirth: e.target.value })} className="input-heritage w-full" placeholder="e.g. 1950" />
                     </div>
                     <div>
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Death Year (Leave blank if alive)</label>
-                      <input type="text" value={suggestForm.dateOfDeath || ""} onChange={(e) => setSuggestForm({ ...suggestForm, dateOfDeath: e.target.value })} className="input-heritage w-full" placeholder="e.g. 2024" />
-                    </div>
-
-                    <div>
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Father's Name</label>
-                      <input type="text" value={suggestForm.fatherName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, fatherName: e.target.value })} className="input-heritage w-full" />
-                    </div>
-                    <div>
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Mother's Name</label>
-                      <input type="text" value={suggestForm.motherName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, motherName: e.target.value })} className="input-heritage w-full" />
+                      <label htmlFor="suggest-death-year" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Death Year (Leave blank if alive)</label>
+                      <input id="suggest-death-year" type="text" value={suggestForm.dateOfDeath || ""} onChange={(e) => setSuggestForm({ ...suggestForm, dateOfDeath: e.target.value })} className="input-heritage w-full" placeholder="e.g. 2024" />
                     </div>
 
                     <div>
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Spouse's Name</label>
-                      <input type="text" value={suggestForm.spouseName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, spouseName: e.target.value })} className="input-heritage w-full" />
+                      <label htmlFor="suggest-father-name" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Father&apos;s Name</label>
+                      <input id="suggest-father-name" type="text" value={suggestForm.fatherName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, fatherName: e.target.value })} className="input-heritage w-full" />
                     </div>
                     <div>
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Home City</label>
-                      <input type="text" value={suggestForm.location || ""} onChange={(e) => setSuggestForm({ ...suggestForm, location: e.target.value })} className="input-heritage w-full" />
+                      <label htmlFor="suggest-mother-name" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Mother&apos;s Name</label>
+                      <input id="suggest-mother-name" type="text" value={suggestForm.motherName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, motherName: e.target.value })} className="input-heritage w-full" />
+                    </div>
+
+                    <div>
+                      <label htmlFor="suggest-spouse-name" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Spouse&apos;s Name</label>
+                      <input id="suggest-spouse-name" type="text" value={suggestForm.spouseName || ""} onChange={(e) => setSuggestForm({ ...suggestForm, spouseName: e.target.value })} className="input-heritage w-full" />
+                    </div>
+                    <div>
+                      <label htmlFor="suggest-home-city" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Home City</label>
+                      <input id="suggest-home-city" type="text" value={suggestForm.location || ""} onChange={(e) => setSuggestForm({ ...suggestForm, location: e.target.value })} className="input-heritage w-full" />
                     </div>
 
                     <div className="sm:col-span-2">
                       <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Profile Photo</label>
                       {suggestForm.profileImage ? (
                         <div className="flex items-center gap-4 p-3 border border-border rounded-lg bg-bg-primary">
-                          <img src={suggestForm.profileImage} alt="Preview" className="w-12 h-12 rounded-full object-cover" />
+                          <div role="img" aria-label="Profile preview" className="h-12 w-12 rounded-full bg-cover bg-center" style={{ backgroundImage: `url(${suggestForm.profileImage})` }} />
                           <button type="button" onClick={() => setSuggestForm({ ...suggestForm, profileImage: "" })} className="text-xs text-terracotta hover:underline">Remove</button>
                         </div>
                       ) : (
                         <div className="relative">
-                          <input type="file" accept="image/*" onChange={handlePhotoUpload} disabled={uploadingImage} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                          <input aria-label="Upload profile photo" type="file" accept="image/*" onChange={handlePhotoUpload} disabled={uploadingImage} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer focus-visible:opacity-100" />
                           <div className={`w-full px-4 py-2.5 rounded-lg border border-dashed border-border flex items-center justify-center gap-2 hover:border-accent transition-all ${uploadingImage ? 'opacity-50' : ''}`}>
                             {uploadingImage ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
                             <span className="text-sm font-medium text-text-muted">Upload Photo</span>
@@ -359,8 +443,8 @@ export default function TreePage() {
                     </div>
 
                     <div className="sm:col-span-2">
-                      <label className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Brief Biography / Notes</label>
-                      <textarea rows={4} value={suggestForm.biography || ""} onChange={(e) => setSuggestForm({ ...suggestForm, biography: e.target.value })} className="input-heritage w-full resize-y" />
+                      <label htmlFor="suggest-biography" className="text-xs text-text-light uppercase tracking-wide mb-1.5 block">Brief Biography / Notes</label>
+                      <textarea id="suggest-biography" rows={4} value={suggestForm.biography || ""} onChange={(e) => setSuggestForm({ ...suggestForm, biography: e.target.value })} className="input-heritage w-full resize-y" />
                     </div>
                   </div>
                 </>
@@ -368,9 +452,10 @@ export default function TreePage() {
             </div>
  
             <div className="p-4 border-t border-border bg-bg-secondary flex justify-end gap-3 sticky bottom-0 shrink-0">
-              <button disabled={submitting} onClick={() => setEditingMember(null)} className="px-5 py-2.5 text-sm font-semibold text-text-muted hover:text-text-primary rounded-lg transition-colors">Cancel</button>
+              <button type="button" disabled={submitting} onClick={closeSuggestion} className="px-5 py-2.5 text-sm font-semibold text-text-muted hover:text-text-primary rounded-lg transition-colors">Cancel</button>
               {!showSuccess && (
                 <button 
+                  type="button"
                   onClick={handleSubmitSuggestion}
                   disabled={submitting || uploadingImage}
                   className="btn-primary"

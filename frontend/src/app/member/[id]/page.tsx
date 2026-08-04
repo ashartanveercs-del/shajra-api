@@ -1,9 +1,23 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { fetchMember, fetchMembers, fetchComments, postComment, verifyEmail, fetchAlbums, uploadAlbumPhoto, type Member, type Comment, type Album } from "@/lib/api";
+import {
+  fetchAlbums,
+  fetchComments,
+  fetchMember,
+  fetchMembers,
+  postComment,
+  uploadAlbumPhoto,
+  uploadImage,
+  verifyEmail,
+  type Album,
+  type Comment,
+  type Member,
+} from "@/lib/api";
+import AsyncState from "@/components/feedback/AsyncState";
+import { asApiProblem, type Loadable } from "@/lib/loadable";
 import {
   ArrowLeft,
   Heart,
@@ -23,14 +37,23 @@ import {
   Plus
 } from "lucide-react";
 
+type AuxiliarySection = "relationships" | "comments" | "albums";
+
+type MemberProfileData = {
+  member: Member;
+  allMembers: Member[];
+  comments: Comment[];
+  albums: Album[];
+  unavailable: Set<AuxiliarySection>;
+};
+
 export default function MemberProfilePage() {
   const params = useParams();
   const id = params.id as string;
-  const [member, setMember] = useState<Member | null>(null);
-  const [allMembers, setAllMembers] = useState<Member[]>([]);
-  const [comments, setComments] = useState<Comment[]>([]);
-  const [albums, setAlbums] = useState<Album[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [profileState, setProfileState] = useState<Loadable<MemberProfileData, null>>({
+    status: "loading",
+  });
+  const profileRequest = useRef(0);
 
   // Comment form state
   const [commentText, setCommentText] = useState("");
@@ -40,18 +63,82 @@ export default function MemberProfilePage() {
   const [emailError, setEmailError] = useState("");
   const [isEmailVerified, setIsEmailVerified] = useState(false);
   const [submittingComment, setSubmittingComment] = useState(false);
+  const [commentError, setCommentError] = useState<string | null>(null);
+
+  const loadProfile = useCallback(() => {
+    const request = ++profileRequest.current;
+    Promise.allSettled([
+      fetchMember(id),
+      fetchMembers(),
+      fetchComments(id),
+      fetchAlbums(id),
+    ] as const).then((results) => {
+      if (request !== profileRequest.current) return;
+
+      const [memberResult, membersResult, commentsResult, albumsResult] = results;
+      if (memberResult.status === "rejected") {
+        const problem = asApiProblem(memberResult.reason, "This member could not be loaded.");
+        setProfileState(
+          problem.status === 404
+            ? { status: "empty", data: null }
+            : { status: "error", problem },
+        );
+        return;
+      }
+
+      const unavailable = new Set<AuxiliarySection>();
+      if (membersResult.status === "rejected") unavailable.add("relationships");
+      if (commentsResult.status === "rejected") unavailable.add("comments");
+      if (albumsResult.status === "rejected") unavailable.add("albums");
+
+      const data: MemberProfileData = {
+        member: memberResult.value,
+        allMembers: membersResult.status === "fulfilled" ? membersResult.value : [],
+        comments: commentsResult.status === "fulfilled" ? commentsResult.value : [],
+        albums: albumsResult.status === "fulfilled" ? albumsResult.value : [],
+        unavailable,
+      };
+
+      if (unavailable.size === 0) {
+        setProfileState({ status: "ready", data });
+        return;
+      }
+
+      const firstFailure = [membersResult, commentsResult, albumsResult].find(
+        (result) => result.status === "rejected",
+      );
+      setProfileState({
+        status: "partial",
+        data,
+        problem: asApiProblem(
+          firstFailure?.status === "rejected" ? firstFailure.reason : undefined,
+          "Some profile details could not be loaded.",
+        ),
+      });
+    });
+  }, [id]);
 
   useEffect(() => {
-      Promise.all([fetchMember(id), fetchMembers(), fetchComments(id), fetchAlbums(id)])
-      .then(([m, all, fetchedComments, fetchedAlbums]) => {
-        setMember(m);
-        setAllMembers(all);
-        setComments(fetchedComments);
-        setAlbums(fetchedAlbums);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [id]);
+    loadProfile();
+    return () => {
+      profileRequest.current += 1;
+    };
+  }, [loadProfile]);
+
+  const retryProfile = () => {
+    setProfileState({ status: "loading" });
+    loadProfile();
+  };
+
+  const addAlbum = (album: Album) => {
+    setProfileState((current) => {
+      if (current.status !== "ready" && current.status !== "partial") return current;
+      return {
+        ...current,
+        data: { ...current.data, albums: [...current.data.albums, album] },
+      };
+    });
+  };
 
   const handleVerifyEmail = async () => {
     if (!authorEmail) return;
@@ -64,8 +151,8 @@ export default function MemberProfilePage() {
       } else {
         setEmailError("This email is not on the approved family members list.");
       }
-    } catch {
-      setEmailError("Verification failed.");
+    } catch (error: unknown) {
+      setEmailError(asApiProblem(error, "Email verification could not be completed.").message);
     } finally {
       setVerifyingEmail(false);
     }
@@ -74,6 +161,7 @@ export default function MemberProfilePage() {
   const submitComment = async () => {
     if (!commentText || !authorName || !isEmailVerified || !member) return;
     setSubmittingComment(true);
+    setCommentError(null);
     try {
       const newComment = await postComment({
         MemberRecordId: member.id,
@@ -82,24 +170,44 @@ export default function MemberProfilePage() {
         AuthorEmail: authorEmail,
         CommentText: commentText,
       });
-      setComments([...comments, newComment]);
+      setProfileState((current) => {
+        if (current.status !== "ready" && current.status !== "partial") return current;
+        return {
+          ...current,
+          data: { ...current.data, comments: [...current.data.comments, newComment] },
+        };
+      });
       setCommentText("");
-    } catch (e: any) {
-      alert(e.message || "Failed to post comment");
+    } catch (error: unknown) {
+      setCommentError(asApiProblem(error, "The comment could not be posted.").message);
     } finally {
       setSubmittingComment(false);
     }
   };
 
-  if (loading) {
+  if (profileState.status === "loading") {
     return (
-      <div className="flex items-center justify-center min-h-[60vh]">
-        <Loader2 className="w-6 h-6 animate-spin text-accent" />
+      <div className="min-h-[60vh]">
+        <AsyncState state="loading" title="Loading member profile" />
       </div>
     );
   }
 
-  if (!member) {
+  if (profileState.status === "error") {
+    return (
+      <div className="mx-auto min-h-[60vh] max-w-2xl px-5 py-20">
+        <AsyncState
+          state="error"
+          title="Member unavailable"
+          message={profileState.problem.message}
+          actionLabel="Retry"
+          onAction={retryProfile}
+        />
+      </div>
+    );
+  }
+
+  if (profileState.status === "empty") {
     return (
       <div className="mx-auto max-w-2xl px-5 py-20 text-center">
         <User className="w-12 h-12 mx-auto mb-4 text-text-light" />
@@ -110,6 +218,8 @@ export default function MemberProfilePage() {
       </div>
     );
   }
+
+  const { member, allMembers, comments, albums, unavailable } = profileState.data;
 
   const findMember = (recId: string | undefined) =>
     recId ? allMembers.find((m) => m.id === recId) : null;
@@ -137,6 +247,16 @@ export default function MemberProfilePage() {
         <ArrowLeft className="w-3.5 h-3.5" />
         Back to Tree
       </Link>
+
+      {profileState.status === "partial" && (
+        <div
+          role="status"
+          className="rounded-lg border border-terracotta-light bg-terracotta-light/20 px-4 py-3"
+        >
+          <p className="font-medium text-text-primary">Some profile details are unavailable</p>
+          <p className="mt-1 text-sm text-text-muted">{profileState.problem.message}</p>
+        </div>
+      )}
 
       {/* Header */}
       <div className="heritage-card p-7 sm:p-8 animate-fadeInUp">
@@ -220,20 +340,29 @@ export default function MemberProfilePage() {
             Family
           </h2>
           <div className="space-y-2.5">
-            {father && <RelationLink label="Father" member={father} />}
-            {mother && <RelationLink label="Mother" member={mother} />}
-            {spouse && <RelationLink label="Spouse" member={spouse} />}
-            {children.length > 0 && (
-              <div className="pt-2">
-                <h3 className="text-[11px] text-text-light uppercase tracking-wide mb-2">
-                  Children ({children.length})
-                </h3>
-                <div className="space-y-1.5">
-                  {children.map((child) => (
-                    <RelationLink key={child.id} member={child} />
-                  ))}
-                </div>
-              </div>
+            {unavailable.has("relationships") ? (
+              <SectionUnavailable title="Relationships unavailable" onRetry={retryProfile} />
+            ) : (
+              <>
+                {father && <RelationLink label="Father" member={father} />}
+                {mother && <RelationLink label="Mother" member={mother} />}
+                {spouse && <RelationLink label="Spouse" member={spouse} />}
+                {children.length > 0 && (
+                  <div className="pt-2">
+                    <h3 className="text-[11px] text-text-light uppercase tracking-wide mb-2">
+                      Children ({children.length})
+                    </h3>
+                    <div className="space-y-1.5">
+                      {children.map((child) => (
+                        <RelationLink key={child.id} member={child} />
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {!father && !mother && !spouse && children.length === 0 && (
+                  <p className="text-sm italic text-text-light">No relationships recorded yet.</p>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -270,7 +399,13 @@ export default function MemberProfilePage() {
       )}
 
       {/* Interactive Albums Section */}
-      <AlbumSection member={member} albums={albums} setAlbums={setAlbums} />
+      <AlbumSection
+        member={member}
+        albums={albums}
+        unavailable={unavailable.has("albums")}
+        onAlbumAdded={addAlbum}
+        onRetry={retryProfile}
+      />
 
       {/* Comments Section */}
       <div className="heritage-card p-6 animate-fadeInUp">
@@ -281,7 +416,9 @@ export default function MemberProfilePage() {
 
         {/* List Comments */}
         <div className="space-y-4 mb-8">
-          {comments.length === 0 ? (
+          {unavailable.has("comments") ? (
+            <SectionUnavailable title="Comments unavailable" onRetry={retryProfile} />
+          ) : comments.length === 0 ? (
             <p className="text-sm text-text-light italic">No comments yet. Be the first to share a memory.</p>
           ) : (
             comments.map((c) => (
@@ -319,12 +456,14 @@ export default function MemberProfilePage() {
                 <div className="flex gap-2">
                   <input
                     type="email"
+                    aria-label="Family email"
                     value={authorEmail}
                     onChange={(e) => setAuthorEmail(e.target.value)}
                     placeholder="name@example.com"
                     className="flex-1 px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent"
                   />
                   <button
+                    type="button"
                     onClick={handleVerifyEmail}
                     disabled={verifyingEmail || !authorEmail}
                     className="btn-primary"
@@ -333,7 +472,7 @@ export default function MemberProfilePage() {
                     Verify
                   </button>
                 </div>
-                {emailError && <p className="text-terracotta text-xs mt-1.5">{emailError}</p>}
+                {emailError && <p role="alert" className="text-terracotta text-xs mt-1.5">{emailError}</p>}
               </div>
             </div>
           ) : (
@@ -343,12 +482,14 @@ export default function MemberProfilePage() {
               </div>
               <input
                 type="text"
+                aria-label="Your name"
                 value={authorName}
                 onChange={(e) => setAuthorName(e.target.value)}
                 placeholder="Your Name"
                 className="w-full px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent"
               />
               <textarea
+                aria-label="Memory or story"
                 value={commentText}
                 onChange={(e) => setCommentText(e.target.value)}
                 placeholder="Share a memory or story..."
@@ -356,7 +497,13 @@ export default function MemberProfilePage() {
                 className="w-full px-3 py-2 rounded-lg border border-border text-sm outline-none focus:border-accent resize-y"
               />
               <div className="flex justify-end">
+                {commentError && (
+                  <p role="alert" className="mr-auto self-center text-xs text-terracotta">
+                    {commentError}
+                  </p>
+                )}
                 <button
+                  type="button"
                   onClick={submitComment}
                   disabled={submittingComment || !commentText || !authorName}
                   className="btn-primary"
@@ -391,22 +538,58 @@ function RelationLink({ label, member }: { label?: string; member: Member }) {
   );
 }
 
-function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: Album[]; setAlbums: any }) {
+function SectionUnavailable({ title, onRetry }: { title: string; onRetry: () => void }) {
+  return (
+    <div className="rounded-lg border border-terracotta-light bg-terracotta-light/20 p-3">
+      <p className="text-sm font-medium text-text-primary">{title}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-2 text-xs font-medium text-accent underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+      >
+        Retry profile details
+      </button>
+    </div>
+  );
+}
+
+function albumImageUrl(image: Album["ImageUrl"]): string | null {
+  if (typeof image === "string") return image;
+  if (Array.isArray(image) && typeof image[0]?.url === "string") return image[0].url;
+  return null;
+}
+
+type AlbumSectionProps = {
+  member: Member;
+  albums: Album[];
+  unavailable: boolean;
+  onAlbumAdded: (album: Album) => void;
+  onRetry: () => void;
+};
+
+function AlbumSection({
+  member,
+  albums,
+  unavailable,
+  onAlbumAdded,
+  onRetry,
+}: AlbumSectionProps) {
   const [showForm, setShowForm] = useState(false);
   const [caption, setCaption] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadedUrl, setUploadedUrl] = useState("");
+  const [albumError, setAlbumError] = useState<string | null>(null);
 
   const handlePhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
+    setAlbumError(null);
     try {
-      const { uploadImage } = await import("@/lib/api");
       const data = await uploadImage(file);
       setUploadedUrl(data.url);
-    } catch (err: any) {
-      alert(err.message || "Failed to upload image.");
+    } catch (error: unknown) {
+      setAlbumError(asApiProblem(error, "The photo could not be uploaded.").message);
     } finally {
       setUploading(false);
     }
@@ -416,6 +599,7 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
     e.preventDefault();
     if (!uploadedUrl) return;
     setUploading(true);
+    setAlbumError(null);
     try {
       const newAlbum = await uploadAlbumPhoto({
         MemberRecordId: member.id,
@@ -423,14 +607,15 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
         ImageUrl: uploadedUrl,
         Caption: caption,
       });
-      setAlbums([...albums, newAlbum]);
+      onAlbumAdded(newAlbum);
       setShowForm(false);
       setUploadedUrl("");
       setCaption("");
-    } catch (err: any) {
-      alert("Failed to upload: " + err.message);
+    } catch (error: unknown) {
+      setAlbumError(asApiProblem(error, "The photo could not be added to the album.").message);
+    } finally {
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   return (
@@ -440,20 +625,29 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
           <Camera className="w-5 h-5 text-accent" />
           Photo Albums
         </h2>
-        <button onClick={() => setShowForm(!showForm)} className="text-accent text-sm font-medium hover:underline flex items-center gap-1">
-          <Plus className="w-4 h-4" /> Add Photo
-        </button>
+        {!unavailable && (
+          <button type="button" onClick={() => setShowForm(!showForm)} className="text-accent text-sm font-medium hover:underline flex items-center gap-1 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
+            <Plus className="w-4 h-4" /> Add Photo
+          </button>
+        )}
       </div>
 
-      {showForm && (
-        <form onSubmit={handleSubmit} className="mb-6 p-4 bg-bg-secondary rounded-xl border border-border">
+      {unavailable ? (
+        <SectionUnavailable title="Albums unavailable" onRetry={onRetry} />
+      ) : showForm && (
+        <form onSubmit={handleSubmit} className="mb-6 p-4 bg-bg-secondary rounded-lg border border-border">
           <p className="text-xs text-text-muted mb-4 leading-relaxed">
             Select a photo from your device to upload it to the album.
           </p>
           <div className="space-y-3">
             {uploadedUrl ? (
               <div className="flex items-center gap-4 p-3 border border-border rounded-lg bg-bg-primary">
-                <img src={uploadedUrl} alt="Preview" className="w-16 h-16 rounded-lg object-cover" />
+                <div
+                  role="img"
+                  aria-label="Album photo preview"
+                  className="h-16 w-16 rounded-lg bg-cover bg-center"
+                  style={{ backgroundImage: `url(${uploadedUrl})` }}
+                />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-text-primary">Photo ready</p>
                   <button type="button" onClick={() => setUploadedUrl("")} className="text-xs text-terracotta hover:underline">Remove & choose another</button>
@@ -461,7 +655,7 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
               </div>
             ) : (
               <div className="relative">
-                <input type="file" accept="image/*" onChange={handlePhotoSelect} disabled={uploading} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed" />
+                <input aria-label="Choose album photo" type="file" accept="image/*" onChange={handlePhotoSelect} disabled={uploading} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed focus-visible:opacity-100" />
                 <div className={`w-full px-4 py-3 rounded-lg border border-border bg-bg-primary flex items-center justify-center gap-2 transition-all ${uploading ? 'opacity-50' : 'hover:border-accent hover:text-accent'}`}>
                   {uploading ? <Loader2 className="w-4 h-4 animate-spin text-accent" /> : <Camera className="w-4 h-4 text-text-muted" />}
                   <span className="text-sm font-medium text-text-muted">{uploading ? "Uploading..." : "Click to select a photo"}</span>
@@ -471,11 +665,13 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
             <div>
               <input 
                 type="text" placeholder="Caption (optional)" 
+                aria-label="Photo caption"
                 value={caption} onChange={(e) => setCaption(e.target.value)} 
                 className="input-heritage w-full"
               />
             </div>
-            <button disabled={uploading || !uploadedUrl} className="btn-primary w-full">
+            {albumError && <p role="alert" className="text-sm text-terracotta">{albumError}</p>}
+            <button type="submit" disabled={uploading || !uploadedUrl} className="btn-primary w-full">
               {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Add to Album"}
             </button>
           </div>
@@ -483,18 +679,18 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
       )}
 
       {/* Legacy and New Photos merged */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-        {member.Photos?.map((photo, i) => (
-          <a key={`legacy-${i}`} href={photo.url} target="_blank" rel="noopener noreferrer" className="block rounded-xl overflow-hidden border border-border group relative">
-            <img src={photo.url} alt="Legacy Photo" className="w-full h-36 object-cover group-hover:scale-105 transition-transform" />
+      {!unavailable && <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        {member.Photos?.map((photo) => (
+          <a key={photo.url} href={photo.url} target="_blank" rel="noopener noreferrer" aria-label="Open legacy photo" className="block rounded-lg overflow-hidden border border-border group relative">
+            <span role="img" aria-label="Legacy photo" className="block h-36 w-full bg-cover bg-center transition-transform group-hover:scale-105" style={{ backgroundImage: `url(${photo.url})` }} />
           </a>
         ))}
         {albums.map((al) => {
-          const imgUrl = typeof al.ImageUrl === 'string' ? al.ImageUrl : (al.ImageUrl as any)?.[0]?.url;
+          const imgUrl = albumImageUrl(al.ImageUrl);
           if (!imgUrl) return null;
           return (
-            <a key={al.id} href={imgUrl} target="_blank" rel="noopener noreferrer" className="block rounded-xl overflow-hidden border border-border group relative">
-              <img src={imgUrl} alt={al.Caption || 'Album Photo'} className="w-full h-36 object-cover group-hover:scale-105 transition-transform" />
+            <a key={al.id} href={imgUrl} target="_blank" rel="noopener noreferrer" aria-label={`Open ${al.Caption || "album photo"}`} className="block rounded-lg overflow-hidden border border-border group relative">
+              <span role="img" aria-label={al.Caption || "Album photo"} className="block h-36 w-full bg-cover bg-center transition-transform group-hover:scale-105" style={{ backgroundImage: `url(${imgUrl})` }} />
               {al.Caption && (
                 <div className="absolute bottom-0 inset-x-0 bg-black/60 p-2 text-xs text-white truncate backdrop-blur-sm">
                   {al.Caption}
@@ -506,7 +702,7 @@ function AlbumSection({ member, albums, setAlbums }: { member: Member; albums: A
         {!member.Photos?.length && albums.length === 0 && !showForm && (
           <p className="text-sm text-text-light italic col-span-full">No photos added yet.</p>
         )}
-      </div>
+      </div>}
     </div>
   );
 }

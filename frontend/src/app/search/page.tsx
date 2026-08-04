@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchMembers, type Member } from "@/lib/api";
+import AsyncState from "@/components/feedback/AsyncState";
+import { asApiProblem, type Loadable } from "@/lib/loadable";
 import Link from "next/link";
 import {
   Search as SearchIcon,
@@ -9,24 +11,50 @@ import {
   MapPin,
   Filter,
   X,
-  Loader2,
   Heart,
 } from "lucide-react";
 
 export default function SearchPage() {
-  const [members, setMembers] = useState<Member[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [memberState, setMemberState] = useState<Loadable<Member[]>>({ status: "loading" });
+  const memberRequest = useRef(0);
   const [query, setQuery] = useState("");
   const [filterCity, setFilterCity] = useState("");
   const [filterBranch, setFilterBranch] = useState("");
   const [filterGeneration, setFilterGeneration] = useState("");
 
-  useEffect(() => {
-    fetchMembers()
-      .then(setMembers)
-      .catch(() => setMembers([]))
-      .finally(() => setLoading(false));
+  const loadMembers = useCallback(() => {
+    const request = ++memberRequest.current;
+    fetchMembers().then(
+      (data) => {
+        if (request !== memberRequest.current) return;
+        setMemberState(data.length > 0 ? { status: "ready", data } : { status: "empty", data });
+      },
+      (error: unknown) => {
+        if (request !== memberRequest.current) return;
+        setMemberState({
+          status: "error",
+          problem: asApiProblem(error, "The family directory could not be loaded."),
+        });
+      },
+    );
   }, []);
+
+  useEffect(() => {
+    loadMembers();
+    return () => {
+      memberRequest.current += 1;
+    };
+  }, [loadMembers]);
+
+  const retryMembers = () => {
+    setMemberState({ status: "loading" });
+    loadMembers();
+  };
+
+  const members = useMemo(
+    () => ("data" in memberState ? memberState.data : []),
+    [memberState],
+  );
 
   const cities = useMemo(
     () => [...new Set(members.map((m) => m.CurrentCity).filter(Boolean))].sort(),
@@ -79,6 +107,7 @@ export default function SearchPage() {
           <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-text-light" />
           <input
             type="text"
+            aria-label="Search by name"
             placeholder="Search by name..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -143,25 +172,43 @@ export default function SearchPage() {
         )}
 
         <span className="ml-auto text-xs text-text-light">
-          {filtered.length} result{filtered.length !== 1 ? "s" : ""}
+          {memberState.status === "ready" || memberState.status === "empty"
+            ? `${filtered.length} result${filtered.length !== 1 ? "s" : ""}`
+            : "Results unavailable"}
         </span>
       </div>
 
-      {loading && (
-        <div className="flex items-center justify-center py-20">
-          <Loader2 className="w-6 h-6 animate-spin text-accent" />
+      {memberState.status === "loading" && (
+        <AsyncState state="loading" title="Loading family directory" />
+      )}
+
+      {memberState.status === "error" && (
+        <AsyncState
+          state="error"
+          title="Directory unavailable"
+          message={memberState.problem.message}
+          actionLabel="Retry"
+          onAction={retryMembers}
+        />
+      )}
+
+      {memberState.status === "empty" && (
+        <div className="heritage-card p-14 text-center">
+          <User className="w-10 h-10 mx-auto mb-4 text-text-light" />
+          <h2 className="font-serif text-xl font-semibold mb-2">No family members yet</h2>
+          <p className="text-text-muted text-sm">The family directory has no records yet.</p>
         </div>
       )}
 
-      {!loading && filtered.length === 0 && (
+      {memberState.status === "ready" && filtered.length === 0 && (
         <div className="heritage-card p-14 text-center">
           <User className="w-10 h-10 mx-auto mb-4 text-text-light" />
-          <h2 className="font-serif text-xl font-semibold mb-2">No results found</h2>
+          <h2 className="font-serif text-xl font-semibold mb-2">No matching members</h2>
           <p className="text-text-muted text-sm">Try a different search or filter.</p>
         </div>
       )}
 
-      {!loading && filtered.length > 0 && (
+      {memberState.status === "ready" && filtered.length > 0 && (
         <div className="space-y-2.5 stagger-children">
           {filtered.map((member) => (
             <Link key={member.id} href={`/member/${member.id}`} className="group block">

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const TEST_API_BASE = "http://api.test";
 
@@ -48,7 +48,7 @@ describe("frontend API contracts", () => {
     });
   });
 
-  it("maps adminFetchSettings to read-only integration status", async () => {
+  it("maps adminFetchIntegrations to read-only integration status", async () => {
     const integrations = {
       groqConfigured: true,
       cloudinaryConfigured: false,
@@ -56,9 +56,9 @@ describe("frontend API contracts", () => {
     };
     const fetchSpy = vi.fn().mockResolvedValue(jsonResponse(integrations));
     vi.stubGlobal("fetch", fetchSpy);
-    const { adminFetchSettings } = await loadApi();
+    const { adminFetchIntegrations } = await loadApi();
 
-    await expect(adminFetchSettings("admin-token")).resolves.toEqual(integrations);
+    await expect(adminFetchIntegrations("admin-token")).resolves.toEqual(integrations);
     expect(fetchSpy).toHaveBeenCalledWith(`${TEST_API_BASE}/api/admin/integrations`, {
       headers: {
         Authorization: "Bearer admin-token",
@@ -67,21 +67,18 @@ describe("frontend API contracts", () => {
     });
   });
 
-  it("rejects adminUpdateSettings locally without issuing a request", async () => {
+  it("does not export removed healing or credential-write capabilities", async () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
-    const { adminUpdateSettings } = await loadApi();
+    const api = await loadApi();
 
-    await expect(
-      adminUpdateSettings("admin-token", { GROQ_API_KEY: "test-key" }),
-    ).rejects.toMatchObject({
-      status: 410,
-      code: "SETTINGS_UPDATES_REMOVED",
-    });
+    expect(api).not.toHaveProperty(["admin", "Update", "Settings"].join(""));
+    expect(api).not.toHaveProperty(["admin", "Heal"].join(""));
+    expect(api).not.toHaveProperty(["admin", "Fetch", "Settings"].join(""));
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("preserves tolerant read fallbacks after HTTP failures", async () => {
+  it("propagates typed read failures instead of manufacturing empty results", async () => {
     const fetchSpy = vi.fn().mockImplementation(() =>
       Promise.resolve(
         jsonResponse(
@@ -98,41 +95,23 @@ describe("frontend API contracts", () => {
     vi.stubGlobal("fetch", fetchSpy);
     const api = await loadApi();
 
-    await expect(api.searchMembers("Ali")).resolves.toEqual([]);
-    await expect(api.fetchComments("member-1")).resolves.toEqual([]);
-    await expect(api.fetchStories()).resolves.toEqual([]);
-    await expect(api.fetchAlbums()).resolves.toEqual([]);
-    await expect(api.verifyEmail("family@example.com")).resolves.toBe(false);
-    await expect(api.adminGetHistory("admin-token")).resolves.toEqual([]);
+    const expectedProblem = {
+      status: 503,
+      code: "SERVICE_UNAVAILABLE",
+      message: "Service unavailable.",
+    };
+
+    await expect(api.searchMembers("Ali")).rejects.toMatchObject(expectedProblem);
+    await expect(api.fetchComments("member-1")).rejects.toMatchObject(expectedProblem);
+    await expect(api.fetchStories()).rejects.toMatchObject(expectedProblem);
+    await expect(api.fetchAlbums()).rejects.toMatchObject(expectedProblem);
+    await expect(api.verifyEmail("family@example.com")).rejects.toMatchObject(
+      expectedProblem,
+    );
+    await expect(api.adminGetHistory("admin-token")).rejects.toMatchObject(
+      expectedProblem,
+    );
     expect(fetchSpy).toHaveBeenCalledTimes(6);
   });
 
-  it("models adminHeal as an error-only request", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue(
-      jsonResponse(
-        {
-          detail: {
-            code: "SELF_HEAL_REMOVED",
-            message: "Automatic graph healing has been removed.",
-          },
-        },
-        410,
-      ),
-    );
-    vi.stubGlobal("fetch", fetchSpy);
-    const api = await loadApi();
-
-    expectTypeOf(api.adminHeal).returns.toEqualTypeOf<Promise<never>>();
-    await expect(api.adminHeal("admin-token")).rejects.toMatchObject({
-      status: 410,
-      code: "SELF_HEAL_REMOVED",
-    });
-    expect(fetchSpy).toHaveBeenCalledWith(`${TEST_API_BASE}/api/admin/heal`, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer admin-token",
-        "Content-Type": "application/json",
-      },
-    });
-  });
 });

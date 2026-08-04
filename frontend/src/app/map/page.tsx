@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { fetchMapMarkers, type MapData, type MapMarker } from "@/lib/api";
-import { Loader2, MapPin, Globe2, Map as MapIcon } from "lucide-react";
+import { fetchMapMarkers, type MapData } from "@/lib/api";
+import AsyncState from "@/components/feedback/AsyncState";
+import { asApiProblem, type Loadable } from "@/lib/loadable";
+import { MapPin, Globe2, Map as MapIcon } from "lucide-react";
 import Link from "next/link";
 
 // 2D Leaflet map
@@ -16,18 +18,42 @@ const Popup = dynamic(() => import("react-leaflet").then((mod) => mod.Popup), { 
 const GlobeMap = dynamic(() => import("@/components/GlobeMap"), { ssr: false });
 
 export default function MapPage() {
-  const [mapData, setMapData] = useState<MapData>({ markers: [], arcs: [] });
-  const [loading, setLoading] = useState(true);
+  const [mapState, setMapState] = useState<Loadable<MapData>>({ status: "loading" });
+  const mapRequest = useRef(0);
   const [filter, setFilter] = useState<"all" | "residence" | "burial">("all");
   const [leafletReady, setLeafletReady] = useState(false);
   const [is3D, setIs3D] = useState(true);
 
-  useEffect(() => {
-    fetchMapMarkers()
-      .then(setMapData)
-      .catch(() => setMapData({ markers: [], arcs: [] }))
-      .finally(() => setLoading(false));
+  const loadMap = useCallback(() => {
+    const request = ++mapRequest.current;
+    fetchMapMarkers().then(
+      (data) => {
+        if (request !== mapRequest.current) return;
+        setMapState(
+          data.markers.length > 0 ? { status: "ready", data } : { status: "empty", data },
+        );
+      },
+      (error: unknown) => {
+        if (request !== mapRequest.current) return;
+        setMapState({
+          status: "error",
+          problem: asApiProblem(error, "Family locations could not be loaded."),
+        });
+      },
+    );
   }, []);
+
+  useEffect(() => {
+    loadMap();
+    return () => {
+      mapRequest.current += 1;
+    };
+  }, [loadMap]);
+
+  const retryMap = () => {
+    setMapState({ status: "loading" });
+    loadMap();
+  };
 
   useEffect(() => {
     import("leaflet").then((L) => {
@@ -41,6 +67,7 @@ export default function MapPage() {
     });
   }, []);
 
+  const mapData = "data" in mapState ? mapState.data : { markers: [], arcs: [] };
   const markers = mapData.markers;
   const filteredMarkers =
     filter === "all" ? markers : markers.filter((m) => m.type === filter);
@@ -70,8 +97,10 @@ export default function MapPage() {
         </div>
         
         {/* View Toggle */}
-        <div className="flex bg-bg-secondary p-1 rounded-xl shadow-inner self-start">
+        <div className="flex self-start rounded-lg bg-bg-secondary p-1 shadow-inner">
           <button
+            type="button"
+            aria-pressed={!is3D}
             onClick={() => setIs3D(false)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${!is3D ? "bg-white text-accent shadow-sm" : "text-text-muted hover:text-text-primary"}`}
           >
@@ -79,6 +108,8 @@ export default function MapPage() {
             2D Map
           </button>
           <button
+            type="button"
+            aria-pressed={is3D}
             onClick={() => setIs3D(true)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${is3D ? "bg-white text-accent shadow-sm" : "text-text-muted hover:text-text-primary"}`}
           >
@@ -96,6 +127,8 @@ export default function MapPage() {
           { key: "burial", label: `Burial Sites (${burialCount})` },
         ].map((tab) => (
           <button
+            type="button"
+            aria-pressed={filter === tab.key}
             key={tab.key}
             onClick={() => setFilter(tab.key as typeof filter)}
             className={`px-4 py-2 rounded-lg text-[13px] font-medium transition-heritage ${
@@ -110,14 +143,23 @@ export default function MapPage() {
       </div>
 
       {/* Map */}
-      <div className="heritage-card overflow-hidden relative rendering-wrapper" style={{ height: "62vh" }}>
-        {(loading || (!is3D && !leafletReady)) ? (
-          <div className="flex items-center justify-center h-full">
-            <Loader2 className="w-6 h-6 animate-spin text-accent" />
-          </div>
-        ) : filteredMarkers.length === 0 ? (
+      <div className="rendering-wrapper relative h-[62vh] min-h-[28rem] overflow-hidden rounded-lg border border-border bg-bg-card shadow-card">
+        {mapState.status === "loading" ||
+        ((mapState.status === "ready" || mapState.status === "empty") &&
+          !is3D &&
+          !leafletReady) ? (
+          <AsyncState state="loading" title="Loading heritage map" />
+        ) : mapState.status === "error" ? (
+          <AsyncState
+            state="error"
+            title="Map unavailable"
+            message={mapState.problem.message}
+            actionLabel="Retry"
+            onAction={retryMap}
+          />
+        ) : mapState.status === "empty" ? (
           <div className="flex flex-col items-center justify-center h-full text-center px-4">
-            <div className="w-14 h-14 rounded-2xl bg-bg-secondary flex items-center justify-center mb-4">
+            <div className="w-14 h-14 rounded-lg bg-bg-secondary flex items-center justify-center mb-4">
               <MapPin className="w-6 h-6 text-text-light" />
             </div>
             <h2 className="font-serif text-xl font-semibold mb-2">No Locations Yet</h2>
@@ -125,6 +167,16 @@ export default function MapPage() {
               Add coordinates to member profiles to see them appear on the map.
             </p>
           </div>
+        ) : filteredMarkers.length === 0 ? (
+          <AsyncState
+            state="empty"
+            title={
+              filter === "residence"
+                ? "No residences match this filter"
+                : "No burial sites match this filter"
+            }
+            message="Choose another location filter to continue."
+          />
         ) : is3D ? (
           <GlobeMap data={filteredData} />
         ) : (

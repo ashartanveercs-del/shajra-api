@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { fetchMembers, type Member } from "@/lib/api";
+import AsyncState from "@/components/feedback/AsyncState";
+import { asApiProblem, type Loadable } from "@/lib/loadable";
 import {
   TreePine,
   Users,
@@ -15,15 +17,40 @@ import {
 } from "lucide-react";
 
 export default function HomePage() {
-  const [members, setMembers] = useState<Member[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [memberState, setMemberState] = useState<Loadable<Member[]>>({ status: "loading" });
+  const memberRequest = useRef(0);
+
+  const loadMembers = useCallback(() => {
+    const request = ++memberRequest.current;
+    fetchMembers().then(
+      (data) => {
+        if (request !== memberRequest.current) return;
+        setMemberState(data.length > 0 ? { status: "ready", data } : { status: "empty", data });
+      },
+      (error: unknown) => {
+        if (request !== memberRequest.current) return;
+        setMemberState({
+          status: "error",
+          problem: asApiProblem(error, "Family records could not be loaded."),
+        });
+      },
+    );
+  }, []);
 
   useEffect(() => {
-    fetchMembers()
-      .then(setMembers)
-      .catch(() => setMembers([]))
-      .finally(() => setLoading(false));
-  }, []);
+    loadMembers();
+    return () => {
+      memberRequest.current += 1;
+    };
+  }, [loadMembers]);
+
+  const retryMembers = () => {
+    setMemberState({ status: "loading" });
+    loadMembers();
+  };
+
+  const members = "data" in memberState ? memberState.data : [];
+  const hasMemberData = memberState.status === "ready" || memberState.status === "empty";
 
   const stats = {
     total: members.length,
@@ -81,10 +108,10 @@ export default function HomePage() {
       <section className="mx-auto max-w-6xl px-5 sm:px-8 -mt-10 relative z-10">
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
           {[
-            { label: "Family Members", value: loading ? "—" : stats.total, icon: Users, bg: "bg-sky-light", iconColor: "text-sky" },
-            { label: "Living Members", value: loading ? "—" : stats.alive, icon: Heart, bg: "bg-emerald-light", iconColor: "text-emerald" },
-            { label: "Cities", value: loading ? "—" : stats.cities, icon: Globe, bg: "bg-terracotta-light", iconColor: "text-terracotta" },
-            { label: "Generations", value: loading ? "—" : stats.generations, icon: Clock, bg: "bg-plum-light", iconColor: "text-plum" },
+            { label: "Family Members", value: hasMemberData ? stats.total : "—", icon: Users, bg: "bg-sky-light", iconColor: "text-sky" },
+            { label: "Living Members", value: hasMemberData ? stats.alive : "—", icon: Heart, bg: "bg-emerald-light", iconColor: "text-emerald" },
+            { label: "Cities", value: hasMemberData ? stats.cities : "—", icon: Globe, bg: "bg-terracotta-light", iconColor: "text-terracotta" },
+            { label: "Generations", value: hasMemberData ? stats.generations : "—", icon: Clock, bg: "bg-plum-light", iconColor: "text-plum" },
           ].map((stat) => (
             <div key={stat.label} className="heritage-card p-5 flex items-center gap-4">
               <div className={`w-11 h-11 rounded-xl ${stat.bg} flex items-center justify-center flex-shrink-0`}>
@@ -100,6 +127,34 @@ export default function HomePage() {
           ))}
         </div>
       </section>
+
+      {memberState.status === "loading" && (
+        <section className="mx-auto max-w-6xl px-5 sm:px-8">
+          <AsyncState state="loading" title="Loading family archive" />
+        </section>
+      )}
+
+      {memberState.status === "error" && (
+        <section className="mx-auto max-w-6xl px-5 sm:px-8">
+          <AsyncState
+            state="error"
+            title="Family archive unavailable"
+            message={memberState.problem.message}
+            actionLabel="Retry"
+            onAction={retryMembers}
+          />
+        </section>
+      )}
+
+      {memberState.status === "empty" && (
+        <section className="mx-auto max-w-6xl px-5 sm:px-8">
+          <AsyncState
+            state="empty"
+            title="No family members yet"
+            message="The family archive is ready for its first record."
+          />
+        </section>
+      )}
 
       {/* Features */}
       <section className="mx-auto max-w-6xl px-5 sm:px-8 py-20 sm:py-28">
@@ -166,7 +221,7 @@ export default function HomePage() {
       </section>
 
       {/* Members */}
-      {members.length > 0 && (
+      {memberState.status === "ready" && (
         <section className="bg-bg-secondary">
           <div className="mx-auto max-w-6xl px-5 sm:px-8 py-20">
             <div className="text-center mb-12">

@@ -1,4 +1,4 @@
-import { ApiProblem, requestJson } from "./http";
+import { requestJson } from "./http";
 
 export interface Member {
   id: string;
@@ -170,15 +170,13 @@ export function fetchMapMarkers(): Promise<MapData> {
 export function searchMembers(query: string): Promise<Member[]> {
   return requestJson<Member[]>(`/api/search?q=${encodeURIComponent(query)}`, {
     cache: "no-store",
-  }).catch(() => []);
+  });
 }
 
 // ── Comments API ────────────────────────────────────────────
 
 export function fetchComments(memberId: string): Promise<Comment[]> {
-  return requestJson<Comment[]>(`/api/comments/${memberId}`, { cache: "no-store" }).catch(
-    () => [],
-  );
+  return requestJson<Comment[]>(`/api/comments/${memberId}`, { cache: "no-store" });
 }
 
 export function postComment(data: Partial<Comment>): Promise<Comment> {
@@ -193,16 +191,14 @@ export function verifyEmail(email: string): Promise<boolean> {
   return requestJson<{ approved?: boolean }>(
     `/api/verify-email?email=${encodeURIComponent(email)}`,
     { cache: "no-store" },
-  )
-    .then((data) => data.approved === true)
-    .catch(() => false);
+  ).then((data) => data.approved === true);
 }
 
 // ── Stories & Albums API ────────────────────────────────────
 
 export function fetchStories(memberId?: string): Promise<Story[]> {
   const path = memberId ? `/api/stories/member/${memberId}` : "/api/stories";
-  return requestJson<Story[]>(path, { cache: "no-store" }).catch(() => []);
+  return requestJson<Story[]>(path, { cache: "no-store" });
 }
 
 export function postStory(data: Partial<Story>): Promise<Story> {
@@ -215,7 +211,7 @@ export function postStory(data: Partial<Story>): Promise<Story> {
 
 export function fetchAlbums(memberId?: string): Promise<Album[]> {
   const path = memberId ? `/api/albums/member/${memberId}` : "/api/albums";
-  return requestJson<Album[]>(path, { cache: "no-store" }).catch(() => []);
+  return requestJson<Album[]>(path, { cache: "no-store" });
 }
 
 export function uploadAlbumPhoto(data: Partial<Album>): Promise<Album> {
@@ -331,28 +327,12 @@ export interface AdminIntegrations {
   groqConfigured: boolean;
   cloudinaryConfigured: boolean;
   coordinationConfigured: boolean;
-  GROQ_API_KEY?: never;
 }
 
-export function adminFetchSettings(token: string): Promise<AdminIntegrations> {
+export function adminFetchIntegrations(token: string): Promise<AdminIntegrations> {
   return requestJson<AdminIntegrations>("/api/admin/integrations", {
     headers: authHeaders(token),
   });
-}
-
-export function adminUpdateSettings(
-  token: string,
-  settings: { GROQ_API_KEY: string },
-): Promise<never> {
-  void token;
-  void settings;
-  return Promise.reject(
-    new ApiProblem(
-      410,
-      "SETTINGS_UPDATES_REMOVED",
-      "Integration credentials can no longer be updated from the frontend.",
-    ),
-  );
 }
 
 export function uploadImage(file: File): Promise<ImageUpload> {
@@ -373,15 +353,8 @@ export function adminUndo(token: string): Promise<AdminUndoResult> {
   });
 }
 
-export function adminHeal(token: string): Promise<never> {
-  return requestJson<never>("/api/admin/heal", {
-    method: "POST",
-    headers: authHeaders(token),
-  });
-}
-
 export function adminGetHistory(token: string): Promise<unknown[]> {
   return requestJson<unknown[]>("/api/admin/history", {
     headers: authHeaders(token),
-  }).catch(() => []);
+  });
 }
