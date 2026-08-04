@@ -49,6 +49,7 @@ Create:
 PersonId = NewType("PersonId", str)
 FamilyUnitId = NewType("FamilyUnitId", str)
 LinkId = NewType("LinkId", str)
+UnresolvedRelationshipId = NewType("UnresolvedRelationshipId", str)
 OperationId = NewType("OperationId", str)
 MigrationRunId = NewType("MigrationRunId", str)
 
@@ -63,7 +64,7 @@ class GraphSnapshot:
     people: Mapping[PersonId, Person]
     family_units: Mapping[FamilyUnitId, FamilyUnit]
     links: Mapping[LinkId, ParentChildLink]
-    unresolved: tuple[UnresolvedRelationship, ...] = ()
+    unresolved: Mapping[UnresolvedRelationshipId, UnresolvedRelationship]
 
 def apply_commands(snapshot: GraphSnapshot, commands: Sequence[GraphCommand]) -> GraphSnapshot: ...
 def validate_snapshot(snapshot: GraphSnapshot) -> ValidationReport: ...
@@ -87,7 +88,12 @@ def semantic_checksum(snapshot: GraphSnapshot) -> str: ...
 Create `backend/tests/unit/domain/test_ids.py`:
 
 ```python
-from domain.ids import migrated_person_id, new_family_unit_id, new_person_id
+from domain.ids import (
+    migrated_person_id,
+    new_family_unit_id,
+    new_person_id,
+    new_unresolved_relationship_id,
+)
 
 
 def test_new_ids_have_type_prefixes_and_are_unique():
@@ -96,6 +102,7 @@ def test_new_ids_have_type_prefixes_and_are_unique():
     assert str(first).startswith("per_")
     assert first != second
     assert str(new_family_unit_id()).startswith("fam_")
+    assert str(new_unresolved_relationship_id()).startswith("unr_")
 
 
 def test_migrated_ids_are_deterministic_and_table_scoped():
@@ -121,6 +128,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 PersonId = NewType("PersonId", str)
 FamilyUnitId = NewType("FamilyUnitId", str)
 LinkId = NewType("LinkId", str)
+UnresolvedRelationshipId = NewType("UnresolvedRelationshipId", str)
 OperationId = NewType("OperationId", str)
 MigrationRunId = NewType("MigrationRunId", str)
 
@@ -146,6 +154,10 @@ def new_link_id() -> LinkId:
     return LinkId(_new("lnk"))
 
 
+def new_unresolved_relationship_id() -> UnresolvedRelationshipId:
+    return UnresolvedRelationshipId(_new("unr"))
+
+
 def new_operation_id() -> OperationId:
     return OperationId(_new("op"))
 
@@ -163,6 +175,12 @@ def migrated_family_unit_id(source_table: str, source_record_id: str) -> FamilyU
 
 def migrated_link_id(source_table: str, source_record_id: str) -> LinkId:
     return LinkId(_migrated("lnk", source_table, source_record_id))
+
+
+def migrated_unresolved_relationship_id(
+    source_table: str, source_record_id: str
+) -> UnresolvedRelationshipId:
+    return UnresolvedRelationshipId(_migrated("unr", source_table, source_record_id))
 
 
 def migrated_operation_id(source_table: str, source_record_id: str) -> OperationId:
@@ -293,6 +311,12 @@ def test_add_link_returns_a_new_snapshot_without_mutating_input():
     assert result.links[link_id] == link
 ```
 
+In the same file, add red-green tests for unresolved add, same-ID supersede, and
+remove. Each command must return a new snapshot, leave the input map unchanged,
+and raise `CommandConflict` for duplicate, missing, or replacement-ID mismatch.
+Add a family-unit supersede test proving the replacement occupies the same stable
+map key and the old version does not coexist in the current snapshot.
+
 - [ ] **Step 2: Run the focused test and confirm failure**
 
 Run: `python -m pytest tests/unit/domain/test_commands.py -q`
@@ -302,7 +326,9 @@ Expected: FAIL because models and commands do not exist.
 - [ ] **Step 3: Implement immutable entity enums and dataclasses**
 
 In `backend/domain/models.py`, define `Gender`, `FamilyUnitKind`, `UnionStatus`,
-`ParentRole`, and `RelationshipType` as `StrEnum`. Define:
+`ParentRole`, `RelationshipType`, and `UnresolvedRelationshipKind` as `StrEnum`.
+The unresolved kinds are exactly `father`, `mother`, `parent`, and `partner`.
+Define:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -327,6 +353,7 @@ class FamilyUnit:
     status: UnionStatus = UnionStatus.UNKNOWN
     start: PartialDate | None = None
     end: PartialDate | None = None
+    distinct_union_confirmed: bool = False
     created_revision: int = 0
 
 
@@ -338,6 +365,15 @@ class ParentChildLink:
     role: ParentRole
     relationship_type: RelationshipType
     family_unit_id: FamilyUnitId | None
+    created_revision: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedRelationship:
+    unresolved_id: UnresolvedRelationshipId
+    subject_person_id: PersonId
+    kind: UnresolvedRelationshipKind
+    unresolved_name: str
     created_revision: int = 0
 
 
@@ -355,11 +391,13 @@ class GraphSnapshot:
     people: Mapping[PersonId, Person]
     family_units: Mapping[FamilyUnitId, FamilyUnit]
     links: Mapping[LinkId, ParentChildLink]
-    unresolved: tuple[UnresolvedRelationship, ...] = ()
+    unresolved: Mapping[UnresolvedRelationshipId, UnresolvedRelationship]
 ```
 
-Use `MappingProxyType(dict(...))` in `GraphSnapshot.__post_init__` so nested maps
-cannot be mutated through a frozen dataclass.
+Use `MappingProxyType(dict(...))` for all four maps in
+`GraphSnapshot.__post_init__` so nested maps cannot be mutated through a frozen
+dataclass. Normalize `UnresolvedRelationship.unresolved_name` by trimming outer
+whitespace and collapsing internal whitespace; reject an empty result.
 
 - [ ] **Step 4: Implement explicit graph commands and reducer**
 
@@ -372,16 +410,28 @@ GraphCommand = (
     AddPersonVersion
     | AddFamilyUnit
     | AddParentChildLink
+    | AddUnresolvedRelationship
     | SetPrimaryFamilyUnit
     | ArchivePerson
     | SupersedeFamilyUnit
     | SupersedeParentChildLink
+    | SupersedeUnresolvedRelationship
+    | RemoveUnresolvedRelationship
 )
 ```
 
-`apply_commands` copies the three maps, applies commands in order, and returns a
-new snapshot. It raises `CommandConflict` for duplicate IDs or missing targets;
-it does not run semantic validation.
+`AddUnresolvedRelationship` contains `annotation`. Supersede contains
+`unresolved_id` plus `replacement` and requires matching stable IDs. Remove
+contains `unresolved_id`. Add rejects a duplicate ID; supersede/remove reject a
+missing target. Supersede replaces and remove deletes the current map value.
+
+`SupersedeFamilyUnit` and `SupersedeParentChildLink` replace the current value
+under the same stable logical ID; prior versions belong to repository history and
+do not coexist in `GraphSnapshot`.
+
+`apply_commands` copies the four maps, applies commands in order, and returns a
+new snapshot. It raises `CommandConflict` for duplicate IDs, missing targets, or
+replacement-ID mismatches; it does not run semantic validation.
 
 - [ ] **Step 5: Build reusable fixtures**
 
@@ -406,6 +456,10 @@ Implement these exact fixture contracts without calling production ID factories:
 - `cousin_union_snapshot()` is acyclic but contains a repeated ancestor path.
 - `repeated_ancestor_snapshot()` contains one person reachable by two valid paths
   so projection must emit one person plus a reference.
+
+Every fixture initializes the unresolved map explicitly. Add
+`duplicate_historical_union_snapshot(confirmed, status, ended)` and an archived
+topology fixture for the validation/projection tasks.
 
 - [ ] **Step 6: Run and commit**
 
@@ -439,6 +493,7 @@ MISSING_PERSON = "MISSING_PERSON"
 MISSING_FAMILY_UNIT = "MISSING_FAMILY_UNIT"
 DUPLICATE_LINK = "DUPLICATE_LINK"
 DUPLICATE_FAMILY_UNIT = "DUPLICATE_FAMILY_UNIT"
+DUPLICATE_UNRESOLVED_RELATIONSHIP = "DUPLICATE_UNRESOLVED_RELATIONSHIP"
 ANCESTRY_CYCLE = "ANCESTRY_CYCLE"
 PRIMARY_UNIT_MISMATCH = "PRIMARY_UNIT_MISMATCH"
 FAMILY_UNIT_PARENT_MISMATCH = "FAMILY_UNIT_PARENT_MISMATCH"
@@ -446,6 +501,7 @@ DEATH_BEFORE_BIRTH = "DEATH_BEFORE_BIRTH"
 UNION_END_BEFORE_START = "UNION_END_BEFORE_START"
 IMPOSSIBLE_PARENT_AGE = "IMPOSSIBLE_PARENT_AGE"
 SUSPICIOUS_PARENT_AGE = "SUSPICIOUS_PARENT_AGE"
+ARCHIVED_RELATIONSHIP_OMITTED = "ARCHIVED_RELATIONSHIP_OMITTED"
 ```
 
 Include this cycle test:
@@ -500,11 +556,23 @@ class ValidationReport:
 code, and affected IDs:
 
 1. Reference existence and self-links.
-2. Duplicate normalized keys.
+2. Duplicate normalized keys. Raw links use
+   `(parent_id, child_id, relationship_type)`. Unresolved annotations use
+   `(subject_person_id, kind, casefolded_whitespace_normalized_name)` and produce
+   a warning. Family units group every current snapshot entry by canonical adult
+   pair regardless of status/dates; a group larger than one is blocking unless
+   every unit has `distinct_union_confirmed=True`.
 3. Family-unit shape and parent membership.
 4. Exactly-zero-or-one primary placement.
 5. DFS cycle detection over biological, adoptive, step, and unknown links.
 6. Person, parent-child, and family-unit chronology.
+
+Add tests proving divorced, widowed, separated, ended, and unknown-status units
+cannot bypass duplicate-pair confirmation. Add a reducer-plus-validator test
+proving a superseded repository version is represented by one replacement under
+the same stable ID and therefore is not a second snapshot unit. Add unresolved
+subject-existence, normalized-duplicate warning, and add/supersede/remove
+lifecycle tests.
 
 Use interval comparisons for partial dates. Block only impossible ordering, such
 as a parent's latest possible birth occurring after the child's earliest possible
@@ -546,7 +614,10 @@ assert projection.references
 assert projection.references[0].target_person_id in set(primary_ids)
 ```
 
-Also shuffle insertion order ten times and assert identical projection dictionaries.
+For the two-parent fixture, assert two raw links, two adult memberships, and
+exactly one descendant edge. Assert canonical edge IDs use the exact `adult:` and
+`child:` formats. Also shuffle all four input-map insertion orders ten times and
+assert identical projection dictionaries, component IDs, and reference IDs.
 
 - [ ] **Step 2: Run projection tests and confirm failure**
 
@@ -556,10 +627,30 @@ Expected: FAIL because projection does not exist.
 
 - [ ] **Step 3: Implement public projection dataclasses**
 
-Define `ProjectedPerson`, `ProjectedFamilyUnit`, `ProjectedLink`,
-`RelationshipReference`, `GraphComponent`, and:
+Define these exact public projection records:
 
 ```python
+@dataclass(frozen=True, slots=True)
+class ProjectedPerson:
+    person_id: PersonId
+    full_name: str
+    gender: Gender
+    birth: PartialDate | None
+    death: PartialDate | None
+    is_alive: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedFamilyUnit:
+    family_unit_id: FamilyUnitId
+    kind: FamilyUnitKind
+    adult_a_id: PersonId
+    adult_b_id: PersonId | None
+    status: UnionStatus
+    start: PartialDate | None
+    end: PartialDate | None
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectedLink:
     link_id: LinkId
@@ -569,39 +660,102 @@ class ProjectedLink:
     relationship_type: RelationshipType
     family_unit_id: FamilyUnitId | None
     primary: bool
-```
 
-Set `primary` only when the child's `primary_family_unit_id` equals the link's
-non-null `family_unit_id`. This is the sole source of the frontend's primary-edge
-flag; the frontend must not derive it.
 
-```python
+@dataclass(frozen=True, slots=True)
+class AdultMembershipEdge:
+    edge_id: str
+    family_unit_id: FamilyUnitId
+    adult_id: PersonId
+    slot: Literal["adult_a", "adult_b"]
+
+
+@dataclass(frozen=True, slots=True)
+class DescendantEdge:
+    edge_id: str
+    family_unit_id: FamilyUnitId
+    child_id: PersonId
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipReference:
+    reference_id: str
+    source_person_id: PersonId
+    target_person_id: PersonId
+    family_unit_id: FamilyUnitId | None
+    relationship_type: RelationshipType
+    label: Literal["repeated_ancestor", "cross_family", "non_primary"]
+
+
+@dataclass(frozen=True, slots=True)
+class GraphComponent:
+    component_id: str
+    root_person_ids: tuple[PersonId, ...]
+    person_ids: tuple[PersonId, ...]
+    family_unit_ids: tuple[FamilyUnitId, ...]
+    link_ids: tuple[LinkId, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class TreeProjection:
     schema_version: Literal["2"]
     revision: int
+    semantic_checksum: str
     status: Literal["ready", "empty", "partial", "unavailable"]
     people: tuple[ProjectedPerson, ...]
     family_units: tuple[ProjectedFamilyUnit, ...]
     parent_child_links: tuple[ProjectedLink, ...]
+    adult_memberships: tuple[AdultMembershipEdge, ...]
+    descendant_edges: tuple[DescendantEdge, ...]
     references: tuple[RelationshipReference, ...]
     components: tuple[GraphComponent, ...]
     issues: tuple[GraphIssue, ...]
     unresolved_count: int
 ```
 
-No projected type contains email, phone, source record ID, audit data, or Airtable ID.
+Set raw-link `primary` only when the child's `primary_family_unit_id` equals the
+link's non-null `family_unit_id`. It is relationship detail, not a rendering
+instruction. `adult_memberships` and `descendant_edges` are the only authoritative
+rendering topology. No projected type contains email, phone, unresolved text,
+source record ID, audit data, provider text, or Airtable ID.
 
 - [ ] **Step 4: Implement component-aware DAG traversal**
 
-Build indexes from ID-sorted tuples. Calculate weakly connected components over
-people, family units, and parent-child links. Within each component, roots are
-active people with no primary ancestry placement. Expand a person once; later
-paths emit `RelationshipReference`. A single-parent family unit is a real unit,
-not a fake spouse. Sort every output collection by its application ID.
+Build indexes from ID-sorted tuples and validate before projection. Then apply the
+public archived-topology filter from the graph-contract design: omit archived
+people, incident links, units with archived adults, their canonical edges, and
+references with hidden endpoints; recompute roots/components afterward. Retained
+children from omitted units remain visible roots. Emit the allowlisted warning
+`ARCHIVED_RELATIONSHIP_OMITTED` and status `partial` when incident topology is
+omitted.
 
-Raise `InvalidGraphProjection(report)` when blocking issues exist. For warnings or
-unresolved annotations, return status `partial` and include sanitized issue codes.
+For each retained family unit, emit one adult membership per present adult with
+IDs `adult:{family_unit_id}:{person_id}`. Group retained primary raw links by
+`(family_unit_id, child_id)` and emit exactly one descendant edge per group with
+ID `child:{family_unit_id}:{child_id}`. Conflicting unit/child membership is a
+blocking validation error, not a silently chosen edge. Raw links remain separate
+detail records and are never rendered one-for-one.
+
+Calculate weakly connected components over retained people, family units, and
+canonical edges. Within each component, roots are retained people with no
+retained primary ancestry placement. Expand a person once; later paths emit
+`RelationshipReference`. A single-parent family unit is a real unit, not a fake
+spouse.
+
+Use full SHA-256 IDs exactly as specified in the graph-contract design:
+`cmp_` hashes sorted component person IDs; `ref_` hashes canonical JSON containing
+source, target, optional unit, relationship type, and label. Sort every output
+collection and every nested ID tuple.
+
+Raise `InvalidGraphProjection(report)` when blocking issues exist. For allowlisted
+warnings, archived-topology omissions, or unresolved annotations, return status
+`partial`. Public issues contain only code, severity, affected public application
+IDs, and fixed allowlisted copy. Copy `semantic_checksum(snapshot)` into the
+projection; do not hash a projection.
+
+Add archived fixtures/tests proving there are no dangling public IDs, hidden
+incident topology is omitted, an affected retained child remains reachable as a
+root, the status is partial, and the admin-domain snapshot remains unchanged.
 
 - [ ] **Step 5: Run and commit**
 
@@ -621,7 +775,7 @@ git commit -m "feat: project deterministic Shajra ancestry DAG"
 - Modify: `backend/domain/projection.py`
 
 **Interfaces:**
-- Consumes: `GraphSnapshot` or `TreeProjection`.
+- Consumes: `GraphSnapshot` only.
 - Produces: lowercase SHA-256 `semantic_checksum`.
 
 - [ ] **Step 1: Write failing checksum tests**
@@ -635,8 +789,17 @@ def test_checksum_changes_for_a_real_relationship_change():
     assert semantic_checksum(before_snapshot()) != semantic_checksum(after_snapshot())
 
 
-def test_checksum_ignores_airtable_provenance():
-    assert semantic_checksum(with_source_record("rec1")) == semantic_checksum(with_source_record("rec2"))
+def test_checksum_ignores_state_and_entity_revision_metadata():
+    assert semantic_checksum(snapshot_revision_a()) == semantic_checksum(snapshot_revision_b())
+
+
+def test_projection_carries_the_snapshot_checksum():
+    snapshot = two_parent_family_snapshot()[0]
+    assert project_graph(snapshot).semantic_checksum == semantic_checksum(snapshot)
+
+
+def test_confirmed_historical_union_changes_checksum():
+    assert semantic_checksum(unconfirmed_union()) != semantic_checksum(confirmed_union())
 ```
 
 - [ ] **Step 2: Implement canonical serialization**
@@ -650,8 +813,14 @@ def sha256_json(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 ```
 
-Exclude graph revision, operation ID, fencing token, source record IDs, and audit
-timestamps. Include stable IDs and all family semantics.
+Exclude graph revision, operation ID, fencing token, stored checksum, every entity
+`created_revision`/`version_revision`, source record IDs, migration IDs, and audit
+timestamps. Include stable IDs and all current family semantics, including
+normalized unresolved annotations and `distinct_union_confirmed`.
+
+`semantic_checksum` must reject non-`GraphSnapshot` inputs. `project_graph`
+computes the snapshot checksum once and copies it into the projection, avoiding a
+second public-projection checksum meaning and any recursive checksum field.
 
 - [ ] **Step 3: Run all graph-core gates**
 

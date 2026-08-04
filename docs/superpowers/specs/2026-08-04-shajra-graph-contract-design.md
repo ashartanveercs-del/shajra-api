@@ -16,7 +16,8 @@ It does not expand deployment scope or permit any cloud or production mutation.
 The v2 tree response separates source relationship records from canonical
 rendering topology.
 
-- `parent_child_links` contains sanitized underlying relationship records. It is
+- `parent_child_links` contains only the allowlisted `ProjectedLink` fields for
+  underlying relationship records. It is
   relationship/detail data and is never rendered as one connector per record.
 - `adult_memberships` is the authoritative rendered set of adult-to-family-unit
   edges.
@@ -118,12 +119,46 @@ class GraphComponent:
     link_ids: tuple[LinkId, ...]
 ```
 
-Component and reference IDs are deterministic strings derived from sorted stable
-application IDs. All nested IDs are sorted. Archived people are excluded from
-the public projection but remain available to the admin snapshot.
+Component and reference IDs use full lowercase SHA-256 digests of canonical
+UTF-8 strings, with no truncation or delimiter ambiguity:
+
+```text
+component_id = "cmp_" + sha256("|".join(sorted(person_ids))).hexdigest()
+reference_id = "ref_" + sha256(
+  canonical_json([source_person_id, target_person_id,
+                  family_unit_id_or_empty, relationship_type, label])
+).hexdigest()
+```
+
+Every component contains at least one person. `canonical_json` uses sorted keys,
+ASCII escaping, and separators `(",", ":")`. All nested IDs are sorted.
 
 No projected type contains contact data, source record IDs, audit metadata,
 provider details, or Airtable IDs.
+
+### Archived topology
+
+The public projection begins with people whose `archived` flag is false.
+
+- It omits every raw link whose parent or child is archived.
+- It omits every family unit whose `adult_a_id` or `adult_b_id` is archived, plus
+  all memberships and descendant edges for that omitted unit.
+- It omits every reference whose source or target is archived or whose family
+  unit was omitted.
+- It recomputes components and roots after filtering; no public collection can
+  contain a dangling person or family-unit ID.
+- An unarchived child whose primary family unit is omitted remains visible and
+  becomes a root unless another retained primary placement exists. The projector
+  never rewrites that family as a synthetic single-parent relationship.
+- Omitting any incident topology adds the allowlisted warning code
+  `ARCHIVED_RELATIONSHIP_OMITTED` and makes the public status `partial`.
+
+The graph-core `GraphSnapshot` is the admin-domain snapshot: it contains current
+archived people, current unresolved annotations, and confirmation flags, but no
+repository provenance or contact fields. API admin DTOs map this snapshot through
+an explicit field allowlist. Public issue DTOs expose only `code`, `severity`, and
+affected public application IDs; their message comes from a fixed code-to-copy
+allowlist and never from raw domain/provider text.
 
 ## 3. Unresolved Relationship Annotations
 
@@ -132,7 +167,9 @@ edges.
 
 Task 1 adds `UnresolvedRelationshipId = NewType("UnresolvedRelationshipId",
 str)` with the `unr_` prefix and new/migrated UUID factories matching the other
-stable ID rules.
+stable ID rules. Task 2 owns the annotation model, snapshot collection, and
+commands. `GraphSnapshot.unresolved` is an immutable
+`Mapping[UnresolvedRelationshipId, UnresolvedRelationship]`, not a history list.
 
 The immutable model is:
 
@@ -157,10 +194,35 @@ Names are trimmed and must be non-empty. The subject person must exist. Duplicat
 keys are `(subject_person_id, kind, casefolded_whitespace_normalized_name)` and
 produce a deterministic `DUPLICATE_UNRESOLVED_RELATIONSHIP` warning.
 
-The command union includes `AddUnresolvedRelationship` and
-`SupersedeUnresolvedRelationship`. Public projection exposes only
-`unresolved_count` and sanitized issue codes. Raw unresolved names remain in the
-admin snapshot and migration review surfaces.
+The command union includes these exact payloads:
+
+```python
+@dataclass(frozen=True, slots=True)
+class AddUnresolvedRelationship:
+    annotation: UnresolvedRelationship
+
+
+@dataclass(frozen=True, slots=True)
+class SupersedeUnresolvedRelationship:
+    unresolved_id: UnresolvedRelationshipId
+    replacement: UnresolvedRelationship
+
+
+@dataclass(frozen=True, slots=True)
+class RemoveUnresolvedRelationship:
+    unresolved_id: UnresolvedRelationshipId
+```
+
+Add rejects an existing ID. Supersede requires an existing target and a
+replacement with the same `unresolved_id`; it replaces the current map value.
+Remove requires an existing target and removes it from the current snapshot.
+Repository version/tombstone rows retain history, but only the highest committed,
+non-removed value enters `GraphSnapshot`, duplicate detection,
+`unresolved_count`, admin-domain output, and the semantic checksum.
+
+Public projection exposes only `unresolved_count` and allowlisted issue codes.
+Raw unresolved names remain in the admin-domain `GraphSnapshot` and migration
+review surfaces.
 
 Any unresolved annotation makes an otherwise valid public projection `partial`;
 it never creates a connector or changes ancestry roots.
@@ -174,10 +236,17 @@ distinct_union_confirmed: bool = False
 ```
 
 The normalized family key is the canonical adult pair after sorting adult IDs;
-a single-parent unit uses `(adult_a_id, None)`. If more than one active family
-unit has the same normalized key, every unit in that duplicate group must have
-`distinct_union_confirmed=True`. Otherwise validation emits the blocking
-`DUPLICATE_FAMILY_UNIT` issue.
+a single-parent unit uses `(adult_a_id, None)`. The comparison population is
+every family unit in the current committed `GraphSnapshot.family_units` map,
+regardless of status, start date, end date, divorce, separation, or widowhood.
+Repository versions superseded at or before the committed revision are not
+separate snapshot entries: `SupersedeFamilyUnit` replaces the current value under
+the same stable `family_unit_id`, while the repository retains prior versions.
+
+If more than one current unit has the same normalized key, every unit in that
+duplicate group must have `distinct_union_confirmed=True`. Otherwise validation
+emits the blocking `DUPLICATE_FAMILY_UNIT` issue. Divorced, widowed, separated,
+ended, and unknown-status units cannot bypass this rule.
 
 Confirmation is an explicit graph mutation reviewed in preview. Services must
 not infer confirmation from dates, statuses, notes, IDs, or record order. The
@@ -194,8 +263,9 @@ belong to repository row wrappers and commit/audit records. They are not fields
 on `Person`, `FamilyUnit`, `ParentChildLink`, `UnresolvedRelationship`, or
 `TreeProjection`.
 
-`semantic_checksum` includes stable IDs and every family semantic, including
-unresolved annotations and `distinct_union_confirmed`. It excludes:
+`semantic_checksum(snapshot: GraphSnapshot)` is the only checksum entry point.
+It includes stable IDs and every current family semantic, including normalized
+unresolved annotation names and `distinct_union_confirmed`. It excludes:
 
 - graph revision
 - head operation ID
@@ -203,16 +273,20 @@ unresolved annotations and `distinct_union_confirmed`. It excludes:
 - any previously stored checksum
 - repository source IDs and migration IDs
 - audit timestamps and delivery metadata
+- every entity `created_revision` or `version_revision`
 
 The graph-core provenance test is replaced with a pure-domain test proving that
 identical graph maps with different `GraphState` revision, operation, fencing,
-and stored-checksum values produce the same checksum. Repository mapper tests in
-the persistence plan separately prove that different source record IDs map to
-the same domain checksum.
+stored-checksum, and entity revision metadata produce the same checksum.
+Repository mapper tests in the persistence plan separately prove that different
+source record IDs map to the same domain checksum.
 
-`TreeProjection` receives the final lowercase SHA-256 checksum after canonical
-serialization. The projection's `semantic_checksum` field is omitted when a
-projection itself is serialized for hashing, preventing self-reference.
+`project_graph` computes the domain checksum from its input snapshot and copies
+that lowercase SHA-256 value into `TreeProjection.semantic_checksum`. A
+`TreeProjection` is never accepted by `semantic_checksum`; therefore public
+privacy filtering and hidden unresolved text cannot create a second checksum
+meaning. Tests assert
+`project_graph(snapshot).semantic_checksum == semantic_checksum(snapshot)`.
 
 ## 6. Determinism and Validation
 
@@ -224,8 +298,8 @@ projection itself is serialized for hashing, preventing self-reference.
   `(parent_id, child_id, relationship_type)`.
 - Guardian links never participate in ancestry or canonical descendant edges.
 - Biological, adoptive, step, and unknown primary links remain cycle-checked.
-- A blocking validation report prevents a ready projection; warnings and
-  unresolved annotations yield `partial`.
+- A blocking validation report prevents a ready projection; allowlisted warnings,
+  archived-topology omissions, and unresolved annotations yield `partial`.
 
 ## 7. Required Tests
 
@@ -236,16 +310,25 @@ The amended graph plans must include tests proving:
 2. The frontend consumes canonical edge arrays and does not group raw links.
 3. Ten insertion-order shuffles produce identical projection dictionaries and
    checksums.
-4. Unresolved IDs are stable, commands are immutable, names never create nodes or
-   edges, and public output omits raw unresolved text.
-5. Duplicate adult pairs fail unless every unit is explicitly confirmed distinct.
-6. Confirmation changes the semantic checksum.
-7. Repository source IDs do not enter domain objects or affect checksums.
-8. Repeated ancestors appear once as a primary person plus deterministic
-   references.
+4. Unresolved IDs are stable; add/supersede/remove commands have the exact current
+   map lifecycle; names never create nodes or edges; public output omits raw text.
+5. Duplicate adult pairs fail unless every current unit is explicitly confirmed,
+   including divorced, widowed, separated, ended, and unknown-status units;
+   superseded repository versions do not appear as duplicate snapshot entries.
+6. Confirmation changes the semantic checksum, while graph/entity revision
+   metadata does not.
+7. The projected checksum equals the input snapshot checksum and is never hashed
+   recursively.
+8. Repository source IDs do not enter domain objects or affect checksums.
+9. Archived people cannot leave dangling public links, units, edges, references,
+   or components; affected unarchived descendants remain visible in a partial
+   graph.
+10. Repeated ancestors appear once as a primary person plus deterministic
+    references.
 
 ## 8. Sequencing
 
-The graph-core plan is amended first, followed by backend persistence and frontend
-plans wherever their DTOs or tests consume this contract. No graph implementation
-begins from the contradictory plan text.
+The graph-core, backend-persistence, and frontend plans are amended in the same
+contract change wherever their DTOs, commands, repositories, tests, or layout
+logic consume this design. No graph implementation begins from the superseded
+plan text.

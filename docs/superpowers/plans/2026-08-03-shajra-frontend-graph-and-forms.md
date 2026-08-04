@@ -6,7 +6,7 @@
 
 **Architecture:** Split the frontend into typed API, graph, submission, admin, enrichment-review, and shared interaction layers. React Flow renders custom person and family-unit nodes; ELK computes deterministic layered geometry with fixed ports. Public writes and admin authentication use same-origin Next.js route handlers, while the browser never stores a bearer token. Admin drag/drop creates drafts only; AI suggestions enter the same previewed mutation workflow as manual edits.
 
-**Tech Stack:** Next.js 16.2.12, React 19.2.8, TypeScript, React Aria Components 1.20.0, React Flow 12.11.2, ELK.js 0.12.0, Zod 4.4.3, React Hook Form 7.84.0, Hookform Resolvers 5.7.1, Vitest 4.1.10, Playwright 1.62.1, Axe Playwright 4.12.1.
+**Tech Stack:** Next.js 16.3.0, React 19.2.8, TypeScript, React Aria Components 1.20.0, React Flow 12.11.2, ELK.js 0.12.0, Zod 4.4.3, React Hook Form 7.84.0, Hookform Resolvers 5.7.1, Vitest 4.1.10, Playwright 1.62.1, Axe Playwright 4.12.1.
 
 ## Global Constraints
 
@@ -87,10 +87,13 @@ export type TreeStatus = "ready" | "empty" | "partial" | "unavailable";
 export interface TreeProjectionV2 {
   schemaVersion: "2";
   revision: number;
+  semanticChecksum: string;
   status: TreeStatus;
   people: PublicPerson[];
   familyUnits: PublicFamilyUnit[];
   parentChildLinks: PublicParentChildLink[];
+  adultMemberships: AdultMembershipEdge[];
+  descendantEdges: DescendantEdge[];
   references: RelationshipReference[];
   components: GraphComponent[];
   issues: GraphIssue[];
@@ -169,8 +172,12 @@ POST, PUT, PATCH, or DELETE request.
 - [ ] **Step 3: Create normalized fixtures with literal IDs**
 
 `tree.ts` exports `emptyTree`, `twoParentTree`, `remarriageTree`,
-`repeatedAncestorTree`, `disconnectedTree`, and `partialTree`. Use literal IDs
-such as `per_anna`, `fam_anna_ben`, and `lnk_anna_child`; never random IDs.
+`repeatedAncestorTree`, `disconnectedTree`, `partialTree`, and
+`archivedTopologyTree`. Every fixture contains a literal 64-hex semantic
+checksum plus explicit `adultMemberships` and `descendantEdges`; raw links never
+stand in for those arrays. Use literal IDs such as `per_anna`, `fam_anna_ben`,
+and `lnk_anna_child`; never random IDs. The archived fixture contains no dangling
+public ID and reports `ARCHIVED_RELATIONSHIP_OMITTED` with allowlisted copy.
 
 `admin.ts` exports revision `7`, one valid mutation preview, one cycle rejection,
 and one `409` stale-revision problem.
@@ -214,6 +221,7 @@ In `types.ts`:
 export const personIdSchema = z.string().regex(/^per_[a-z0-9_]+$/).brand<"PersonId">();
 export const familyUnitIdSchema = z.string().regex(/^fam_[a-z0-9_]+$/).brand<"FamilyUnitId">();
 export const linkIdSchema = z.string().regex(/^lnk_[a-z0-9_]+$/).brand<"LinkId">();
+export const unresolvedRelationshipIdSchema = z.string().regex(/^unr_[a-z0-9_]+$/).brand<"UnresolvedRelationshipId">();
 export const submissionIdSchema = z.string().regex(/^sub_[a-z0-9_]+$/).brand<"SubmissionId">();
 export const attemptIdSchema = z.string().regex(/^att_[a-z0-9_]+$/).brand<"AttemptId">();
 export const reviewIdSchema = z.string().regex(/^rev_[a-z0-9_]+$/).brand<"ReviewId">();
@@ -221,27 +229,58 @@ export const reviewIdSchema = z.string().regex(/^rev_[a-z0-9_]+$/).brand<"Review
 export type PersonId = z.infer<typeof personIdSchema>;
 export type FamilyUnitId = z.infer<typeof familyUnitIdSchema>;
 export type LinkId = z.infer<typeof linkIdSchema>;
+export type UnresolvedRelationshipId = z.infer<typeof unresolvedRelationshipIdSchema>;
 export type SubmissionId = z.infer<typeof submissionIdSchema>;
 export type AttemptId = z.infer<typeof attemptIdSchema>;
 export type ReviewId = z.infer<typeof reviewIdSchema>;
 ```
 
+The canonical edge schemas have these exact camel-case fields:
+
+```ts
+type AdultMembershipEdge = {
+  edgeId: string;
+  familyUnitId: FamilyUnitId;
+  adultId: PersonId;
+  slot: "adult_a" | "adult_b";
+};
+
+type DescendantEdge = {
+  edgeId: string;
+  familyUnitId: FamilyUnitId;
+  childId: PersonId;
+};
+```
+
+Their Zod schemas are strict, require semantic edge IDs matching the corresponding
+`adult:{familyUnitId}:{adultId}` or `child:{familyUnitId}:{childId}` values after
+parse, and reject dangling IDs during tree-level refinement.
+
 `MutationDraft` is `{ schemaVersion: "1"; snapshotRevision: number;
 idempotencyKey: string; commands: GraphCommandDto[]; sourceReviewId?: ReviewId }`. Define
 `GraphCommandDto` as a strict discriminated union for add/update person, create/
 supersede family unit, create/supersede parent-child link, set primary placement,
-archive person, and unresolved annotation. Its JSON field names map one-to-one to
-the backend `GraphMutationRequest` command schemas.
+archive person, and add/supersede/remove unresolved annotation. Unresolved add
+carries the full annotation, supersede carries the stable unresolved ID plus a
+same-ID replacement, and remove carries the stable unresolved ID. Its JSON field
+names map one-to-one to the backend `GraphMutationRequest` command schemas.
 The API mapper converts `sourceReviewId` to backend `source_reference`; only a
 branded `ReviewId` is accepted.
 
-Define strict schemas for partial dates, people, family units, links, references,
-components, issues, tree projection, mutation draft, preview, result, and RFC 9457
-problem details. Add submission review summary/detail, enrichment attempt,
+Define strict schemas for partial dates, people, family units, raw links,
+adult-membership edges, descendant edges, references, components, allowlisted
+public issues, tree projection, mutation draft, preview, result, and RFC 9457
+problem details. `adultMemberships` and `descendantEdges` are required arrays and
+the only rendering topology. Raw `parentChildLinks` remain relationship detail.
+`semanticChecksum` is required as 64 lowercase hexadecimal characters. Public
+issue schemas reject raw/internal messages and unknown fields.
+
+Add submission review summary/detail, enrichment attempt,
 candidate, suggestion, decision, and completed-review schemas matching backend
 camel-case fields. Derive TypeScript types with `z.infer` rather than duplicating
 interfaces. `PublicParentChildLink.primary` is required and comes from the backend
-projection; no frontend schema default may invent it.
+projection, but it is not rendered directly; no frontend schema default may
+invent it.
 
 - [ ] **Step 3: Implement public client parsing**
 
@@ -376,7 +415,8 @@ repeated ancestors create references rather than duplicate person nodes.
 
 For `twoParentTree`, assert two adult-membership edges enter the family unit and
 exactly one descendant edge leaves that unit for its child, despite two underlying
-parent-child links.
+parent-child links. Assert adding another raw detail link cannot add a rendered
+edge, while removing a required canonical edge fails the fixture/schema contract.
 
 - [ ] **Step 2: Define typed node and edge unions**
 
@@ -395,13 +435,16 @@ Use fixed ports `person-parent-out`, `family-adult-a-in`, `family-adult-b-in`,
 
 - [ ] **Step 3: Convert v2 projection to ELK input**
 
-Sort every person, family unit, and link by ID. Add one ELK node per person and
-family unit. Derive adult edges from `adultAId`/`adultBId`, with IDs
-`adult:{familyUnitId}:{personId}`. Group primary links by
-`(familyUnitId, childId)` and emit one `child:{familyUnitId}:{childId}` edge from
-the family child port. A primary link without a family unit emits
-`parent:{parentId}:{childId}`. Reference edges are excluded from ELK and overlaid
-after layout. Reject conflicting grouped roles instead of hiding them.
+Sort every person, family unit, `adultMembership`, and `descendantEdge` by ID. Add
+one ELK node per person and family unit. Convert each backend-provided adult
+membership directly to the declared adult slot/port and each backend-provided
+descendant edge directly from the family child port to the person child port.
+Validate every referenced person/unit and reject duplicate canonical edge IDs or
+dangling endpoints.
+
+Never iterate `parentChildLinks` to create, group, infer, or supplement ELK edges;
+those records are relationship detail only. Reference edges are excluded from ELK
+and overlaid after layout from the explicit backend reference collection.
 
 Use these options:
 
@@ -767,9 +810,14 @@ card, and pane resizing cannot overlap the toolbar.
 
 - [ ] **Step 3: Write relationship-draft tests**
 
-Test create union, single-parent unit, parent-child link, remarriage, change primary
-placement, archive person, unresolved proposal, cycle preview rejection, stale
-revision, and idempotency-key stability. Drafts always include snapshot revision.
+Test create union, single-parent unit, parent-child link, remarriage, repeated
+historical union, change primary placement, archive person, unresolved
+add/supersede/remove, cycle preview rejection, stale revision, and idempotency-key
+stability. Drafts always include snapshot revision. A repeated canonical adult
+pair must fail local draft construction until the administrator explicitly
+confirms the distinction; the resulting draft sets
+`distinctUnionConfirmed=true` on every current unit in that duplicate group via
+same-ID supersede commands and on the new unit.
 
 - [ ] **Step 4: Implement draft builders and focused inspector actions**
 
@@ -781,7 +829,10 @@ idempotency key when a draft begins and preserve it through preview and commit.
 union, Change primary placement, Edit person, and Archive for a selected person.
 Family units expose Edit union, Add child, End union, and Supersede. Use stable-ID
 comboboxes with name, dates, and branch context; unresolved text is a separate
-field. Keep unsaved drafts in memory and warn before route unload.
+field with explicit add, replace, and remove actions. `Add another union` for an
+existing canonical adult pair displays a required confirmation checkbox naming
+the affected units; dates/status never auto-confirm it. Keep unsaved drafts in
+memory and warn before route unload.
 
 - [ ] **Step 5: Make drag/drop draft-only**
 
