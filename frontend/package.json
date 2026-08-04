@@ -16,7 +16,7 @@
     "@types/three": "^0.183.1",
     "leaflet": "^1.9.4",
     "lucide-react": "^1.7.0",
-    "next": "16.2.12",
+    "next": "16.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-globe.gl": "^2.37.0",
@@ -34,10 +34,28 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.2.12",
+    "eslint-config-next": "16.3.0",
     "jsdom": "30.0.1",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "4.1.10"
+  },
+  "overrides": {
+    "@eslint/eslintrc": {
+      "js-yaml": "4.3.0"
+    },
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": {
+        "brace-expansion": "5.0.9"
+      }
+    },
+    "eslint": {
+      "minimatch": {
+        "brace-expansion": "1.1.18"
+      }
+    },
+    "kapsule": {
+      "lodash-es": "4.18.1"
+    }
   }
 }

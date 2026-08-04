@@ -1,36 +1,59 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Shajra Frontend
 
-## Getting Started
+The frontend lives in `frontend/` and the FastAPI backend lives in `backend/`.
+Use Node 22 and Python 3.12 for the repeatable local gate.
 
-First, run the development server:
+## Local development
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+Start the backend from the repository root in an isolated virtual environment:
+
+```powershell
+python -m venv backend/.venv
+backend/.venv/Scripts/python -m pip install --upgrade pip
+backend/.venv/Scripts/python -m pip install -r backend/requirements-dev.txt
+Set-Location backend
+.venv/Scripts/python -m uvicorn main:app --reload
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Start the frontend in a second PowerShell window:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```powershell
+Set-Location frontend
+$env:NEXT_PUBLIC_API_URL = "http://127.0.0.1:8000"
+npm ci
+npm run dev
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Open the frontend at [http://localhost:3000](http://localhost:3000) and the
+backend readiness endpoint at
+[http://127.0.0.1:8000/api/health/ready](http://127.0.0.1:8000/api/health/ready).
 
-## Learn More
+All write flags remain `false` during this recovery plan. Do not add credentials
+to local files or enable public or relationship writes for local verification.
 
-To learn more about Next.js, take a look at the following resources:
+## Local verification
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Run backend checks from the repository root with the isolated virtual environment:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```powershell
+backend/.venv/Scripts/python -m pytest backend/tests -q
+backend/.venv/Scripts/ruff check backend
+backend/.venv/Scripts/python -m compileall -q backend
+backend/.venv/Scripts/pip-audit -r backend/requirements.txt
+```
 
-## Deploy on Vercel
+Run frontend checks from `frontend/`:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```powershell
+npm ci
+npm audit --audit-level=high
+npm run lint
+npm run typecheck
+npm test
+$env:NEXT_PUBLIC_API_URL = "https://ci.invalid"
+npm run build
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The production build intentionally uses only the non-production `.invalid` API
+URL. It must never be built with a production URL or secret during local or GitHub
+verification.
