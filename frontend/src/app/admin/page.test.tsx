@@ -97,6 +97,61 @@ describe("AdminPage reliability states", () => {
     expect(await screen.findByText("Sara Khan")).toBeInTheDocument();
   });
 
+  it("settles concurrent section retries without leaving either section stuck", async () => {
+    const membersRetry = deferred<Array<{ id: string; FullName: string }>>();
+    const emailsRetry = deferred<Array<{ id: string; Email: string; Name: string }>>();
+    apiMocks.fetchPending.mockResolvedValue([
+      { id: "submission-1", Status: "Pending", RawFullName: "Ali Pending" },
+    ]);
+    apiMocks.fetchMembers
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "member read failed"))
+      .mockImplementationOnce(() => membersRetry.promise);
+    apiMocks.adminFetchApprovedEmails
+      .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "email read failed"))
+      .mockImplementationOnce(() => emailsRetry.promise);
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+
+    await user.click(await screen.findByRole("button", { name: /^Members/ }));
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    await user.click(screen.getByRole("button", { name: /^Approved Emails/ }));
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+
+    membersRetry.resolve([{ id: "member-1", FullName: "Sara Khan" }]);
+    await user.click(screen.getByRole("button", { name: /^Members/ }));
+    expect(await screen.findByText("Sara Khan")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Approved Emails/ }));
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+    emailsRetry.resolve([
+      { id: "email-1", Email: "family@example.com", Name: "Family" },
+    ]);
+    expect(await screen.findByText("family@example.com")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+
+    apiMocks.fetchMembers.mockRejectedValueOnce(
+      new ApiProblem(503, "REQUEST_FAILED", "member reload failed"),
+    );
+    apiMocks.adminFetchApprovedEmails.mockRejectedValueOnce(
+      new ApiProblem(503, "REQUEST_FAILED", "email reload failed"),
+    );
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(3));
+    await user.click(screen.getByRole("button", { name: /^Members/ }));
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: /^Approved Emails/ }));
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /^Pending/ }));
+    expect(screen.getByText("Ali Pending")).toBeInTheDocument();
+    expect(apiMocks.fetchPending).toHaveBeenCalledTimes(2);
+    expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(3);
+    expect(apiMocks.adminFetchApprovedEmails).toHaveBeenCalledTimes(3);
+  });
+
   it("resets a deferred refresh when logout starts a newer session", async () => {
     const oldRefresh = deferred<Array<{ id: string; FullName: string }>>();
     apiMocks.fetchMembers

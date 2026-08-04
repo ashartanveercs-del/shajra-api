@@ -146,6 +146,11 @@ export default function AdminPage() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const dashboardRequest = useRef(0);
+  const dashboardSectionRequest = useRef<Record<DashboardSection, number>>({
+    pending: 0,
+    members: 0,
+    emails: 0,
+  });
   const sessionEpoch = useRef(0);
   const activeToken = useRef(token);
   const loginRequest = useRef(0);
@@ -209,6 +214,7 @@ export default function AdminPage() {
     if (!token || activeToken.current !== token) return;
     const epoch = sessionEpoch.current;
     const request = ++dashboardRequest.current;
+    dashboardSectionRequest.current = { pending: request, members: request, emails: request };
     if (block) setDashboardState({ status: "loading" });
     setRefreshing(true);
     try {
@@ -224,6 +230,7 @@ export default function AdminPage() {
     if (!token || activeToken.current !== token || retryingSectionsRef.current.has(section)) return;
     const epoch = sessionEpoch.current;
     const request = ++dashboardRequest.current;
+    dashboardSectionRequest.current = { ...dashboardSectionRequest.current, [section]: request };
     retryingSectionsRef.current = new Set(retryingSectionsRef.current).add(section);
     setRetryingSections(new Set(retryingSectionsRef.current));
 
@@ -239,7 +246,7 @@ export default function AdminPage() {
         const emails = await adminFetchApprovedEmails(token);
         applyResult = (data) => ({ ...data, emails });
       }
-      if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
+      if (request !== dashboardSectionRequest.current[section] || !sessionIsCurrent(epoch, token)) return;
       setDashboardState((current) => {
         const retained = "data" in current ? current.data : EMPTY_DASHBOARD;
         const unavailable = new Set(retained.unavailable);
@@ -247,7 +254,7 @@ export default function AdminPage() {
         return dashboardStateFor(applyResult({ ...retained, unavailable }));
       });
     } catch (error: unknown) {
-      if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
+      if (request !== dashboardSectionRequest.current[section] || !sessionIsCurrent(epoch, token)) return;
       setDashboardState((current) => {
         const retained = "data" in current ? current.data : EMPTY_DASHBOARD;
         const unavailable = new Set(retained.unavailable).add(section);
@@ -257,7 +264,7 @@ export default function AdminPage() {
         );
       });
     } finally {
-      if (request === dashboardRequest.current && sessionIsCurrent(epoch, token)) {
+      if (sessionIsCurrent(epoch, token)) {
         const next = new Set(retryingSectionsRef.current);
         next.delete(section);
         retryingSectionsRef.current = next;
@@ -270,6 +277,7 @@ export default function AdminPage() {
     if (!token || activeToken.current !== token) return;
     const epoch = sessionEpoch.current;
     const request = ++dashboardRequest.current;
+    dashboardSectionRequest.current = { pending: request, members: request, emails: request };
     fetchDashboard(token).then((results) => {
       if (request !== dashboardRequest.current || !sessionIsCurrent(epoch, token)) return;
       setDashboardState(dashboardStateFrom(results));
