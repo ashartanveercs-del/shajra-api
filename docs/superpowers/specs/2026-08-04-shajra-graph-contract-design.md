@@ -140,7 +140,9 @@ provider details, or Airtable IDs.
 
 The public projection begins with people whose `archived` flag is false.
 
-- It omits every raw link whose parent or child is archived.
+- It omits every raw link whose parent or child is archived. It also omits a raw
+  link whose non-null `family_unit_id` names any family unit omitted by this
+  filter, even when that link's parent and child are both retained.
 - It omits every family unit whose `adult_a_id` or `adult_b_id` is archived, plus
   all memberships and descendant edges for that omitted unit.
 - It omits every reference whose source or target is archived or whose family
@@ -155,10 +157,99 @@ The public projection begins with people whose `archived` flag is false.
 
 The graph-core `GraphSnapshot` is the admin-domain snapshot: it contains current
 archived people, current unresolved annotations, and confirmation flags, but no
-repository provenance or contact fields. API admin DTOs map this snapshot through
-an explicit field allowlist. Public issue DTOs expose only `code`, `severity`, and
-affected public application IDs; their message comes from a fixed code-to-copy
-allowlist and never from raw domain/provider text.
+repository provenance or contact fields. The v2 API uses camel-case JSON and the
+following exact strict DTOs; every object rejects unknown fields:
+
+```typescript
+type PublicIssueCode =
+  | "DUPLICATE_UNRESOLVED_RELATIONSHIP"
+  | "SUSPICIOUS_PARENT_AGE"
+  | "ARCHIVED_RELATIONSHIP_OMITTED"
+  | "GRAPH_WARNING";
+
+type PublicGraphIssueDto = {
+  code: PublicIssueCode;
+  severity: "error" | "warning";
+  message: string;
+  personIds: PersonId[];
+  familyUnitIds: FamilyUnitId[];
+  linkIds: LinkId[];
+};
+
+type AdminPartialDateDto = {
+  value: string;
+  precision: "year" | "month" | "day";
+};
+
+type AdminPersonDto = {
+  personId: PersonId;
+  fullName: string;
+  gender: Gender;
+  birth: AdminPartialDateDto | null;
+  death: AdminPartialDateDto | null;
+  isAlive: boolean | null;
+  primaryFamilyUnitId: FamilyUnitId | null;
+  archived: boolean;
+  versionRevision: number;
+};
+
+type AdminFamilyUnitDto = {
+  familyUnitId: FamilyUnitId;
+  kind: FamilyUnitKind;
+  adultAId: PersonId;
+  adultBId: PersonId | null;
+  status: UnionStatus;
+  start: AdminPartialDateDto | null;
+  end: AdminPartialDateDto | null;
+  distinctUnionConfirmed: boolean;
+  createdRevision: number;
+};
+
+type AdminParentChildLinkDto = {
+  linkId: LinkId;
+  parentId: PersonId;
+  childId: PersonId;
+  role: ParentRole;
+  relationshipType: RelationshipType;
+  familyUnitId: FamilyUnitId | null;
+  createdRevision: number;
+};
+
+type AdminUnresolvedRelationshipDto = {
+  unresolvedId: UnresolvedRelationshipId;
+  subjectPersonId: PersonId;
+  kind: UnresolvedRelationshipKind;
+  unresolvedName: string;
+  createdRevision: number;
+};
+
+type AdminGraphSnapshot = {
+  schemaVersion: "2";
+  revision: number;
+  semanticChecksum: string;
+  people: AdminPersonDto[];
+  familyUnits: AdminFamilyUnitDto[];
+  parentChildLinks: AdminParentChildLinkDto[];
+  unresolvedRelationships: AdminUnresolvedRelationshipDto[];
+};
+```
+
+`headOperationId`, `fencingToken`, repository row IDs, source IDs, provider
+metadata, and contact fields are not API fields. Public issue `message` is the
+only user-facing text field: it is selected from `PUBLIC_ISSUE_MESSAGES` by
+allowlisted `code`, never copied from `GraphIssue.message` or provider text. A
+non-allowlisted warning maps to allowlisted code `GRAPH_WARNING` and its fixed
+generic message; blocking errors prevent projection. There is no public `copy`,
+`rawMessage`, or `internalMessage` field.
+
+The public warning allowlist is exact:
+
+```text
+DUPLICATE_UNRESOLVED_RELATIONSHIP = "Some relationships need review."
+SUSPICIOUS_PARENT_AGE = "Some dates may need review."
+ARCHIVED_RELATIONSHIP_OMITTED = "Some relationships are hidden because an archived person is involved."
+GRAPH_WARNING = "Some family-tree details need review."
+```
 
 ## 3. Unresolved Relationship Annotations
 
@@ -170,6 +261,16 @@ str)` with the `unr_` prefix and new/migrated UUID factories matching the other
 stable ID rules. Task 2 owns the annotation model, snapshot collection, and
 commands. `GraphSnapshot.unresolved` is an immutable
 `Mapping[UnresolvedRelationshipId, UnresolvedRelationship]`, not a history list.
+
+The migrated factory accepts
+`(source_table, source_record_id, source_relation_slot)`. The slot is a non-empty,
+case-sensitive mapper-owned field/ordinal discriminator such as `FatherName#0`,
+`MotherName#0`, or `SpouseNames#1`. Its UUID5 name is the compact ASCII JSON array
+`["shajra","unresolved","v1",source_table,source_record_id,source_relation_slot]`
+encoded with separators `(",", ":")`; no delimiter-joined string is used. Legacy
+list fields preserve source order and use a zero-based ordinal, so every relation
+from one row has a distinct ID and an unchanged row produces the same IDs on
+every migration rerun.
 
 The immutable model is:
 
@@ -310,21 +411,28 @@ The amended graph plans must include tests proving:
 2. The frontend consumes canonical edge arrays and does not group raw links.
 3. Ten insertion-order shuffles produce identical projection dictionaries and
    checksums.
-4. Unresolved IDs are stable; add/supersede/remove commands have the exact current
-   map lifecycle; names never create nodes or edges; public output omits raw text.
+4. Unresolved IDs are stable and distinct across father, mother, and every
+   partner slot from one legacy row and across idempotent reruns;
+   add/supersede/remove commands have the exact current-map lifecycle; names
+   never create nodes or edges; public output omits raw text.
 5. Duplicate adult pairs fail unless every current unit is explicitly confirmed,
    including divorced, widowed, separated, ended, and unknown-status units;
    superseded repository versions do not appear as duplicate snapshot entries.
 6. Confirmation changes the semantic checksum, while graph/entity revision
    metadata does not.
-7. The projected checksum equals the input snapshot checksum and is never hashed
-   recursively.
+7. The projected checksum equals the input snapshot checksum, is never hashed
+   recursively, and passing a projection to `semantic_checksum` raises
+   `TypeError`.
 8. Repository source IDs do not enter domain objects or affect checksums.
 9. Archived people cannot leave dangling public links, units, edges, references,
-   or components; affected unarchived descendants remain visible in a partial
-   graph.
+   or components; both raw parent links are omitted when a two-adult family is
+   filtered because one adult is archived, while the affected unarchived child
+   remains visible in a partial graph.
 10. Repeated ancestors appear once as a primary person plus deterministic
     references.
+11. Public issue and admin snapshot objects have exactly the key sets above;
+    code/message mismatches and unknown, private, or provenance fields are
+    rejected by backend and frontend schemas.
 
 ## 8. Sequencing
 

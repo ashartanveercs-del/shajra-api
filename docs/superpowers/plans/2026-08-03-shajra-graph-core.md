@@ -90,6 +90,7 @@ Create `backend/tests/unit/domain/test_ids.py`:
 ```python
 from domain.ids import (
     migrated_person_id,
+    migrated_unresolved_relationship_id,
     new_family_unit_id,
     new_person_id,
     new_unresolved_relationship_id,
@@ -109,6 +110,20 @@ def test_migrated_ids_are_deterministic_and_table_scoped():
     first = migrated_person_id("ApprovedMembers", "rec123")
     assert first == migrated_person_id("ApprovedMembers", "rec123")
     assert first != migrated_person_id("PendingSubmissions", "rec123")
+
+
+def test_migrated_unresolved_ids_are_relation_slot_scoped_and_idempotent():
+    slots = ("FatherName#0", "MotherName#0", "SpouseNames#0", "SpouseNames#1")
+    first_run = [
+        migrated_unresolved_relationship_id("ApprovedMembers", "rec123", slot)
+        for slot in slots
+    ]
+    second_run = [
+        migrated_unresolved_relationship_id("ApprovedMembers", "rec123", slot)
+        for slot in slots
+    ]
+    assert len(set(first_run)) == len(slots)
+    assert first_run == second_run
 ```
 
 - [ ] **Step 2: Run ID tests and confirm failure**
@@ -122,6 +137,7 @@ Expected: FAIL because `domain.ids` does not exist.
 Write `backend/domain/ids.py`:
 
 ```python
+import json
 from typing import NewType
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -140,6 +156,26 @@ def _new(prefix: str) -> str:
 def _migrated(prefix: str, source_table: str, source_record_id: str) -> str:
     value = uuid5(NAMESPACE_URL, f"shajra:{source_table}:{source_record_id}")
     return f"{prefix}_{value.hex}"
+
+
+def _migrated_unresolved(
+    source_table: str, source_record_id: str, source_relation_slot: str
+) -> str:
+    if not source_relation_slot:
+        raise ValueError("source_relation_slot must be non-empty")
+    canonical_name = json.dumps(
+        [
+            "shajra",
+            "unresolved",
+            "v1",
+            source_table,
+            source_record_id,
+            source_relation_slot,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"unr_{uuid5(NAMESPACE_URL, canonical_name).hex}"
 
 
 def new_person_id() -> PersonId:
@@ -178,9 +214,11 @@ def migrated_link_id(source_table: str, source_record_id: str) -> LinkId:
 
 
 def migrated_unresolved_relationship_id(
-    source_table: str, source_record_id: str
+    source_table: str, source_record_id: str, source_relation_slot: str
 ) -> UnresolvedRelationshipId:
-    return UnresolvedRelationshipId(_migrated("unr", source_table, source_record_id))
+    return UnresolvedRelationshipId(
+        _migrated_unresolved(source_table, source_record_id, source_relation_slot)
+    )
 
 
 def migrated_operation_id(source_table: str, source_record_id: str) -> OperationId:
@@ -190,6 +228,13 @@ def migrated_operation_id(source_table: str, source_record_id: str) -> Operation
 def migrated_run_id(source_table: str, source_record_id: str) -> MigrationRunId:
     return MigrationRunId(_migrated("mig", source_table, source_record_id))
 ```
+
+`source_relation_slot` is a non-empty, case-sensitive source-field/ordinal token
+owned by the legacy mapper. Use exact values such as `FatherName#0`,
+`MotherName#0`, and `SpouseNames#0`; list ordinals are zero-based and preserve
+source order. The compact ASCII JSON array in `_migrated_unresolved` is the
+canonical UUID5 name, so delimiter characters inside source values cannot make
+two identities ambiguous.
 
 - [ ] **Step 4: Write failing partial-date tests**
 
@@ -449,8 +494,9 @@ Implement these exact fixture contracts without calling production ID factories:
 - `simple_parent_child_snapshot(include_link=True)` returns the snapshot plus
   `PARENT`, `CHILD`, and `LinkId("lnk_parent_child")`; omitting the link changes
   no other fixture data.
-- `two_parent_family_snapshot()` contains two adults, one union, one child, two
-  biological links, and that union as the child's primary family unit.
+- `two_parent_family_snapshot()` returns one `GraphSnapshot` containing two
+  adults, one union, one child, two biological links, and that union as the
+  child's primary family unit.
 - `remarriage_snapshot()` contains one adult in two distinct canonical unions and
   one child per union.
 - `cousin_union_snapshot()` is acyclic but contains a repeated ancestor path.
@@ -619,6 +665,12 @@ exactly one descendant edge. Assert canonical edge IDs use the exact `adult:` an
 `child:` formats. Also shuffle all four input-map insertion orders ten times and
 assert identical projection dictionaries, component IDs, and reference IDs.
 
+For the archived two-parent fixture, archive adult A while retaining adult B,
+child C, family F, and raw links A-to-C and B-to-C in the input snapshot. Assert
+F, both raw links, both memberships, and F's descendant edge are absent from the
+public projection; B and C remain, C is a root, every retained ID resolves, the
+status is `partial`, and the input admin-domain snapshot is unchanged.
+
 - [ ] **Step 2: Run projection tests and confirm failure**
 
 Run: `python -m pytest tests/unit/domain/test_projection.py -q`
@@ -696,6 +748,32 @@ class GraphComponent:
     link_ids: tuple[LinkId, ...]
 
 
+PublicIssueCode = Literal[
+    "DUPLICATE_UNRESOLVED_RELATIONSHIP",
+    "SUSPICIOUS_PARENT_AGE",
+    "ARCHIVED_RELATIONSHIP_OMITTED",
+    "GRAPH_WARNING",
+]
+
+PUBLIC_ISSUE_MESSAGES: Mapping[PublicIssueCode, str] = MappingProxyType({
+    "DUPLICATE_UNRESOLVED_RELATIONSHIP": "Some relationships need review.",
+    "SUSPICIOUS_PARENT_AGE": "Some dates may need review.",
+    "ARCHIVED_RELATIONSHIP_OMITTED":
+        "Some relationships are hidden because an archived person is involved.",
+    "GRAPH_WARNING": "Some family-tree details need review.",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class PublicGraphIssue:
+    code: PublicIssueCode
+    severity: IssueSeverity
+    message: str
+    person_ids: tuple[PersonId, ...] = ()
+    family_unit_ids: tuple[FamilyUnitId, ...] = ()
+    link_ids: tuple[LinkId, ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class TreeProjection:
     schema_version: Literal["2"]
@@ -709,7 +787,7 @@ class TreeProjection:
     descendant_edges: tuple[DescendantEdge, ...]
     references: tuple[RelationshipReference, ...]
     components: tuple[GraphComponent, ...]
-    issues: tuple[GraphIssue, ...]
+    issues: tuple[PublicGraphIssue, ...]
     unresolved_count: int
 ```
 
@@ -723,11 +801,12 @@ source record ID, audit data, provider text, or Airtable ID.
 
 Build indexes from ID-sorted tuples and validate before projection. Then apply the
 public archived-topology filter from the graph-contract design: omit archived
-people, incident links, units with archived adults, their canonical edges, and
-references with hidden endpoints; recompute roots/components afterward. Retained
-children from omitted units remain visible roots. Emit the allowlisted warning
-`ARCHIVED_RELATIONSHIP_OMITTED` and status `partial` when incident topology is
-omitted.
+people; raw links with an archived endpoint; raw links whose non-null family unit
+is omitted; units with archived adults; their canonical edges; and references
+with hidden endpoints or omitted family units. Recompute roots/components
+afterward. Retained children from omitted units remain visible roots. Emit the
+allowlisted warning `ARCHIVED_RELATIONSHIP_OMITTED` and status `partial` when
+incident topology is omitted.
 
 For each retained family unit, emit one adult membership per present adult with
 IDs `adult:{family_unit_id}:{person_id}`. Group retained primary raw links by
@@ -749,13 +828,18 @@ collection and every nested ID tuple.
 
 Raise `InvalidGraphProjection(report)` when blocking issues exist. For allowlisted
 warnings, archived-topology omissions, or unresolved annotations, return status
-`partial`. Public issues contain only code, severity, affected public application
-IDs, and fixed allowlisted copy. Copy `semantic_checksum(snapshot)` into the
-projection; do not hash a projection.
+`partial`. Convert internal `GraphIssue` records to strict `PublicGraphIssue`
+records containing exactly `code`, `severity`, `message`, `person_ids`,
+`family_unit_ids`, and `link_ids`. Select `message` from
+`PUBLIC_ISSUE_MESSAGES`, using the four exact code/message pairs in the
+graph-contract design; never forward `GraphIssue.message`. Map an unknown
+warning to allowlisted `GRAPH_WARNING` plus its fixed generic message. Copy
+`semantic_checksum(snapshot)` into the projection; do not hash a projection.
 
-Add archived fixtures/tests proving there are no dangling public IDs, hidden
-incident topology is omitted, an affected retained child remains reachable as a
-root, the status is partial, and the admin-domain snapshot remains unchanged.
+Add archived fixtures/tests proving there are no dangling public IDs, both links
+from the archived two-adult family are omitted even though one link has retained
+person endpoints, an affected retained child remains reachable as a root, the
+status is partial, and the admin-domain snapshot remains unchanged.
 
 - [ ] **Step 5: Run and commit**
 
@@ -781,6 +865,9 @@ git commit -m "feat: project deterministic Shajra ancestry DAG"
 - [ ] **Step 1: Write failing checksum tests**
 
 ```python
+import pytest
+
+
 def test_checksum_ignores_mapping_insertion_order():
     assert semantic_checksum(snapshot_order_a()) == semantic_checksum(snapshot_order_b())
 
@@ -794,8 +881,14 @@ def test_checksum_ignores_state_and_entity_revision_metadata():
 
 
 def test_projection_carries_the_snapshot_checksum():
-    snapshot = two_parent_family_snapshot()[0]
+    snapshot = two_parent_family_snapshot()
     assert project_graph(snapshot).semantic_checksum == semantic_checksum(snapshot)
+
+
+def test_checksum_rejects_a_projection():
+    snapshot = two_parent_family_snapshot()
+    with pytest.raises(TypeError):
+        semantic_checksum(project_graph(snapshot))
 
 
 def test_confirmed_historical_union_changes_checksum():
@@ -818,9 +911,10 @@ Exclude graph revision, operation ID, fencing token, stored checksum, every enti
 timestamps. Include stable IDs and all current family semantics, including
 normalized unresolved annotations and `distinct_union_confirmed`.
 
-`semantic_checksum` must reject non-`GraphSnapshot` inputs. `project_graph`
-computes the snapshot checksum once and copies it into the projection, avoiding a
-second public-projection checksum meaning and any recursive checksum field.
+`semantic_checksum` begins with an explicit `isinstance(snapshot, GraphSnapshot)`
+guard and raises `TypeError` for every other input. `project_graph` computes the
+snapshot checksum once and copies it into the projection, avoiding a second
+public-projection checksum meaning and any recursive checksum field.
 
 - [ ] **Step 3: Run all graph-core gates**
 

@@ -177,10 +177,14 @@ POST, PUT, PATCH, or DELETE request.
 checksum plus explicit `adultMemberships` and `descendantEdges`; raw links never
 stand in for those arrays. Use literal IDs such as `per_anna`, `fam_anna_ben`,
 and `lnk_anna_child`; never random IDs. The archived fixture contains no dangling
-public ID and reports `ARCHIVED_RELATIONSHIP_OMITTED` with allowlisted copy.
+public ID and reports `ARCHIVED_RELATIONSHIP_OMITTED` with its exact allowlisted
+`message`.
 
-`admin.ts` exports revision `7`, one valid mutation preview, one cycle rejection,
-and one `409` stale-revision problem.
+`admin.ts` exports an exact strict `AdminGraphSnapshot` at revision `7`, one valid
+mutation preview, one cycle rejection, and one `409` stale-revision problem. The
+snapshot includes one archived person, one unresolved annotation, entity
+revision fields, a non-null person birth date, and a family unit with
+`distinctUnionConfirmed`.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -211,6 +215,51 @@ and missing graph revision. The core assertion is:
 expect(() => treeProjectionSchema.parse({ ...twoParentTree, schemaVersion: "3" }))
   .toThrow();
 expect(JSON.stringify(treeProjectionSchema.parse(twoParentTree))).not.toContain("Email");
+```
+
+Add positive exact-key assertions for a parsed public issue and every level of
+`adminGraphSnapshot`. Assert public `copy`, `rawMessage`, `internalMessage`, a
+code/message mismatch, and any unknown key throw. Assert admin `Email`,
+`PhoneNumber`, `SourceRecordId`, `headOperationId`, `fencingToken`, and unknown
+nested keys throw rather than being stripped.
+
+```ts
+expect(Object.keys(publicGraphIssueSchema.parse(partialTree.issues[0])).sort())
+  .toEqual(["code", "familyUnitIds", "linkIds", "message", "personIds", "severity"]);
+
+const admin = adminGraphSnapshotSchema.parse(adminGraphSnapshot);
+expect(Object.keys(admin).sort()).toEqual([
+  "familyUnits", "parentChildLinks", "people", "revision", "schemaVersion",
+  "semanticChecksum", "unresolvedRelationships",
+]);
+expect(Object.keys(admin.people[0]).sort()).toEqual([
+  "archived", "birth", "death", "fullName", "gender", "isAlive", "personId",
+  "primaryFamilyUnitId", "versionRevision",
+]);
+expect(Object.keys(admin.people[0].birth!).sort()).toEqual(["precision", "value"]);
+expect(Object.keys(admin.familyUnits[0]).sort()).toEqual([
+  "adultAId", "adultBId", "createdRevision", "distinctUnionConfirmed", "end",
+  "familyUnitId", "kind", "start", "status",
+]);
+expect(Object.keys(admin.parentChildLinks[0]).sort()).toEqual([
+  "childId", "createdRevision", "familyUnitId", "linkId", "parentId", "relationshipType", "role",
+]);
+expect(Object.keys(admin.unresolvedRelationships[0]).sort()).toEqual([
+  "createdRevision", "kind", "subjectPersonId", "unresolvedId", "unresolvedName",
+]);
+
+expect(() => publicGraphIssueSchema.parse({ ...partialTree.issues[0], copy: "raw" }))
+  .toThrow();
+expect(() => publicGraphIssueSchema.parse({ ...partialTree.issues[0], message: "raw" }))
+  .toThrow();
+expect(() => adminGraphSnapshotSchema.parse({
+  ...adminGraphSnapshot,
+  headOperationId: "op_private",
+})).toThrow();
+expect(() => adminGraphSnapshotSchema.parse({
+  ...adminGraphSnapshot,
+  people: [{ ...adminGraphSnapshot.people[0], Email: "private@example.com" }],
+})).toThrow();
 ```
 
 - [ ] **Step 2: Define branded IDs and DTO schemas**
@@ -256,6 +305,109 @@ Their Zod schemas are strict, require semantic edge IDs matching the correspondi
 `adult:{familyUnitId}:{adultId}` or `child:{familyUnitId}:{childId}` values after
 parse, and reject dangling IDs during tree-level refinement.
 
+Define the public issue contract with the exact fixed messages from the graph
+design:
+
+```ts
+export const publicIssueCodeSchema = z.enum([
+  "DUPLICATE_UNRESOLVED_RELATIONSHIP",
+  "SUSPICIOUS_PARENT_AGE",
+  "ARCHIVED_RELATIONSHIP_OMITTED",
+  "GRAPH_WARNING",
+]);
+
+export const PUBLIC_ISSUE_MESSAGES: Record<
+  z.infer<typeof publicIssueCodeSchema>,
+  string
+> = {
+  DUPLICATE_UNRESOLVED_RELATIONSHIP: "Some relationships need review.",
+  SUSPICIOUS_PARENT_AGE: "Some dates may need review.",
+  ARCHIVED_RELATIONSHIP_OMITTED:
+    "Some relationships are hidden because an archived person is involved.",
+  GRAPH_WARNING: "Some family-tree details need review.",
+};
+
+export const publicGraphIssueSchema = z
+  .object({
+    code: publicIssueCodeSchema,
+    severity: z.enum(["error", "warning"]),
+    message: z.string(),
+    personIds: z.array(personIdSchema),
+    familyUnitIds: z.array(familyUnitIdSchema),
+    linkIds: z.array(linkIdSchema),
+  })
+  .strict()
+  .superRefine((issue, context) => {
+    if (issue.message !== PUBLIC_ISSUE_MESSAGES[issue.code]) {
+      context.addIssue({ code: "custom", message: "Public issue message mismatch" });
+    }
+  });
+```
+
+Define the admin snapshot before any client signature uses it. These are the
+complete key sets; every `z.object` ends in `.strict()`:
+
+```ts
+export const adminPartialDateSchema = z.object({
+  value: z.string(),
+  precision: z.enum(["year", "month", "day"]),
+}).strict();
+
+export const adminPersonSchema = z.object({
+  personId: personIdSchema,
+  fullName: z.string(),
+  gender: genderSchema,
+  birth: adminPartialDateSchema.nullable(),
+  death: adminPartialDateSchema.nullable(),
+  isAlive: z.boolean().nullable(),
+  primaryFamilyUnitId: familyUnitIdSchema.nullable(),
+  archived: z.boolean(),
+  versionRevision: z.number().int().nonnegative(),
+}).strict();
+
+export const adminFamilyUnitSchema = z.object({
+  familyUnitId: familyUnitIdSchema,
+  kind: familyUnitKindSchema,
+  adultAId: personIdSchema,
+  adultBId: personIdSchema.nullable(),
+  status: unionStatusSchema,
+  start: adminPartialDateSchema.nullable(),
+  end: adminPartialDateSchema.nullable(),
+  distinctUnionConfirmed: z.boolean(),
+  createdRevision: z.number().int().nonnegative(),
+}).strict();
+
+export const adminParentChildLinkSchema = z.object({
+  linkId: linkIdSchema,
+  parentId: personIdSchema,
+  childId: personIdSchema,
+  role: parentRoleSchema,
+  relationshipType: relationshipTypeSchema,
+  familyUnitId: familyUnitIdSchema.nullable(),
+  createdRevision: z.number().int().nonnegative(),
+}).strict();
+
+export const adminUnresolvedRelationshipSchema = z.object({
+  unresolvedId: unresolvedRelationshipIdSchema,
+  subjectPersonId: personIdSchema,
+  kind: z.enum(["father", "mother", "parent", "partner"]),
+  unresolvedName: z.string().trim().min(1),
+  createdRevision: z.number().int().nonnegative(),
+}).strict();
+
+export const adminGraphSnapshotSchema = z.object({
+  schemaVersion: z.literal("2"),
+  revision: z.number().int().nonnegative(),
+  semanticChecksum: z.string().regex(/^[a-f0-9]{64}$/),
+  people: z.array(adminPersonSchema),
+  familyUnits: z.array(adminFamilyUnitSchema),
+  parentChildLinks: z.array(adminParentChildLinkSchema),
+  unresolvedRelationships: z.array(adminUnresolvedRelationshipSchema),
+}).strict();
+
+export type AdminGraphSnapshot = z.infer<typeof adminGraphSnapshotSchema>;
+```
+
 `MutationDraft` is `{ schemaVersion: "1"; snapshotRevision: number;
 idempotencyKey: string; commands: GraphCommandDto[]; sourceReviewId?: ReviewId }`. Define
 `GraphCommandDto` as a strict discriminated union for add/update person, create/
@@ -273,7 +425,8 @@ public issues, tree projection, mutation draft, preview, result, and RFC 9457
 problem details. `adultMemberships` and `descendantEdges` are required arrays and
 the only rendering topology. Raw `parentChildLinks` remain relationship detail.
 `semanticChecksum` is required as 64 lowercase hexadecimal characters. Public
-issue schemas reject raw/internal messages and unknown fields.
+issue schemas accept only the exact `message` for the allowlisted `code` and
+reject `copy`, raw/internal-message fields, and all unknown fields.
 
 Add submission review summary/detail, enrichment attempt,
 candidate, suggestion, decision, and completed-review schemas matching backend
@@ -309,7 +462,9 @@ export function fetchAdminSnapshot(): Promise<AdminGraphSnapshot>;
 export function compensateOperation(operationId: string, revision: number): Promise<MutationResult>;
 ```
 
-Commit sends the preview's idempotency key and revision through the proxy.
+`fetchAdminSnapshot` requests `unknown` and returns only
+`adminGraphSnapshotSchema.parse(body)`. Commit sends the preview's idempotency
+key and revision through the proxy.
 
 - [ ] **Step 5: Convert `src/lib/api.ts` into an explicit compatibility barrel**
 

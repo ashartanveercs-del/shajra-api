@@ -34,6 +34,7 @@ Create:
 - `backend/repositories/protocols.py`: graph, audit, submissions, and identity protocols.
 - `backend/repositories/memory.py`: deterministic in-memory implementation.
 - `backend/repositories/airtable/client.py`: table construction and batched retries.
+- `backend/repositories/airtable/schema.py`: canonical normalized table/field manifest.
 - `backend/repositories/airtable/formulas.py`: safe formula builders.
 - `backend/repositories/airtable/mappers.py`: row/domain mapping.
 - `backend/repositories/airtable/legacy.py`: read-only v1 snapshot adapter.
@@ -74,6 +75,7 @@ New Airtable tables for staging and migration:
 - `PersonVersions`
 - `FamilyUnits`
 - `ParentChildLinks`
+- `UnresolvedRelationships`
 - `ChangeLog`
 - `GraphCommits`
 - `GraphState`
@@ -81,6 +83,12 @@ New Airtable tables for staging and migration:
 - `SubmissionReviews`
 
 Add `PersonId` and `ArchivedAt` to `ApprovedMembers`.
+
+This list is the canonical normalized-schema provisioning inventory and is
+implemented once in `repositories/airtable/schema.py`. Runtime API requests never
+auto-create tables. Operator provisioning and every target preflight use that
+same manifest and fail before any row write when a table or required field is
+missing.
 
 ## Interfaces
 
@@ -190,9 +198,11 @@ git commit -m "feat: add append-only Shajra repository contracts"
 **Files:**
 - Create: `backend/repositories/airtable/__init__.py`
 - Create: `backend/repositories/airtable/client.py`
+- Create: `backend/repositories/airtable/schema.py`
 - Create: `backend/repositories/airtable/formulas.py`
 - Create: `backend/repositories/airtable/mappers.py`
 - Create: `backend/repositories/airtable/legacy.py`
+- Create: `backend/tests/unit/repositories/test_airtable_schema.py`
 - Create: `backend/tests/unit/repositories/test_airtable_formulas.py`
 - Create: `backend/tests/unit/repositories/test_airtable_mappers.py`
 - Modify: `backend/airtable_client.py`
@@ -200,10 +210,13 @@ git commit -m "feat: add append-only Shajra repository contracts"
 **Interfaces:**
 - Produces: safe formula functions and `LegacySnapshotRepository`.
 
-- [ ] **Step 1: Write formula-injection tests**
+- [ ] **Step 1: Write schema-manifest and formula-injection tests**
 
-Create tests using names with quotes, backslashes, parentheses, and Airtable
-function text:
+First assert the canonical schema manifest has exactly these table names and that
+`UnresolvedRelationships` requires `UnresolvedId`, `SubjectPersonId`, `Kind`,
+`UnresolvedName`, `Revision`, `OperationId`, `FencingToken`, and `IsRemoved`.
+Then create formula tests using names with quotes, backslashes, parentheses, and
+Airtable function text:
 
 ```python
 def test_exact_match_escapes_user_text():
@@ -216,7 +229,66 @@ def test_field_name_is_allowlisted():
         exact_match("FullName})", "Ashar")
 ```
 
-- [ ] **Step 2: Implement formula builders with pyairtable helpers**
+- [ ] **Step 2: Implement the schema manifest and safe formula builders**
+
+Define immutable `NORMALIZED_SCHEMA` in `schema.py`; its keys are exactly
+`PersonVersions`, `FamilyUnits`, `ParentChildLinks`,
+`UnresolvedRelationships`, `ChangeLog`, `GraphCommits`, `GraphState`,
+`EnrichmentAttempts`, and `SubmissionReviews`, and each value is the complete
+required field-name frozenset. Repository table construction and operator
+preflight both import this object:
+
+```python
+from types import MappingProxyType
+
+
+NORMALIZED_SCHEMA = MappingProxyType({
+    "PersonVersions": frozenset({
+        "PersonId", "FullName", "Gender", "Birth", "Death", "IsAlive",
+        "PrimaryFamilyUnitId", "Archived", "VersionRevision", "Revision",
+        "OperationId", "FencingToken",
+    }),
+    "FamilyUnits": frozenset({
+        "FamilyUnitId", "Kind", "AdultAId", "AdultBId", "Status", "Start",
+        "End", "DistinctUnionConfirmed", "CreatedRevision", "Revision",
+        "OperationId", "FencingToken",
+    }),
+    "ParentChildLinks": frozenset({
+        "LinkId", "ParentId", "ChildId", "Role", "RelationshipType",
+        "FamilyUnitId", "CreatedRevision", "Revision", "OperationId",
+        "FencingToken",
+    }),
+    "UnresolvedRelationships": frozenset({
+        "UnresolvedId", "SubjectPersonId", "Kind", "UnresolvedName",
+        "CreatedRevision", "Revision", "OperationId", "FencingToken",
+        "IsRemoved",
+    }),
+    "ChangeLog": frozenset({
+        "OperationId", "IdempotencyKey", "State", "ActorId", "RequestId",
+        "SourceReference", "ExpectedRevision", "ResultRevision",
+        "FencingToken", "CommandsJson", "InverseCommandsJson", "CreatedAt",
+        "UpdatedAt",
+    }),
+    "GraphCommits": frozenset({
+        "Revision", "OperationId", "FencingToken", "SemanticChecksum",
+        "CommittedAt",
+    }),
+    "GraphState": frozenset({
+        "Revision", "HeadOperationId", "FencingToken", "SemanticChecksum",
+        "UpdatedAt",
+    }),
+    "EnrichmentAttempts": frozenset({
+        "AttemptId", "Sequence", "Status", "SubmissionId", "InputSha256",
+        "RequestSha256", "PromptVersion", "Model", "CandidateIdsJson",
+        "SuggestionJson", "SuggestionSha256", "ErrorCode", "CreatedAt",
+    }),
+    "SubmissionReviews": frozenset({
+        "ReviewId", "DecisionId", "AttemptId", "SuggestionKey", "Decision",
+        "ReplacementPersonId", "ReplacementValue", "ActorId", "Status",
+        "CreatedAt",
+    }),
+})
+```
 
 Use `pyairtable.formulas.match` and a fixed field allowlist:
 
@@ -240,7 +312,12 @@ Assert one-element Airtable linked lists map to application IDs through an
 explicit ID map, empty lists map to `None`, multiple values fail where cardinality
 is one, and public mappers never include `Email`, `PhoneNumber`, source IDs, or
 record IDs. Map legacy unresolved father/mother/spouse names to stable `unr_`
-annotations. Add a test proving two repository rows with different
+annotations. For one `ApprovedMembers` row containing father, mother, and two
+spouse-list values, pass the exact slots `FatherName#0`, `MotherName#0`,
+`SpouseNames#0`, and `SpouseNames#1` to
+`migrated_unresolved_relationship_id`; assert four unique IDs and identical IDs
+and annotations on an idempotent rerun. Legacy list ordinals are zero-based and
+preserve source order. Add a test proving two repository rows with different
 `SourceRecordId`/`MigrationRunId` values produce identical domain snapshots and
 semantic checksums when their family semantics match.
 
@@ -261,7 +338,7 @@ formula interpolation.
 - [ ] **Step 6: Run and commit**
 
 ```powershell
-python -m pytest tests/unit/repositories/test_airtable_formulas.py tests/unit/repositories/test_airtable_mappers.py -q
+python -m pytest tests/unit/repositories/test_airtable_schema.py tests/unit/repositories/test_airtable_formulas.py tests/unit/repositories/test_airtable_mappers.py -q
 ruff check repositories/airtable airtable_client.py tests/unit/repositories
 mypy repositories/airtable
 git add backend/repositories/airtable backend/airtable_client.py backend/tests/unit/repositories
@@ -571,19 +648,180 @@ field allowlists. Assert no serialized key contains `Email`, `PhoneNumber`,
 `rec`. For `/api/v2/tree`, assert the response contains authoritative
 `adultMemberships` and `descendantEdges`, preserves raw `parentChildLinks` as
 detail, emits two memberships plus one descendant edge for a two-parent child,
-and exposes only allowlisted issue code/severity/copy and affected public IDs.
-Assert archived people leave no dangling public topology while the admin snapshot
-retains the archived records and current unresolved names.
+and exposes public issues with exactly `code`, `severity`, `message`,
+`personIds`, `familyUnitIds`, and `linkIds`. Assert each code/message pair matches
+`PUBLIC_ISSUE_MESSAGES`, `copy` and raw/internal-message fields are absent, and
+unknown fields are rejected. Assert archived people leave no dangling public
+topology: when adult A is archived, family F and both A-to-child and
+retained-adult-B-to-child raw links are absent because both name F. The admin
+snapshot fixture retains the archived records and current unresolved names and
+contains a non-null person birth date for the nested date key-set assertion.
+
+For `/api/admin/v2/graph/snapshot`, assert the top-level key set is exactly
+`schemaVersion`, `revision`, `semanticChecksum`, `people`, `familyUnits`,
+`parentChildLinks`, and `unresolvedRelationships`. Add exact key-set assertions
+for every nested DTO below, including `versionRevision`, `createdRevision`, and
+`distinctUnionConfirmed`. Validate that adding `Email`, `PhoneNumber`,
+`SourceRecordId`, `headOperationId`, `fencingToken`, or any unknown field at any
+level fails schema validation.
+
+```python
+assert set(public_body["issues"][0]) == {
+    "code", "severity", "message", "personIds", "familyUnitIds", "linkIds"
+}
+assert set(admin_body) == {
+    "schemaVersion", "revision", "semanticChecksum", "people", "familyUnits",
+    "parentChildLinks", "unresolvedRelationships",
+}
+assert set(admin_body["people"][0]) == {
+    "personId", "fullName", "gender", "birth", "death", "isAlive",
+    "primaryFamilyUnitId", "archived", "versionRevision",
+}
+assert set(admin_body["people"][0]["birth"]) == {"value", "precision"}
+assert set(admin_body["familyUnits"][0]) == {
+    "familyUnitId", "kind", "adultAId", "adultBId", "status", "start", "end",
+    "distinctUnionConfirmed", "createdRevision",
+}
+assert set(admin_body["parentChildLinks"][0]) == {
+    "linkId", "parentId", "childId", "role", "relationshipType",
+    "familyUnitId", "createdRevision",
+}
+assert set(admin_body["unresolvedRelationships"][0]) == {
+    "unresolvedId", "subjectPersonId", "kind", "unresolvedName", "createdRevision",
+}
+with pytest.raises(ValidationError):
+    PublicGraphIssueResponse.model_validate({**public_body["issues"][0], "copy": "raw"})
+with pytest.raises(ValidationError):
+    PublicGraphIssueResponse.model_validate({**public_body["issues"][0], "message": "raw"})
+with pytest.raises(ValidationError):
+    AdminGraphSnapshotResponse.model_validate({**admin_body, "fencingToken": 9})
+with pytest.raises(ValidationError):
+    AdminGraphSnapshotResponse.model_validate({
+        **admin_body,
+        "people": [{**admin_body["people"][0], "Email": "private@example.com"}],
+    })
+```
 
 - [ ] **Step 4: Implement API schemas and routers**
 
 Map every graph-contract projection type, including canonical edge collections
 and the copied snapshot checksum, to strict camel-case Pydantic response models.
-Raw links are detail and are not a second rendering topology. Public issue copy
-comes from a fixed code allowlist; unknown/internal messages map to generic copy.
-The admin snapshot uses an explicit domain-field allowlist and includes current
-unresolved annotations and `distinctUnionConfirmed`, but no repository provenance
-or contact fields. Keep current v1 read routes as adapters until frontend cutover.
+Raw links are detail and are not a second rendering topology. Public issue text
+uses the field name `message` and comes from `PUBLIC_ISSUE_MESSAGES`; never copy
+`GraphIssue.message`. Map a non-allowlisted warning to allowlisted code
+`GRAPH_WARNING` and its fixed generic message. Define all response models with
+`ConfigDict(extra="forbid", alias_generator=to_camel, populate_by_name=True)`
+and these exact Python fields (serialized names are their camel-case aliases):
+
+```python
+from types import MappingProxyType
+from typing import Final, Literal, Mapping, Self
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+
+def to_camel(value: str) -> str:
+    first, *rest = value.split("_")
+    return first + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
+class StrictResponseModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", alias_generator=to_camel, populate_by_name=True
+    )
+
+
+PublicIssueCode = Literal[
+    "DUPLICATE_UNRESOLVED_RELATIONSHIP",
+    "SUSPICIOUS_PARENT_AGE",
+    "ARCHIVED_RELATIONSHIP_OMITTED",
+    "GRAPH_WARNING",
+]
+
+PUBLIC_ISSUE_MESSAGES: Final[Mapping[PublicIssueCode, str]] = MappingProxyType({
+    "DUPLICATE_UNRESOLVED_RELATIONSHIP": "Some relationships need review.",
+    "SUSPICIOUS_PARENT_AGE": "Some dates may need review.",
+    "ARCHIVED_RELATIONSHIP_OMITTED":
+        "Some relationships are hidden because an archived person is involved.",
+    "GRAPH_WARNING": "Some family-tree details need review.",
+})
+
+
+class PublicGraphIssueResponse(StrictResponseModel):
+    code: PublicIssueCode
+    severity: Literal["error", "warning"]
+    message: str
+    person_ids: tuple[PersonId, ...]
+    family_unit_ids: tuple[FamilyUnitId, ...]
+    link_ids: tuple[LinkId, ...]
+
+    @model_validator(mode="after")
+    def message_matches_code(self) -> Self:
+        if self.message != PUBLIC_ISSUE_MESSAGES[self.code]:
+            raise ValueError("Public issue message mismatch")
+        return self
+
+
+class AdminPartialDateResponse(StrictResponseModel):
+    value: str
+    precision: Literal["year", "month", "day"]
+
+
+class AdminPersonResponse(StrictResponseModel):
+    person_id: PersonId
+    full_name: str
+    gender: Gender
+    birth: AdminPartialDateResponse | None
+    death: AdminPartialDateResponse | None
+    is_alive: bool | None
+    primary_family_unit_id: FamilyUnitId | None
+    archived: bool
+    version_revision: int
+
+
+class AdminFamilyUnitResponse(StrictResponseModel):
+    family_unit_id: FamilyUnitId
+    kind: FamilyUnitKind
+    adult_a_id: PersonId
+    adult_b_id: PersonId | None
+    status: UnionStatus
+    start: AdminPartialDateResponse | None
+    end: AdminPartialDateResponse | None
+    distinct_union_confirmed: bool
+    created_revision: int
+
+
+class AdminParentChildLinkResponse(StrictResponseModel):
+    link_id: LinkId
+    parent_id: PersonId
+    child_id: PersonId
+    role: ParentRole
+    relationship_type: RelationshipType
+    family_unit_id: FamilyUnitId | None
+    created_revision: int
+
+
+class AdminUnresolvedRelationshipResponse(StrictResponseModel):
+    unresolved_id: UnresolvedRelationshipId
+    subject_person_id: PersonId
+    kind: UnresolvedRelationshipKind
+    unresolved_name: str
+    created_revision: int
+
+
+class AdminGraphSnapshotResponse(StrictResponseModel):
+    schema_version: Literal["2"]
+    revision: int
+    semantic_checksum: str
+    people: tuple[AdminPersonResponse, ...]
+    family_units: tuple[AdminFamilyUnitResponse, ...]
+    parent_child_links: tuple[AdminParentChildLinkResponse, ...]
+    unresolved_relationships: tuple[AdminUnresolvedRelationshipResponse, ...]
+```
+
+The admin mapper sorts every collection by stable ID and exposes none of
+`head_operation_id`, `fencing_token`, repository provenance, contact data, or
+provider metadata. Keep current v1 read routes as adapters until frontend cutover.
 Add admin routes:
 
 ```text
@@ -1005,6 +1243,7 @@ Use `argparse` and require explicit environments. Exact operator surface:
 
 ```powershell
 python -m ops.cli preflight --source production --read-only
+python -m ops.cli preflight --target staging --read-only
 python -m ops.cli backup --source production --output D:\shajra-backups\snapshot.sbk
 python -m ops.cli audit --backup D:\shajra-backups\snapshot.sbk --output migration-artifacts\audit.json
 python -m ops.cli plan --backup D:\shajra-backups\snapshot.sbk --output migration-artifacts\plan.json
@@ -1015,6 +1254,14 @@ $plan = "migration-artifacts\plan.json"
 $planSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $plan).Hash.ToLowerInvariant()
 python -m ops.cli migrate --target production --plan $plan --apply --confirm-sha $planSha
 ```
+
+Source preflight verifies only the declared legacy read schema. Target preflight
+imports `NORMALIZED_SCHEMA` and verifies every normalized table and required
+field, including `UnresolvedRelationships`, without creating or updating cloud
+state. Add CLI tests where that table alone is absent and assert preflight fails
+before repository construction or any write. The reviewed provisioning checklist
+is generated directly from the same manifest, so table creation and verification
+cannot use divergent inventories.
 
 Production `migrate` refuses to run without `--apply`, the exact SHA-256 of the
 reviewed plan file, a verified restore-drill receipt, and all blocking ambiguities
@@ -1028,8 +1275,12 @@ the CLI rejects empty values and IDs outside the `op_` namespace.
 Generate deterministic UUID5 `PersonId` values from ApprovedMembers record IDs.
 Create family units only from exact ID pairs or reviewed reciprocal links. Create
 parent-child links only from existing exact IDs. Put every name-only relation in
-the ambiguity report. Produce expected row counts and semantic checksum before
-any apply. Batch Airtable writes and retry `429` with bounded backoff.
+the ambiguity report. Generate each unresolved annotation ID with its exact
+source-field/ordinal slot (`FatherName#0`, `MotherName#0`, or
+`SpouseNames#{zero_based_index}`), and assert one multi-relation row yields
+distinct IDs that are unchanged on rerun. Produce expected row counts and
+semantic checksum before any apply. Batch Airtable writes and retry `429` with
+bounded backoff.
 
 - [ ] **Step 7: Implement verification and recovery**
 

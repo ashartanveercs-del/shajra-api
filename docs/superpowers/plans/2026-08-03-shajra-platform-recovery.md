@@ -6,7 +6,13 @@
 
 **Architecture:** Keep the current v1 routes temporarily, but place configuration, write gates, HTTP errors, and test tooling around them. Production configuration fails closed, every unsafe write is disabled by default, and the frontend has one typed HTTP boundary with explicit loading and failure states.
 
-**Tech Stack:** Python 3.12, FastAPI, Pydantic Settings 2.14.2, pytest 9.1.1, Next.js 16.2.12, React 19.2.8, TypeScript, Vitest 4.1.10, Testing Library.
+**Tech Stack:** Python 3.12, FastAPI, Pydantic Settings 2.14.2, pytest 9.1.1, Next.js 16.3.0, React 19.2.8, TypeScript, Vitest 4.1.10, Testing Library.
+
+**Dependency baseline correction (2026-08-04):** The completed Task 6 security
+gate upgraded `next` and `eslint-config-next` together to 16.3.0, regenerated the
+lockfile, and verified `npm audit` at zero known vulnerabilities. Package files
+and all consuming plans therefore use 16.3.0; the prior patch-level baseline is
+superseded.
 
 ## Global Constraints
 
@@ -168,8 +174,8 @@ Run:
 
 ```powershell
 cd D:\andrew\shajra-api\frontend
-npm install --save-exact next@16.2.12 react@19.2.8 react-dom@19.2.8
-npm install --save-dev --save-exact eslint-config-next@16.2.12 vitest@4.1.10 jsdom@30.0.1 @testing-library/react@16.3.2 @testing-library/jest-dom@7.0.0 @testing-library/user-event@14.6.1
+npm install --save-exact next@16.3.0 react@19.2.8 react-dom@19.2.8
+npm install --save-dev --save-exact eslint-config-next@16.3.0 vitest@4.1.10 jsdom@30.0.1 @testing-library/react@16.3.2 @testing-library/jest-dom@7.0.0 @testing-library/user-event@14.6.1
 ```
 
 Add scripts to `frontend/package.json`:
