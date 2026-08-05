@@ -170,6 +170,61 @@ def test_checksum_changes_when_distinct_historical_union_is_confirmed():
     assert semantic_checksum(confirmed) != semantic_checksum(unconfirmed)
 
 
+def test_checksum_is_independent_of_two_adult_family_slot_order():
+    snapshot = _snapshot()
+    family_id, family = next(iter(snapshot.family_units.items()))
+    swapped_adults = GraphSnapshot(
+        snapshot.state,
+        snapshot.people,
+        {
+            family_id: replace(
+                family,
+                adult_a_id=family.adult_b_id,
+                adult_b_id=family.adult_a_id,
+            )
+        },
+        snapshot.links,
+        snapshot.unresolved,
+    )
+
+    assert semantic_checksum(swapped_adults) == semantic_checksum(snapshot)
+
+
+@pytest.mark.parametrize(
+    "collection", ["people", "family_units", "links", "unresolved"]
+)
+def test_checksum_rejects_mapping_key_mismatched_with_embedded_stable_id(collection):
+    snapshot = _snapshot()
+    people = dict(snapshot.people)
+    family_units = dict(snapshot.family_units)
+    links = dict(snapshot.links)
+    unresolved = dict(snapshot.unresolved)
+
+    if collection == "people":
+        _, person = people.popitem()
+        people[PersonId("per_mismatched_key")] = person
+    elif collection == "family_units":
+        _, family = family_units.popitem()
+        family_units[FamilyUnitId("fam_mismatched_key")] = family
+    elif collection == "links":
+        _, link = links.popitem()
+        links[LinkId("lnk_mismatched_key")] = link
+    else:
+        _, annotation = unresolved.popitem()
+        unresolved[UnresolvedRelationshipId("unr_mismatched_key")] = annotation
+
+    malformed = GraphSnapshot(
+        snapshot.state,
+        people,
+        family_units,
+        links,
+        unresolved,
+    )
+
+    with pytest.raises(ValueError, match=f"{collection} map key does not match"):
+        semantic_checksum(malformed)
+
+
 def test_checksum_rejects_non_snapshot_input():
     with pytest.raises(TypeError):
         semantic_checksum(object())

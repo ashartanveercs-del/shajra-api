@@ -44,8 +44,10 @@ def _partial_date_value(value: PartialDate | None) -> dict[str, str] | None:
 
 
 def _people_value(people: Mapping[PersonId, Person]) -> dict[str, object]:
-    return {
-        str(person_id): {
+    value: dict[str, object] = {}
+    for person_id, person in sorted(people.items(), key=lambda item: str(item[0])):
+        _require_matching_key("people", person_id, person.person_id)
+        value[str(person_id)] = {
             "person_id": str(person.person_id),
             "full_name": person.full_name,
             "gender": person.gender.value,
@@ -59,37 +61,36 @@ def _people_value(people: Mapping[PersonId, Person]) -> dict[str, object]:
             ),
             "archived": person.archived,
         }
-        for person_id, person in sorted(people.items(), key=lambda item: str(item[0]))
-    }
+    return value
 
 
 def _family_units_value(
     family_units: Mapping[FamilyUnitId, FamilyUnit],
 ) -> dict[str, object]:
-    return {
-        str(family_unit_id): {
+    value: dict[str, object] = {}
+    for family_unit_id, family_unit in sorted(
+        family_units.items(), key=lambda item: str(item[0])
+    ):
+        _require_matching_key(
+            "family_units", family_unit_id, family_unit.family_unit_id
+        )
+        value[str(family_unit_id)] = {
             "family_unit_id": str(family_unit.family_unit_id),
             "kind": family_unit.kind.value,
-            "adult_a_id": str(family_unit.adult_a_id),
-            "adult_b_id": (
-                str(family_unit.adult_b_id)
-                if family_unit.adult_b_id is not None
-                else None
-            ),
+            "adult_ids": _family_adult_ids(family_unit),
             "status": family_unit.status.value,
             "start": _partial_date_value(family_unit.start),
             "end": _partial_date_value(family_unit.end),
             "distinct_union_confirmed": family_unit.distinct_union_confirmed,
         }
-        for family_unit_id, family_unit in sorted(
-            family_units.items(), key=lambda item: str(item[0])
-        )
-    }
+    return value
 
 
 def _links_value(links: Mapping[LinkId, ParentChildLink]) -> dict[str, object]:
-    return {
-        str(link_id): {
+    value: dict[str, object] = {}
+    for link_id, link in sorted(links.items(), key=lambda item: str(item[0])):
+        _require_matching_key("links", link_id, link.link_id)
+        value[str(link_id)] = {
             "link_id": str(link.link_id),
             "parent_id": str(link.parent_id),
             "child_id": str(link.child_id),
@@ -99,21 +100,33 @@ def _links_value(links: Mapping[LinkId, ParentChildLink]) -> dict[str, object]:
                 str(link.family_unit_id) if link.family_unit_id is not None else None
             ),
         }
-        for link_id, link in sorted(links.items(), key=lambda item: str(item[0]))
-    }
+    return value
 
 
 def _unresolved_value(
     unresolved: Mapping[UnresolvedRelationshipId, UnresolvedRelationship],
 ) -> dict[str, object]:
-    return {
-        str(unresolved_id): {
+    value: dict[str, object] = {}
+    for unresolved_id, annotation in sorted(
+        unresolved.items(), key=lambda item: str(item[0])
+    ):
+        _require_matching_key("unresolved", unresolved_id, annotation.unresolved_id)
+        value[str(unresolved_id)] = {
             "unresolved_id": str(annotation.unresolved_id),
             "subject_person_id": str(annotation.subject_person_id),
             "kind": annotation.kind.value,
             "unresolved_name": annotation.unresolved_name,
         }
-        for unresolved_id, annotation in sorted(
-            unresolved.items(), key=lambda item: str(item[0])
-        )
-    }
+    return value
+
+
+def _family_adult_ids(family_unit: FamilyUnit) -> list[str]:
+    adult_ids = [str(family_unit.adult_a_id)]
+    if family_unit.adult_b_id is not None:
+        adult_ids.append(str(family_unit.adult_b_id))
+    return sorted(adult_ids)
+
+
+def _require_matching_key(collection: str, key: str, entity_id: str) -> None:
+    if key != entity_id:
+        raise ValueError(f"{collection} map key does not match embedded stable ID")
