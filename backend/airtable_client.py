@@ -1,192 +1,241 @@
+"""Legacy v1 Airtable compatibility facade.
+
+New repository code lives under :mod:`repositories.airtable`; this module keeps
+the existing route imports working until the v1 API is retired.
 """
-Shajra System — Airtable Data Access Layer v2
-CRUD operations for all tables.
-"""
-from pyairtable import Api
-from config import AIRTABLE_PAT, AIRTABLE_BASE_ID, APPROVED_MEMBERS_TABLE, PENDING_SUBMISSIONS_TABLE, APPROVED_EMAILS_TABLE
 
-api = Api(AIRTABLE_PAT)
+import os
+from typing import Any
 
-members_table = api.table(AIRTABLE_BASE_ID, APPROVED_MEMBERS_TABLE)
-pending_table = api.table(AIRTABLE_BASE_ID, PENDING_SUBMISSIONS_TABLE)
-comments_table = api.table(AIRTABLE_BASE_ID, "Comments")
-stories_table = api.table(AIRTABLE_BASE_ID, "Stories")
-albums_table = api.table(AIRTABLE_BASE_ID, "PhotoAlbums")
-approved_emails_table = api.table(AIRTABLE_BASE_ID, APPROVED_EMAILS_TABLE)
+from pyairtable.formulas import BLANK, EQ, OR, Field
 
+from config import (
+    AIRTABLE_BASE_ID,
+    AIRTABLE_PAT,
+    APPROVED_EMAILS_TABLE,
+    APPROVED_MEMBERS_TABLE,
+    PENDING_SUBMISSIONS_TABLE,
+)
+from repositories.airtable.client import AirtableClient
+from repositories.airtable.formulas import (
+    case_insensitive_exact,
+    case_insensitive_substring,
+    exact_match,
+)
 
-def _flatten(r):
-    fields = r.get("fields", {})
-    # For linked records, Airtable returns a list of IDs.
-    # We flatten these into strings for our internal search/lookup logic.
-    linked_fields = ["FatherRecordId", "MotherRecordId", "SpouseRecordId"]
-    for f in linked_fields:
-        val = fields.get(f)
-        if isinstance(val, list) and len(val) > 0:
-            fields[f] = val[0]
-        elif isinstance(val, list):
-            fields[f] = ""
-
-    # Ensure critical fields have safe defaults
-    res = {"id": r["id"], **fields}
-    if "FullName" not in res: res["FullName"] = "Unknown"
-    if "Gender" not in res: res["Gender"] = "Male"
-    if "IsAlive" not in res: res["IsAlive"] = True
-    
-    return res
+_client = AirtableClient(AIRTABLE_PAT, AIRTABLE_BASE_ID)
 
 
-# ── Approved Members ──────────────────────────────────────────
+class _LazyTable:
+    def __init__(self, name: str) -> None:
+        self._name = name
 
-def get_all_members():
-    records = members_table.all()
-    return [_flatten(r) for r in records]
+    def __getattr__(self, attribute: str) -> Any:
+        return getattr(_client.table(self._name), attribute)
 
 
-def get_member_by_id(record_id: str):
+members_table = _LazyTable(APPROVED_MEMBERS_TABLE)
+pending_table = _LazyTable(PENDING_SUBMISSIONS_TABLE)
+comments_table = _LazyTable("Comments")
+stories_table = _LazyTable("Stories")
+albums_table = _LazyTable("PhotoAlbums")
+approved_emails_table = _LazyTable(APPROVED_EMAILS_TABLE)
+
+
+def _flatten(record: dict[str, object]) -> dict[str, object]:
+    fields = dict(record.get("fields", {}))
+    for field in ("FatherRecordId", "MotherRecordId", "SpouseRecordId"):
+        value = fields.get(field)
+        if isinstance(value, list):
+            fields[field] = value[0] if value else ""
+    result = {"id": record["id"], **fields}
+    result.setdefault("FullName", "Unknown")
+    result.setdefault("Gender", "Male")
+    result.setdefault("IsAlive", True)
+    return result
+
+
+def _read_all(table: _LazyTable, formula: str | None = None) -> list[dict[str, object]]:
+    records = table.all() if formula is None else table.all(formula=formula)
+    return [_flatten(record) for record in records]
+
+
+def _legacy_mutations_enabled() -> bool:
+    return os.getenv("SHAJRA_LEGACY_MUTATIONS_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _require_legacy_mutations_enabled() -> None:
+    if not _legacy_mutations_enabled():
+        raise RuntimeError("Legacy Airtable mutations are disabled")
+
+
+def _create_legacy(table: _LazyTable, fields: dict[str, object]) -> dict[str, object]:
+    _require_legacy_mutations_enabled()
+    return _flatten(table.create(fields))
+
+
+def _update_legacy(
+    table: _LazyTable, record_id: str, fields: dict[str, object]
+) -> dict[str, object]:
+    _require_legacy_mutations_enabled()
+    return _flatten(table.update(record_id, fields))
+
+
+def _delete_legacy(table: _LazyTable, record_id: str) -> bool:
+    _require_legacy_mutations_enabled()
+    table.delete(record_id)
+    return True
+
+
+# Approved Members
+def get_all_members() -> list[dict[str, object]]:
+    return _read_all(members_table)
+
+
+def get_member_by_id(record_id: str) -> dict[str, object] | None:
     try:
         return _flatten(members_table.get(record_id))
     except Exception:
         return None
 
 
-def create_member(fields: dict):
-    return _flatten(members_table.create(fields))
+def create_member(fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _create_legacy(members_table, fields)
 
 
-def update_member(record_id: str, fields: dict):
-    return _flatten(members_table.update(record_id, fields))
+def update_member(record_id: str, fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _update_legacy(members_table, record_id, fields)
 
 
-def delete_member(record_id: str):
-    members_table.delete(record_id)
-    return True
+def delete_member(record_id: str) -> bool:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _delete_legacy(members_table, record_id)
 
 
-def search_members(query: str):
-    formula = f"FIND(LOWER('{query}'), LOWER({{FullName}}))"
-    return [_flatten(r) for r in members_table.all(formula=formula)]
+def search_members(query: str) -> list[dict[str, object]]:
+    return _read_all(members_table, case_insensitive_substring("FullName", query))
 
 
-def get_members_by_filter(field: str, value: str):
-    formula = f"{{{field}}} = '{value}'"
-    return [_flatten(r) for r in members_table.all(formula=formula)]
+def get_members_by_filter(field: str, value: str) -> list[dict[str, object]]:
+    return _read_all(members_table, exact_match(field, value))
 
 
-# ── Pending Submissions ──────────────────────────────────────
-
-def get_all_pending():
-    return [_flatten(r) for r in pending_table.all()]
-
-
-def get_pending_by_status(status: str = "Pending"):
-    formula = f"{{Status}} = '{status}'"
-    return [_flatten(r) for r in pending_table.all(formula=formula)]
+# Pending Submissions
+def get_all_pending() -> list[dict[str, object]]:
+    return _read_all(pending_table)
 
 
-def create_pending(fields: dict):
-    return _flatten(pending_table.create(fields))
+def get_pending_by_status(status: str = "Pending") -> list[dict[str, object]]:
+    return _read_all(pending_table, exact_match("Status", status))
 
 
-def update_pending(record_id: str, fields: dict):
-    return _flatten(pending_table.update(record_id, fields))
+def create_pending(fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _create_legacy(pending_table, fields)
 
 
-def delete_pending(record_id: str):
-    pending_table.delete(record_id)
-    return True
+def update_pending(record_id: str, fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _update_legacy(pending_table, record_id, fields)
 
 
-# ── Comments ──────────────────────────────────────────────────
-
-def get_comments_for_member(member_record_id: str):
-    formula = f"{{MemberRecordId}} = '{member_record_id}'"
-    return [_flatten(r) for r in comments_table.all(formula=formula)]
+def delete_pending(record_id: str) -> bool:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _delete_legacy(pending_table, record_id)
 
 
-def get_all_comments():
-    return [_flatten(r) for r in comments_table.all()]
+# Comments
+def get_comments_for_member(member_record_id: str) -> list[dict[str, object]]:
+    return _read_all(comments_table, exact_match("MemberRecordId", member_record_id))
 
 
-def create_comment(fields: dict):
-    return _flatten(comments_table.create(fields))
+def get_all_comments() -> list[dict[str, object]]:
+    return _read_all(comments_table)
 
 
-def delete_comment(record_id: str):
-    comments_table.delete(record_id)
-    return True
+def create_comment(fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _create_legacy(comments_table, fields)
 
 
-# ── Stories ───────────────────────────────────────────────────
-
-def get_all_stories():
-    return [_flatten(r) for r in stories_table.all()]
-
-
-def get_family_stories():
-    """Stories not tied to a specific member."""
-    formula = "OR({MemberRecordId} = '', {MemberRecordId} = BLANK())"
-    return [_flatten(r) for r in stories_table.all(formula=formula)]
+def delete_comment(record_id: str) -> bool:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _delete_legacy(comments_table, record_id)
 
 
-def get_stories_for_member(member_record_id: str):
-    formula = f"{{MemberRecordId}} = '{member_record_id}'"
-    return [_flatten(r) for r in stories_table.all(formula=formula)]
+# Stories
+def get_all_stories() -> list[dict[str, object]]:
+    return _read_all(stories_table)
 
 
-def create_story(fields: dict):
-    return _flatten(stories_table.create(fields))
+def get_family_stories() -> list[dict[str, object]]:
+    formula = str(OR(EQ(Field("MemberRecordId"), ""), EQ(Field("MemberRecordId"), BLANK())))
+    return _read_all(stories_table, formula)
 
 
-def update_story(record_id: str, fields: dict):
-    return _flatten(stories_table.update(record_id, fields))
+def get_stories_for_member(member_record_id: str) -> list[dict[str, object]]:
+    return _read_all(stories_table, exact_match("MemberRecordId", member_record_id))
 
 
-def delete_story(record_id: str):
-    stories_table.delete(record_id)
-    return True
+def create_story(fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _create_legacy(stories_table, fields)
 
 
-# ── Photo Albums ──────────────────────────────────────────────
-
-def get_all_albums():
-    return [_flatten(r) for r in albums_table.all()]
-
-
-def get_albums_for_member(member_record_id: str):
-    formula = f"{{MemberRecordId}} = '{member_record_id}'"
-    return [_flatten(r) for r in albums_table.all(formula=formula)]
+def update_story(record_id: str, fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _update_legacy(stories_table, record_id, fields)
 
 
-def create_album(fields: dict):
-    return _flatten(albums_table.create(fields))
+def delete_story(record_id: str) -> bool:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _delete_legacy(stories_table, record_id)
 
 
-def update_album(record_id: str, fields: dict):
-    return _flatten(albums_table.update(record_id, fields))
+# Photo Albums
+def get_all_albums() -> list[dict[str, object]]:
+    return _read_all(albums_table)
 
 
-def delete_album(record_id: str):
-    albums_table.delete(record_id)
-    return True
+def get_albums_for_member(member_record_id: str) -> list[dict[str, object]]:
+    return _read_all(albums_table, exact_match("MemberRecordId", member_record_id))
 
 
-# ── Approved Emails ───────────────────────────────────────────
+def create_album(fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _create_legacy(albums_table, fields)
 
-def get_approved_emails():
-    return [_flatten(r) for r in approved_emails_table.all()]
+
+def update_album(record_id: str, fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _update_legacy(albums_table, record_id, fields)
+
+
+def delete_album(record_id: str) -> bool:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _delete_legacy(albums_table, record_id)
+
+
+# Approved Emails
+def get_approved_emails() -> list[dict[str, object]]:
+    return _read_all(approved_emails_table)
 
 
 def is_email_approved(email: str) -> bool:
-    formula = f"LOWER({{Email}}) = LOWER('{email}')"
-    results = approved_emails_table.all(formula=formula)
-    return len(results) > 0
+    return bool(_read_all(approved_emails_table, case_insensitive_exact("Email", email)))
 
 
-def add_approved_email(fields: dict):
-    return _flatten(approved_emails_table.create(fields))
+def add_approved_email(fields: dict[str, object]) -> dict[str, object]:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _create_legacy(approved_emails_table, fields)
 
 
-def remove_approved_email(record_id: str):
-    approved_emails_table.delete(record_id)
-    return True
+def remove_approved_email(record_id: str) -> bool:
+    """Legacy, feature-gated mutation export for existing v1 routes."""
+    return _delete_legacy(approved_emails_table, record_id)
