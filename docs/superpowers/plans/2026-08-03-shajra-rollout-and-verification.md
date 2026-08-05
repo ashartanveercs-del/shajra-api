@@ -278,6 +278,7 @@ python -m ops.cli plan-schema --target staging --output "$schemaDir\staging-sche
 
 $schemaPlan = "$schemaDir\staging-schema-plan.json"
 $schemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+python -m ops.cli check-schema-plan --target staging --plan $schemaPlan --confirm-sha $schemaPlanSha
 python -m ops.cli provision-schema --target staging --plan $schemaPlan --apply --confirm-sha $schemaPlanSha
 python -m ops.cli preflight --target staging --read-only
 ```
@@ -626,20 +627,22 @@ production rows, and backend production flag.
 ```powershell
 $approvalPath = "D:\shajra-rollout-evidence\current\07-migration-review.json"
 $approval = Get-Content -LiteralPath $approvalPath -Raw | ConvertFrom-Json
-$driftPlan = Join-Path (Split-Path -Parent $approval.schemaPlanPath) "production-schema-drift-check.json"
+$schemaPlan = [string]$approval.schemaPlanPath
+$actualSchemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+if ($actualSchemaPlanSha -ne $approval.schemaPlanSha256) {
+    throw "Approved schema plan file changed"
+}
 
 python -m ops.cli preflight --source production --read-only
-python -m ops.cli plan-schema --target production --output $driftPlan
-
-$currentSchemaPlan = Get-Content -LiteralPath $driftPlan -Raw | ConvertFrom-Json
-if ($currentSchemaPlan.observedSchemaSha256 -ne $approval.observedSchemaSha256) {
-    throw "Production Airtable schema changed after approval"
-}
+python -m ops.cli check-schema-plan --target production --plan $schemaPlan --confirm-sha $approval.schemaPlanSha256
 ```
 
-Compare source counts/checksum with the approved evidence as well. If they differ,
-or if `plan-schema` reports an incompatibility, discard both reviewed plans, take
-a new backup, restore it to staging, and request approval again.
+Compare source counts/checksum with the approved evidence as well.
+`check-schema-plan` may report `baseline`, `resumable`, or `complete`; only
+`resumable` permits an exact prefix created by an earlier interrupted run. If the
+source differs or the schema check reports incompatible drift, discard both
+reviewed plans, take a new backup, restore it to staging, and request approval
+again.
 
 - [ ] **Step 2: Provision the exact reviewed schema plan**
 

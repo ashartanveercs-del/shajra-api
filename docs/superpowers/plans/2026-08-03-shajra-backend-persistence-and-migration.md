@@ -20,8 +20,8 @@
 - Redis stores only leases, counters, JWT revocation IDs, and rate-limit state.
 - `AI_ENRICHMENT_ENABLED` defaults to `false`; AI receives no contact fields and
   can never call a graph repository or relationship mutation service.
-- Schema render/plan/provision, migration, backup, restore, and recovery run only
-  as operator CLI commands and are never imported by the API runtime.
+- Schema render/plan/check/provision, migration, backup, restore, and recovery run
+  only as operator CLI commands and are never imported by the API runtime.
 - No command in this plan is run against production Airtable or production Vercel.
 - Staging integration tests are opt-in and skipped without explicit staging variables.
 - Every task ends with focused tests and a local commit.
@@ -1379,10 +1379,11 @@ git commit -m "feat: add review-only Shajra AI enrichment"
 - Modify: `backend/requirements-dev.txt`, `.gitignore`
 
 **Interfaces:**
-- Produces: `render-schema`, `plan-schema`, `provision-schema`, `preflight`,
-  `backup`, `audit`, `plan`, `restore`, `migrate`, `verify`, and
-  `recover-operation` commands. Schema mutation is operator-owned CLI work and is
-  never imported or called by the FastAPI/Vercel runtime.
+- Produces: `render-schema`, `plan-schema`, `check-schema-plan`,
+  `provision-schema`, `preflight`, `backup`, `audit`, `plan`, `restore`,
+  `migrate`, `verify`, and `recover-operation` commands. Schema mutation is
+  operator-owned CLI work and is never imported or called by the FastAPI/Vercel
+  runtime.
 
 - [ ] **Step 1: Add CLI-only encryption dependency**
 
@@ -1410,10 +1411,16 @@ Assert render output is deterministic; in preflight mode, missing
 `singleLineText`, and precision `2` each produce the exact stable issue code
 and zero create calls. Assert a reviewed schema plan converts only the missing
 table into a create action, passes each `TableSpec.create_fields()` with the
-primary field first, is idempotent on rerun, and rejects a changed observed-schema
-digest, missing `--apply`, wrong plan SHA, or production without
-`--allow-production`. Also reject a plan whose `manifestSha256` differs from the
-currently rendered canonical manifest.
+primary field first, and is idempotent on a complete rerun. For a plan with at
+least two missing tables, inject failure after the first successful
+`Base.create_table`, rerun the exact same approved plan, and assert it validates
+the completed prefix, creates only the remaining suffix, and reaches a clean
+preflight. Assert `check-schema-plan` reports baseline, resumable, and complete
+states with zero create calls. Reject a changed baseline digest, a non-prefix
+intermediate state, incompatible drift in any already-existing table, missing
+`--apply`, wrong plan SHA, or production without `--allow-production`. Also
+reject a plan whose `manifestSha256` differs from the currently rendered
+canonical manifest.
 
 Fixtures must cover exact parent IDs, reciprocal spouse pairs, the three known
 name/ID spelling mismatches, the one non-reciprocal spouse, unresolved mother,
@@ -1430,6 +1437,7 @@ python -m ops.cli plan-schema --target staging --output migration-artifacts/stag
 
 $schemaPlan = "migration-artifacts/staging-schema-plan.json"
 $schemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+python -m ops.cli check-schema-plan --target staging --plan $schemaPlan --confirm-sha $schemaPlanSha
 python -m ops.cli provision-schema --target staging --plan $schemaPlan --apply --confirm-sha $schemaPlanSha
 python -m ops.cli preflight --source production --read-only
 python -m ops.cli preflight --target staging --read-only
@@ -1446,28 +1454,49 @@ python -m ops.cli migrate --target production --plan $plan --apply --confirm-sha
 
 `render-schema` is local and network-free. `plan-schema` reads target metadata and
 writes canonical JSON containing `schemaVersion`, `target`, `manifestSha256`,
-`observedSchemaSha256`, ordered `createTables`, and `incompatibilities`; it exits
-nonzero when an existing table is incompatible. Both SHA-256 values hash
+`observedSchemaSha256`, `createTables` as table-name strings in immutable
+manifest order, and `incompatibilities`; it exits nonzero when an existing table
+is incompatible. Both SHA-256 values hash
 sorted-key compact ASCII JSON. The observed digest contains table names, explicit
 missing-table markers, resolved primary-field names, field names/types, and
 declared option key/value pairs; it excludes Airtable table/field IDs and
-descriptions. `provision-schema` parses the plan and, before any no-op or mutation,
-requires the command target to match the plan, the current rendered manifest to
-match `manifestSha256`, `--apply`, the exact plan SHA, and `--allow-production`
-for production. It then re-reads metadata. Full validation returns idempotent
-no-op success; otherwise the observed digest must match and every issue must map
-exactly to the plan's ordered missing-table actions. Only then may it call
-`Base.create_table` using each typed `TableSpec`. It never modifies, renames, or
-deletes existing schema and finishes with read-only validation. Execution of the
-production command belongs only to the separately reviewed rollout plan; no
-schema command is run against cloud state while implementing this task.
+descriptions.
+
+Implement one shared read-only classifier used by `check-schema-plan` and
+`provision-schema`. After validating target, exact plan SHA, and current
+`manifestSha256`, it re-reads metadata and returns exactly one state:
+
+- `baseline`: current validation has only the plan's original missing tables,
+  in canonical manifest order, and `observedSchemaSha256` matches the plan;
+- `resumable`: every table in a non-empty prefix of ordered `createTables`
+  already exists and validates exactly, while the validation's missing-table
+  list is exactly the unexecuted suffix; or
+- `complete`: full normalized-schema validation succeeds.
+
+Any non-missing issue, a missing table outside the approved actions, a completed
+action that is not an exact prefix, a manifest mismatch, or baseline digest
+mismatch is incompatible drift and exits nonzero. `check-schema-plan` reports
+the state plus completed and remaining action names as canonical JSON and never
+mutates Airtable.
+
+`provision-schema` runs the same classifier and, before any no-op or mutation,
+also requires `--apply` and `--allow-production` for production. `complete`
+returns idempotent no-op success. From `baseline` or `resumable`, it calls
+`Base.create_table` only for the remaining approved suffix using each typed
+`TableSpec`, in order. After each successful create it force-refreshes metadata
+and requires the classifier to advance by exactly that one prefix action before
+continuing; it finishes with full read-only validation. An interrupted run
+therefore resumes from its exact validated prefix with the same approved plan. It
+never modifies, renames, or deletes existing schema. Execution of the production
+command belongs only to the separately reviewed rollout plan; no schema command
+is run against cloud state while implementing this task.
 
 Source preflight verifies only the declared legacy read schema. Target preflight
 calls `Base.schema(force=True)` and `validate_normalized_schema`, including
 primary fields, exact normalized field sets, field types, integer precision, and
 checkbox options, without mutation. A missing `UnresolvedRelationships` table or
 any incompatible field fails before repository construction or record writes.
-Render, plan, provision, and preflight all consume the same immutable
+Render, plan, plan-check, provision, and preflight all consume the same immutable
 `NORMALIZED_SCHEMA`.
 
 Production `migrate` refuses to run without `--apply`, the exact SHA-256 of the
