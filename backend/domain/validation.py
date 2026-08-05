@@ -100,52 +100,54 @@ def _cycle_issues(
         key=lambda link: link.link_id,
     )
     adjacency: dict[PersonId, list[PersonId]] = defaultdict(list)
+    reverse_adjacency: dict[PersonId, list[PersonId]] = defaultdict(list)
     for link in ancestry_links:
         adjacency[link.parent_id].append(link.child_id)
-    for children in adjacency.values():
-        children.sort()
+        reverse_adjacency[link.child_id].append(link.parent_id)
+    for neighbors in (*adjacency.values(), *reverse_adjacency.values()):
+        neighbors.sort()
 
-    index = 0
-    indices: dict[PersonId, int] = {}
-    lowlinks: dict[PersonId, int] = {}
-    stack: list[PersonId] = []
-    on_stack: set[PersonId] = set()
-    components: list[tuple[PersonId, ...]] = []
-
-    def visit(person_id: PersonId) -> None:
-        nonlocal index
-        indices[person_id] = index
-        lowlinks[person_id] = index
-        index += 1
-        stack.append(person_id)
-        on_stack.add(person_id)
-
-        for child_id in adjacency.get(person_id, []):
-            if child_id not in indices:
-                visit(child_id)
-                lowlinks[person_id] = min(lowlinks[person_id], lowlinks[child_id])
-            elif child_id in on_stack:
-                lowlinks[person_id] = min(lowlinks[person_id], indices[child_id])
-
-        if lowlinks[person_id] != indices[person_id]:
-            return
-        component: list[PersonId] = []
-        while True:
-            member = stack.pop()
-            on_stack.remove(member)
-            component.append(member)
-            if member == person_id:
-                break
-        if len(component) > 1:
-            components.append(tuple(sorted(component)))
-
+    visited: set[PersonId] = set()
+    finish_order: list[PersonId] = []
     for person_id in sorted(snapshot.people):
-        if person_id not in indices:
-            visit(person_id)
+        if person_id in visited:
+            continue
+        visited.add(person_id)
+        traversal_frames: list[tuple[PersonId, int]] = [(person_id, 0)]
+        while traversal_frames:
+            current_id, child_index = traversal_frames[-1]
+            children = adjacency.get(current_id, [])
+            if child_index == len(children):
+                finish_order.append(current_id)
+                traversal_frames.pop()
+                continue
+            child_id = children[child_index]
+            traversal_frames[-1] = (current_id, child_index + 1)
+            if child_id not in visited:
+                visited.add(child_id)
+                traversal_frames.append((child_id, 0))
+
+    assigned: set[PersonId] = set()
+    components: list[tuple[PersonId, ...]] = []
+    for person_id in reversed(finish_order):
+        if person_id in assigned:
+            continue
+        assigned.add(person_id)
+        component_members: list[PersonId] = []
+        reverse_traversal = [person_id]
+        while reverse_traversal:
+            current_id = reverse_traversal.pop()
+            component_members.append(current_id)
+            for parent_id in reversed(reverse_adjacency.get(current_id, [])):
+                if parent_id not in assigned:
+                    assigned.add(parent_id)
+                    reverse_traversal.append(parent_id)
+        if len(component_members) > 1:
+            components.append(tuple(sorted(component_members)))
 
     issues: list[GraphIssue] = []
-    for component in sorted(components):
-        members = set(component)
+    for cyclic_component in sorted(components):
+        members = set(cyclic_component)
         cycle_link_ids = (
             link.link_id
             for link in ancestry_links
@@ -156,7 +158,7 @@ def _cycle_issues(
                 ANCESTRY_CYCLE,
                 IssueSeverity.ERROR,
                 "An ancestry cycle connects the affected people.",
-                person_ids=component,
+                person_ids=cyclic_component,
                 link_ids=cycle_link_ids,
             )
         )

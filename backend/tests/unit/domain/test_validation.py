@@ -460,6 +460,23 @@ def test_guardian_cycle_is_excluded_from_ancestry_detection():
     assert "ANCESTRY_CYCLE" not in _codes(validate_snapshot(guardian_cycle_snapshot()))
 
 
+def test_deep_acyclic_ancestry_chain_does_not_consume_python_call_stack():
+    depth = 1_500
+    people = tuple(_person(f"per_deep_{index:04d}") for index in range(depth))
+    links = tuple(
+        _link(
+            f"lnk_deep_{index:04d}",
+            people[index].person_id,
+            people[index + 1].person_id,
+        )
+        for index in range(depth - 1)
+    )
+
+    report = validate_snapshot(_snapshot(people=people, links=links))
+
+    assert report.issues == ()
+
+
 def test_one_cycle_component_emits_one_issue_with_all_sorted_affected_ids():
     people = tuple(_person(f"per_cycle_{name}") for name in ("c", "a", "b"))
     by_id = {person.person_id: person for person in people}
