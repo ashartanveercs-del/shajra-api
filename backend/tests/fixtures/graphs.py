@@ -1,5 +1,10 @@
 from domain.dates import PartialDate
-from domain.ids import FamilyUnitId, LinkId, PersonId
+from domain.ids import (
+    FamilyUnitId,
+    LinkId,
+    PersonId,
+    UnresolvedRelationshipId,
+)
 from domain.models import (
     FamilyUnit,
     FamilyUnitKind,
@@ -10,6 +15,8 @@ from domain.models import (
     Person,
     RelationshipType,
     UnionStatus,
+    UnresolvedRelationship,
+    UnresolvedRelationshipKind,
 )
 
 PARENT = PersonId("per_parent")
@@ -306,4 +313,110 @@ def archived_two_parent_snapshot() -> GraphSnapshot:
             ),
         },
         {},
+    )
+
+
+def single_parent_family_snapshot() -> GraphSnapshot:
+    adult = PersonId("per_single_parent")
+    child = PersonId("per_single_child")
+    family_id = FamilyUnitId("fam_single_parent")
+    link = _link("lnk_single_parent_child", adult, child, family_id)
+    return GraphSnapshot(
+        _state(),
+        {
+            adult: Person(adult, "Single Parent"),
+            child: Person(child, "Single Child", primary_family_unit_id=family_id),
+        },
+        {
+            family_id: FamilyUnit(
+                family_id,
+                FamilyUnitKind.SINGLE_PARENT,
+                adult,
+            )
+        },
+        {link.link_id: link},
+        {},
+    )
+
+
+def partner_only_snapshot() -> GraphSnapshot:
+    adult_a = PersonId("per_partner_a")
+    adult_b = PersonId("per_partner_b")
+    family_id = FamilyUnitId("fam_partner_only")
+    return GraphSnapshot(
+        _state(),
+        {
+            adult_a: Person(adult_a, "Partner A"),
+            adult_b: Person(adult_b, "Partner B"),
+        },
+        {
+            family_id: FamilyUnit(
+                family_id,
+                FamilyUnitKind.UNION,
+                adult_a,
+                adult_b,
+            )
+        },
+        {},
+        {},
+    )
+
+
+def disconnected_components_snapshot() -> GraphSnapshot:
+    adult_a = PersonId("per_disconnected_a")
+    adult_b = PersonId("per_disconnected_b")
+    adult_c = PersonId("per_disconnected_c")
+    adult_d = PersonId("per_disconnected_d")
+    family_a = FamilyUnitId("fam_disconnected_a")
+    family_b = FamilyUnitId("fam_disconnected_b")
+    return GraphSnapshot(
+        _state(),
+        {
+            person_id: Person(person_id, str(person_id))
+            for person_id in (adult_a, adult_b, adult_c, adult_d)
+        },
+        {
+            family_a: FamilyUnit(
+                family_a,
+                FamilyUnitKind.UNION,
+                adult_a,
+                adult_b,
+            ),
+            family_b: FamilyUnit(
+                family_b,
+                FamilyUnitKind.UNION,
+                adult_c,
+                adult_d,
+            ),
+        },
+        {},
+        {},
+    )
+
+
+def deterministic_projection_snapshot() -> GraphSnapshot:
+    primary = two_parent_family_snapshot()
+    repeated = repeated_ancestor_snapshot()
+    partners = partner_only_snapshot()
+    unresolved_a = UnresolvedRelationship(
+        UnresolvedRelationshipId("unr_projection_a"),
+        CHILD,
+        UnresolvedRelationshipKind.FATHER,
+        "Unknown Father",
+    )
+    unresolved_b = UnresolvedRelationship(
+        UnresolvedRelationshipId("unr_projection_b"),
+        CHILD,
+        UnresolvedRelationshipKind.PARTNER,
+        "Unknown Partner",
+    )
+    return GraphSnapshot(
+        _state(17),
+        {**primary.people, **repeated.people, **partners.people},
+        {**primary.family_units, **partners.family_units},
+        {**primary.links, **repeated.links},
+        {
+            unresolved_a.unresolved_id: unresolved_a,
+            unresolved_b.unresolved_id: unresolved_b,
+        },
     )
