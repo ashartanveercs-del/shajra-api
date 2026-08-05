@@ -123,8 +123,78 @@ def remarriage_snapshot() -> GraphSnapshot:
             LinkId("lnk_remarriage_first"): _link(
                 "lnk_remarriage_first", PARENT, first_child, first_family
             ),
+            LinkId("lnk_former_first"): _link(
+                "lnk_former_first", former, first_child, first_family
+            ),
             LinkId("lnk_remarriage_second"): _link(
                 "lnk_remarriage_second", PARENT, second_child, second_family
+            ),
+            LinkId("lnk_current_second"): _link(
+                "lnk_current_second", current, second_child, second_family
+            ),
+        },
+        {},
+    )
+
+
+def adoptive_cycle_snapshot() -> GraphSnapshot:
+    first = PersonId("per_adoptive_cycle_a")
+    second = PersonId("per_adoptive_cycle_b")
+    return GraphSnapshot(
+        _state(),
+        {
+            first: Person(first, "Adoptive Cycle A"),
+            second: Person(second, "Adoptive Cycle B"),
+        },
+        {},
+        {
+            LinkId("lnk_adoptive_a_b"): ParentChildLink(
+                LinkId("lnk_adoptive_a_b"),
+                first,
+                second,
+                ParentRole.PARENT,
+                RelationshipType.ADOPTIVE,
+                None,
+            ),
+            LinkId("lnk_adoptive_b_a"): ParentChildLink(
+                LinkId("lnk_adoptive_b_a"),
+                second,
+                first,
+                ParentRole.PARENT,
+                RelationshipType.ADOPTIVE,
+                None,
+            ),
+        },
+        {},
+    )
+
+
+def guardian_cycle_snapshot() -> GraphSnapshot:
+    first = PersonId("per_guardian_cycle_a")
+    second = PersonId("per_guardian_cycle_b")
+    return GraphSnapshot(
+        _state(),
+        {
+            first: Person(first, "Guardian Cycle A"),
+            second: Person(second, "Guardian Cycle B"),
+        },
+        {},
+        {
+            LinkId("lnk_guardian_a_b"): ParentChildLink(
+                LinkId("lnk_guardian_a_b"),
+                first,
+                second,
+                ParentRole.PARENT,
+                RelationshipType.GUARDIAN,
+                None,
+            ),
+            LinkId("lnk_guardian_b_a"): ParentChildLink(
+                LinkId("lnk_guardian_b_a"),
+                second,
+                first,
+                ParentRole.PARENT,
+                RelationshipType.GUARDIAN,
+                None,
             ),
         },
         {},
