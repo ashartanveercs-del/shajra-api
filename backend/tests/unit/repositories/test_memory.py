@@ -165,6 +165,33 @@ def test_tombstones_remove_every_entity_kind(
     first_commit, first_permit = commit_and_permit_for(first_receipt)
     memory_repository.append_commit(first_commit, first_permit)
 
+    first_snapshot = memory_repository.load_committed()
+    assert first_snapshot.people == {
+        person_id: Person(person_id, "Parent"),
+        child_id: Person(child_id, "Child"),
+    }
+    assert first_snapshot.family_units == {
+        family_id: FamilyUnit(family_id, FamilyUnitKind.SINGLE_PARENT, person_id)
+    }
+    assert first_snapshot.links == {
+        link_id: ParentChildLink(
+            link_id,
+            person_id,
+            child_id,
+            ParentRole.PARENT,
+            RelationshipType.BIOLOGICAL,
+            family_id,
+        )
+    }
+    assert first_snapshot.unresolved == {
+        unresolved_id: UnresolvedRelationship(
+            unresolved_id,
+            child_id,
+            UnresolvedRelationshipKind.FATHER,
+            "Unknown parent",
+        )
+    }
+
     tombstones = GraphWriteSet(
         person_tombstones=(person_id,),
         family_unit_tombstones=(family_id,),
