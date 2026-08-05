@@ -48,6 +48,7 @@ from tests.fixtures.graphs import (
     remarriage_snapshot,
     repeated_ancestor_snapshot,
     simple_parent_child_snapshot,
+    shared_family_pedigree_collapse_snapshot,
     single_parent_family_snapshot,
     two_parent_family_snapshot,
 )
@@ -374,6 +375,21 @@ def test_siblings_in_one_primary_family_do_not_repeat_the_same_ancestry_path():
     )
 
     assert project_graph(with_sibling).references == ()
+
+
+def test_one_descendant_path_repeats_ancestor_through_shared_family_siblings():
+    projection = project_graph(shared_family_pedigree_collapse_snapshot())
+
+    assert projection.references == (
+        RelationshipReference(
+            "ref_875d1bb48a6328792fc320012a69e17046731ea901d54990eedc96b96290c0ce",
+            PersonId("per_shared_sibling_b"),
+            PersonId("per_shared_ancestor"),
+            FamilyUnitId("fam_shared_siblings"),
+            RelationshipType.BIOLOGICAL,
+            "repeated_ancestor",
+        ),
+    )
 
 
 def test_partner_only_component_has_two_roots_and_no_fake_descendants():

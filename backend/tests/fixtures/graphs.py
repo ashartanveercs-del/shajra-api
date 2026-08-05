@@ -505,3 +505,54 @@ def archived_reference_candidates_snapshot() -> GraphSnapshot:
         },
         snapshot.unresolved,
     )
+
+
+def shared_family_pedigree_collapse_snapshot() -> GraphSnapshot:
+    ancestor = PersonId("per_shared_ancestor")
+    sibling_a = PersonId("per_shared_sibling_a")
+    sibling_b = PersonId("per_shared_sibling_b")
+    descendant = PersonId("per_shared_descendant")
+    sibling_family = FamilyUnitId("fam_shared_siblings")
+    descendant_family = FamilyUnitId("fam_shared_descendant")
+    links = (
+        _link("lnk_shared_ancestor_a", ancestor, sibling_a, sibling_family),
+        _link("lnk_shared_ancestor_b", ancestor, sibling_b, sibling_family),
+        _link("lnk_shared_sibling_a", sibling_a, descendant, descendant_family),
+        _link("lnk_shared_sibling_b", sibling_b, descendant, descendant_family),
+    )
+    return GraphSnapshot(
+        _state(),
+        {
+            ancestor: Person(ancestor, "Shared Ancestor"),
+            sibling_a: Person(
+                sibling_a,
+                "Shared Sibling A",
+                primary_family_unit_id=sibling_family,
+            ),
+            sibling_b: Person(
+                sibling_b,
+                "Shared Sibling B",
+                primary_family_unit_id=sibling_family,
+            ),
+            descendant: Person(
+                descendant,
+                "Shared Descendant",
+                primary_family_unit_id=descendant_family,
+            ),
+        },
+        {
+            sibling_family: FamilyUnit(
+                sibling_family,
+                FamilyUnitKind.SINGLE_PARENT,
+                ancestor,
+            ),
+            descendant_family: FamilyUnit(
+                descendant_family,
+                FamilyUnitKind.UNION,
+                sibling_a,
+                sibling_b,
+            ),
+        },
+        {link.link_id: link for link in links},
+        {},
+    )

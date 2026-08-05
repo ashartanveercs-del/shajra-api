@@ -351,21 +351,27 @@ def _relationship_references(
     for outgoing in adjacency.values():
         outgoing.sort(key=lambda link: (link.parent_id, link.link_id))
 
-    references = [
-        _relationship_reference(link, "non_primary")
-        for link in links
-        if link.relationship_type is RelationshipType.GUARDIAN
-    ]
-    expanded: set[PersonId] = set()
-    primary_family_sources: dict[FamilyUnitId, PersonId] = {}
-    starts = sorted(
-        {link.parent_id for link in ancestry_links}
-        | {link.child_id for link in ancestry_links},
-        key=lambda person_id: (person_id in parent_ids, person_id),
-    )
-    for start_id in starts:
-        if start_id in expanded:
+    references_by_id: dict[str, RelationshipReference] = {}
+    for link in links:
+        if link.relationship_type is RelationshipType.GUARDIAN:
+            reference = _relationship_reference(link, "non_primary")
+        elif link.relationship_type in _ANCESTRY_TYPES and not link.primary:
+            label: ReferenceLabel = (
+                "cross_family"
+                if link.family_unit_id is not None
+                else "non_primary"
+            )
+            reference = _relationship_reference(link, label)
+        else:
             continue
+        references_by_id[reference.reference_id] = reference
+
+    ancestry_people = {link.parent_id for link in ancestry_links} | {
+        link.child_id for link in ancestry_links
+    }
+    starts = sorted(ancestry_people - parent_ids)
+    for start_id in starts:
+        expanded: set[PersonId] = set()
         expanded.add(start_id)
         frames: list[tuple[PersonId, int]] = [(start_id, 0)]
         while frames:
@@ -376,28 +382,16 @@ def _relationship_references(
                 continue
             link = outgoing[link_index]
             frames[-1] = (person_id, link_index + 1)
-            if link.primary and link.family_unit_id is not None:
-                source_id = primary_family_sources.setdefault(
-                    link.family_unit_id, link.child_id
-                )
-                if source_id != link.child_id:
-                    continue
-            if not link.primary:
-                label: ReferenceLabel = (
-                    "cross_family"
-                    if link.family_unit_id is not None
-                    else "non_primary"
-                )
-                references.append(_relationship_reference(link, label))
-            elif link.parent_id in expanded:
-                references.append(
-                    _relationship_reference(link, "repeated_ancestor")
-                )
+            if link.primary and link.parent_id in expanded:
+                reference = _relationship_reference(link, "repeated_ancestor")
+                references_by_id[reference.reference_id] = reference
             if link.parent_id not in expanded:
                 expanded.add(link.parent_id)
                 frames.append((link.parent_id, 0))
 
-    return tuple(sorted(references, key=lambda reference: reference.reference_id))
+    return tuple(
+        references_by_id[reference_id] for reference_id in sorted(references_by_id)
+    )
 
 
 def _relationship_reference(
