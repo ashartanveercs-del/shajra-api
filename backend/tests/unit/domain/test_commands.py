@@ -1,4 +1,6 @@
 from dataclasses import replace
+from collections.abc import Sequence
+from typing import get_type_hints
 
 import pytest
 
@@ -14,6 +16,7 @@ from domain.commands import (
     SupersedeFamilyUnit,
     SupersedeParentChildLink,
     SupersedeUnresolvedRelationship,
+    GraphCommand,
     apply_commands,
 )
 from domain.ids import FamilyUnitId, LinkId, PersonId, UnresolvedRelationshipId
@@ -97,6 +100,15 @@ def test_reducer_accepts_cross_reference_errors_for_later_semantic_validation():
     result = apply_commands(empty_snapshot(), [AddParentChildLink(link)])
 
     assert result.links[link.link_id] == link
+
+
+def test_reducer_accepts_tuple_commands_under_the_sequence_contract():
+    person = Person(PARENT, "Tuple Input")
+
+    result = apply_commands(empty_snapshot(), (AddPersonVersion(person),))
+
+    assert result.people[PARENT] == person
+    assert get_type_hints(apply_commands)["commands"] == Sequence[GraphCommand]
 
 
 def test_add_person_version_inserts_then_replaces_the_stable_person_id():

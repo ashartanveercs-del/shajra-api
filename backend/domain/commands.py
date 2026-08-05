@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from domain.ids import FamilyUnitId, LinkId, PersonId, UnresolvedRelationshipId
@@ -83,7 +84,7 @@ GraphCommand = (
 
 
 def apply_commands(
-    snapshot: GraphSnapshot, commands: list[GraphCommand]
+    snapshot: GraphSnapshot, commands: Sequence[GraphCommand]
 ) -> GraphSnapshot:
     people = dict(snapshot.people)
     family_units = dict(snapshot.family_units)
