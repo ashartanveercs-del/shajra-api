@@ -4,7 +4,10 @@
 
 **Goal:** Persist the normalized graph atomically over Airtable, serialize mutations through Upstash, expose secure v2 APIs, add review-only AI enrichment, and provide a reversible, idempotent migration CLI.
 
-**Architecture:** Airtable rows are append-only versions; an append-only `GraphCommits` record is the visibility boundary and `GraphState` is only a cache. An Upstash lease with a monotonic fencing token serializes writers. Services operate through repository protocols, validate a complete proposed snapshot before staging, and publish only by appending a commit. AI enrichment uses a separate append-only attempt pipeline whose validated suggestions can populate a draft but cannot publish graph state.
+**Architecture:** Airtable rows are append-only versions; an append-only `GraphCommits` record is the visibility boundary and `GraphState` is only a cache. Readers authorize each staged row through the exact `(Revision, OperationId, FencingToken)` tuple of its logical commit. Upstash leases serialize proposal work, while an immutable, non-expiring `COMMITTING` reservation makes commit authorization atomic and recoverable. Services validate a complete proposed snapshot before staging and publish only the exact commit named by a `CommitPermit`. AI enrichment uses a separate append-only attempt pipeline whose validated suggestions can populate a draft but cannot publish graph state.
+
+The binding coordination and compensation design is
+`docs/superpowers/specs/2026-08-05-shajra-commit-coordination-design.md`.
 
 **Tech Stack:** Python 3.12, FastAPI 0.141.1, pyairtable 3.4.2, Upstash Redis client 1.7.0, PyJWT 2.13.0, Argon2, Cloudinary 1.45.0, Pillow 12.3.0, cryptography 50.0.0 for the operator CLI.
 
@@ -13,11 +16,18 @@
 - Complete the platform recovery and graph-core plans first.
 - No fuzzy match may write a relationship. AI and name matching return suggestions only.
 - Airtable record IDs never leave repository adapters or appear in public DTOs.
-- Staged rows are invisible until their `GraphCommits` revision exists.
+- Staged rows are visible only when their `(Revision, OperationId, FencingToken)`
+  exactly matches that revision's logical `GraphCommit`.
 - `GraphState` is a cache, not the commit authority.
-- Every mutation requires `Idempotency-Key` and `If-Match`; stale revisions return `409`.
-- Lock loss, stale fencing token, or Upstash outage fails closed.
-- Redis stores only leases, counters, JWT revocation IDs, and rate-limit state.
+- Every graph-state mutation requires `Idempotency-Key` and integer `If-Match`;
+  stale graph revisions return `409`.
+- Non-graph create and attempt mutations require `Idempotency-Key`; non-graph
+  state transitions use their explicit resource state/version precondition when
+  their task defines one, never the graph revision.
+- Lease loss or an Upstash outage before commit authorization fails closed. After
+  authorization, the exact reserved commit is irrevocable and recovery completes it.
+- Redis stores only leases, fencing/revision counters, commit coordination
+  reservation/receipt state, JWT revocation IDs, and rate-limit state.
 - `AI_ENRICHMENT_ENABLED` defaults to `false`; AI receives no contact fields and
   can never call a graph repository or relationship mutation service.
 - Schema render/plan/check/provision, migration, backup, restore, and recovery run
@@ -42,7 +52,7 @@ Create:
 - `backend/repositories/airtable/graph.py`: versioned graph and commit repository.
 - `backend/repositories/airtable/audit.py`: durable operation records.
 - `backend/repositories/airtable/submissions.py`: pending and content repositories.
-- `backend/coordination/protocols.py`: lease, revocation, and rate-limit contracts.
+- `backend/coordination/protocols.py`: lease, commit-coordinator, revocation, and rate-limit contracts.
 - `backend/coordination/upstash.py`: Redis implementation and Lua scripts.
 - `backend/services/relationships.py`: preview, execute, and compensate orchestration.
 - `backend/services/submissions.py`: raw-first submission persistence.
@@ -96,16 +106,36 @@ field type, or required option is incompatible.
 ## Interfaces
 
 ```python
+@dataclass(frozen=True, slots=True)
+class CommitPermit:
+    operation_id: OperationId
+    revision: int
+    fencing_token: int
+    permit_id: str
+
+
 class GraphRepository(Protocol):
     def load_committed(self, revision: int | None = None) -> GraphSnapshot: ...
     def stage(self, write_set: GraphWriteSet, context: WriteContext) -> StagedWriteReceipt: ...
     def verify_staged(self, receipt: StagedWriteReceipt) -> None: ...
-    def append_commit(self, commit: GraphCommit, lease: Lease) -> GraphState: ...
+    def append_commit(self, commit: GraphCommit, permit: CommitPermit) -> GraphState: ...
 
 class AuditRepository(Protocol):
     def find_by_idempotency_key(self, key: str) -> AuditOperation | None: ...
     def create_pending(self, operation: AuditOperation) -> None: ...
     def transition(self, operation_id: OperationId, state: OperationState) -> None: ...
+
+class CommitCoordinator(Protocol):
+    def acquire(
+        self, scope: str, owner: str, committed_revision: int, ttl_ms: int
+    ) -> Lease: ...
+    def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
+    def assert_owned(self, lease: Lease) -> None: ...
+    def authorize_commit(self, lease: Lease, commit: GraphCommit) -> CommitPermit: ...
+    def get_reservation(self, scope: str) -> CommitReservation | None: ...
+    def confirm_commit(self, permit: CommitPermit, commit: GraphCommit) -> None: ...
+    def release(self, lease: Lease) -> None: ...
+
 
 class LeaseManager(Protocol):
     def acquire(self, scope: str, owner: str, ttl_ms: int) -> Lease: ...
@@ -116,7 +146,14 @@ class LeaseManager(Protocol):
 class RelationshipService:
     def preview(self, request: GraphMutationRequest) -> MutationPreview: ...
     def execute(self, request: GraphMutationRequest, actor: Actor, request_id: str) -> MutationResult: ...
-    def compensate(self, operation_id: OperationId, expected_revision: int, actor: Actor) -> MutationResult: ...
+    def compensate(
+        self,
+        operation_id: OperationId,
+        expected_revision: int,
+        idempotency_key: str,
+        actor: Actor,
+        request_id: str,
+    ) -> MutationResult: ...
 ```
 
 ### Task 1: Repository Protocols and In-Memory Commit Semantics
@@ -133,23 +170,43 @@ class RelationshipService:
 
 - [ ] **Step 1: Write failing visibility tests**
 
-Create `backend/tests/unit/repositories/test_memory.py`:
+Create `backend/tests/unit/repositories/test_memory.py`. The same-revision
+regression is mandatory and uses no lease or coordination type:
 
 ```python
-def test_staged_rows_are_invisible_until_commit(memory_repository, write_set, lease):
-    receipt = memory_repository.stage(write_set, context_for(revision=1, lease=lease))
+def test_staged_rows_are_invisible_until_commit(memory_repository, write_set):
+    context = context_for(operation_id="op_one", revision=1, fencing_token=11)
+    receipt = memory_repository.stage(write_set, context)
     assert memory_repository.load_committed().state.revision == 0
-    memory_repository.append_commit(commit_for(receipt), lease)
+    commit, permit = commit_and_permit_for(receipt)
+    memory_repository.append_commit(commit, permit)
     assert memory_repository.load_committed().state.revision == 1
 
 
-def test_uncommitted_higher_revision_does_not_shadow_committed_data(
-    memory_repository, committed_snapshot, failed_write_set, lease
+def test_only_committing_operation_is_visible_when_two_stage_same_revision(
+    memory_repository,
 ):
-    memory_repository.seed(committed_snapshot)
-    memory_repository.stage(failed_write_set, context_for(revision=2, lease=lease))
-    assert memory_repository.load_committed().state.revision == 1
+    person_id = PersonId("per_shared")
+    receipt_a = memory_repository.stage(
+        GraphWriteSet(person_upserts=(Person(person_id, "From A"),)),
+        context_for(operation_id="op_a", revision=1, fencing_token=21),
+    )
+    receipt_b = memory_repository.stage(
+        GraphWriteSet(person_upserts=(Person(person_id, "From B"),)),
+        context_for(operation_id="op_b", revision=1, fencing_token=22),
+    )
+
+    commit_b, permit_b = commit_and_permit_for(receipt_b)
+    memory_repository.append_commit(commit_b, permit_b)
+
+    assert memory_repository.load_committed().people[person_id].full_name == "From B"
+    assert receipt_a.operation_id != commit_b.operation_id
 ```
+
+Also prove that a mismatched operation ID or fencing token stays invisible,
+tombstones remove entities of all four kinds, a permit mismatch adds no commit,
+identical logical commit duplicates are idempotent, and conflicting duplicate
+commits fail closed.
 
 - [ ] **Step 2: Run the focused test and confirm failure**
 
@@ -160,8 +217,10 @@ Expected: FAIL because repository types do not exist.
 - [ ] **Step 3: Define commit and write contracts**
 
 In `backend/repositories/protocols.py`, define frozen `WriteContext`,
-`GraphWriteSet`, `StagedWriteReceipt`, `GraphCommit`, `AuditOperation`, and the
-protocols in this plan's interface block. `WriteContext` contains:
+`GraphWriteSet`, `StagedWriteReceipt`, `GraphCommit`, `CommitPermit`,
+`AuditOperation`, `AuditOperationState`, `GraphRepository`, and
+`AuditRepository`. Task 1 defines no `Lease`, coordinator, Redis, revocation, or
+rate-limit type. `WriteContext` contains:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -173,18 +232,50 @@ class WriteContext:
     request_id: str
 ```
 
-`GraphWriteSet` contains complete person, family-unit, link, and unresolved-
-annotation versions plus unresolved tombstones generated by pure commands, not
-database patches. Family-unit versions persist `distinct_union_confirmed`.
+`GraphWriteSet` is the canonical typed structure used for forward and inverse
+writes:
+
+```python
+@dataclass(frozen=True, slots=True)
+class GraphWriteSet:
+    person_upserts: tuple[Person, ...] = ()
+    person_tombstones: tuple[PersonId, ...] = ()
+    family_unit_upserts: tuple[FamilyUnit, ...] = ()
+    family_unit_tombstones: tuple[FamilyUnitId, ...] = ()
+    parent_child_link_upserts: tuple[ParentChildLink, ...] = ()
+    parent_child_link_tombstones: tuple[LinkId, ...] = ()
+    unresolved_upserts: tuple[UnresolvedRelationship, ...] = ()
+    unresolved_tombstones: tuple[UnresolvedRelationshipId, ...] = ()
+```
+
+It is generated from complete before/after snapshots, not database patches.
+Upserts preserve graph-core revision metadata and family units preserve
+`distinct_union_confirmed`. Its canonical JSON form uses the field order above,
+stable logical-ID sorting inside each field, sorted object keys, compact
+separators, and ASCII output. `GraphCommit` contains `operation_id`, `revision`,
+`fencing_token`, `permit_id`, `semantic_checksum`, and `committed_at`.
+`CommitPermit` contains exactly `operation_id`, `revision`, `fencing_token`, and
+`permit_id`; permit IDs use `cpr_<uuid4 hex>`.
 
 - [ ] **Step 4: Implement in-memory append-only semantics**
 
-Store all four entity-version kinds by `(logical_id, revision)` and commits by
-revision. `load_committed` finds the highest commit, then selects the highest
-version at or below that revision for each logical ID. It ignores every version
-whose revision lacks a commit and omits unresolved IDs whose highest committed
-row is a tombstone. `append_commit` rejects non-sequential revisions and stale
-fencing tokens.
+Store every upsert and tombstone by
+`(entity_kind, logical_id, revision, operation_id, fencing_token)`. Resolve
+physical commit records into logical commits by canonical fields. Identical
+duplicates are one logical commit; conflicting rows for a revision raise
+`COMMIT_LOG_CORRUPTION`.
+
+`load_committed` finds the highest valid logical commit, authorizes entity rows
+only when their `(revision, operation_id, fencing_token)` exactly matches that
+revision's commit, then selects the highest authorized version at or below the
+requested revision for each logical ID. A highest authorized tombstone omits the
+entity for all four kinds. Identical physical entity rows are one logical version;
+conflicting payloads under the same identity raise `ENTITY_VERSION_CORRUPTION`.
+
+`append_commit(commit, permit)` requires an exact match of operation ID, revision,
+fencing token, and permit ID. It rejects non-sequential revisions and permit
+mismatches, returns the existing state for an identical logical commit, and fails
+closed for a conflicting duplicate. It performs no lease lookup.
 
 - [ ] **Step 5: Run and commit**
 
@@ -216,10 +307,12 @@ git commit -m "feat: add append-only Shajra repository contracts"
 - [ ] **Step 1: Write schema-manifest and formula-injection tests**
 
 First assert the typed canonical schema manifest has exactly these table names.
-For `UnresolvedRelationships`, assert primary field `UnresolvedId`; text fields
-`SubjectPersonId`, `Kind`, and `UnresolvedName`; integer fields `Revision` and
-`FencingToken` with precision `0`; text `OperationId`; and checkbox `IsRemoved`
-with the declared icon/color options. Add negative validator fixtures for a
+For each of `PersonVersions`, `FamilyUnits`, `ParentChildLinks`, and
+`UnresolvedRelationships`, assert integer fields `Revision` and `FencingToken`
+with precision `0`, text `OperationId`, and checkbox `IsTombstone` with the
+declared icon/color options. Assert `Archived` remains a separate checkbox on
+`PersonVersions`, `GraphCommits` has text `PermitId`, and `ChangeLog` has canonical
+`InverseWriteSetJson`. Add negative validator fixtures for a
 missing table, wrong primary field, `Revision` as `singleLineText`, and number
 precision `2`. Then create formula tests using names with quotes, backslashes,
 parentheses, and Airtable function text:
@@ -330,26 +423,27 @@ NORMALIZED_SCHEMA = MappingProxyType({
         text("PersonId"), text("FullName"), text("Gender"), text("Birth"),
         text("Death"), text("IsAlive"), text("PrimaryFamilyUnitId"),
         checkbox("Archived"), integer("VersionRevision"), integer("Revision"),
-        text("OperationId"), integer("FencingToken"),
+        text("OperationId"), integer("FencingToken"), checkbox("IsTombstone"),
     )),
     "FamilyUnits": TableSpec("FamilyUnits", "FamilyUnitId", (
         text("FamilyUnitId"), text("Kind"), text("AdultAId"), text("AdultBId"),
         text("Status"), text("Start"), text("End"),
         checkbox("DistinctUnionConfirmed"), integer("CreatedRevision"),
         integer("Revision"), text("OperationId"), integer("FencingToken"),
+        checkbox("IsTombstone"),
     )),
     "ParentChildLinks": TableSpec("ParentChildLinks", "LinkId", (
         text("LinkId"), text("ParentId"), text("ChildId"), text("Role"),
         text("RelationshipType"), text("FamilyUnitId"),
         integer("CreatedRevision"), integer("Revision"), text("OperationId"),
-        integer("FencingToken"),
+        integer("FencingToken"), checkbox("IsTombstone"),
     )),
     "UnresolvedRelationships": TableSpec(
         "UnresolvedRelationships", "UnresolvedId", (
             text("UnresolvedId"), text("SubjectPersonId"), text("Kind"),
             text("UnresolvedName"), integer("CreatedRevision"),
             integer("Revision"), text("OperationId"), integer("FencingToken"),
-            checkbox("IsRemoved"),
+            checkbox("IsTombstone"),
         ),
     ),
     "ChangeLog": TableSpec("ChangeLog", "OperationId", (
@@ -357,11 +451,11 @@ NORMALIZED_SCHEMA = MappingProxyType({
         text("ActorId"), text("RequestId"), text("SourceReference"),
         integer("ExpectedRevision"), integer("ResultRevision"),
         integer("FencingToken"), long_text("CommandsJson"),
-        long_text("InverseCommandsJson"), text("CreatedAt"), text("UpdatedAt"),
+        long_text("InverseWriteSetJson"), text("CreatedAt"), text("UpdatedAt"),
     )),
     "GraphCommits": TableSpec("GraphCommits", "OperationId", (
         text("OperationId"), integer("Revision"), integer("FencingToken"),
-        text("SemanticChecksum"), text("CommittedAt"),
+        text("PermitId"), text("SemanticChecksum"), text("CommittedAt"),
     )),
     "GraphState": TableSpec("GraphState", "StateKey", (
         text("StateKey"), integer("Revision"), text("HeadOperationId"),
@@ -487,7 +581,10 @@ and identical IDs and annotations on an idempotent rerun. The mapper must not
 split delimiters or synthesize a plural spouse field. Add a test proving two
 repository rows with different
 `SourceRecordId`/`MigrationRunId` values produce identical domain snapshots and
-semantic checksums when their family semantics match.
+semantic checksums when their family semantics match. Add row-mapper tests proving
+all four entity kinds serialize `Revision`, `OperationId`, `FencingToken`, and
+`IsTombstone`; tombstone rows deserialize as repository tombstones rather than
+graph-core entities.
 
 - [ ] **Step 4: Implement the read-only legacy repository**
 
@@ -527,8 +624,12 @@ git commit -m "fix: isolate and escape Shajra Airtable access"
 - [ ] **Step 1: Write mocked Airtable commit-boundary tests**
 
 Use fake tables recording `batch_create` calls. Assert stage writes rows with the
-same `OperationId`, `Revision`, and `FencingToken`; assert `GraphCommits` is the
-last table written; assert a missing commit causes staged rows to be ignored.
+same `OperationId`, `Revision`, and `FencingToken` and an explicit
+`IsTombstone`. Assert all staged entity tables are written and verified before
+`GraphCommits`, and `GraphState` is attempted only after `GraphCommits`. Assert a
+missing commit causes staged rows to be ignored. Reproduce the Task 1 regression
+with two operations staging the same revision and assert only rows matching the
+committed operation ID and fencing token load.
 
 ```python
 assert fake_tables.write_order == [
@@ -544,38 +645,52 @@ assert fake_tables.write_order == [
 - [ ] **Step 2: Implement append-only row shapes**
 
 Every normalized row contains its stable logical ID, `Revision`, `OperationId`,
-`FencingToken`, an entity-appropriate tombstone/archive marker, and semantic
-fields. Family units persist `DistinctUnionConfirmed`; unresolved rows persist
-kind, subject ID, normalized name, and `IsRemoved`. Never update an existing
-version row. `GraphCommits` contains:
+`FencingToken`, `IsTombstone`, and semantic fields for an upsert. `Archived` is a
+separate semantic person field and never substitutes for `IsTombstone`. Family
+units persist `DistinctUnionConfirmed`; unresolved upserts persist kind, subject
+ID, and normalized name. Never update an existing version row. `GraphCommits`
+contains:
 
 ```python
 {
     "Revision": commit.revision,
     "OperationId": str(commit.operation_id),
     "FencingToken": commit.fencing_token,
+    "PermitId": commit.permit_id,
     "SemanticChecksum": commit.semantic_checksum,
     "CommittedAt": commit.committed_at.isoformat(),
 }
 ```
 
-Append the commit after staged-row verification. Update the single `GraphState`
-cache row with primary field `StateKey="graph"` only after the commit and tolerate
-cache-update failure.
+`append_commit(commit, permit)` checks the exact operation ID, revision, fencing
+token, and permit ID before any write and has no coordination or Redis dependency.
+Append the commit after staged-row verification. Resolve an ambiguous create by
+reading the revision back. Treat canonical-identical physical `GraphCommits` rows
+as one logical commit; any canonical difference within a revision is
+`COMMIT_LOG_CORRUPTION`. Update the single `GraphState` cache row with primary
+field `StateKey="graph"` only after the commit and tolerate cache-update failure.
 
 - [ ] **Step 3: Implement committed snapshot loading**
 
-Read the highest valid `GraphCommits.Revision`, verify one commit per revision,
-load normalized rows in batches, and select the highest row revision at or below
-the commit for each logical ID. Recompute the semantic checksum and fail closed
-with `COMMIT_CHECKSUM_MISMATCH` if it differs.
+Read and canonicalize `GraphCommits` in revision order. Identical physical rows are
+one logical commit; conflicting rows for a revision fail closed. For each logical
+entity ID, discard every row whose `(Revision, OperationId, FencingToken)` does not
+exactly match the logical commit for that row's revision, then select the highest
+authorized row at or below the requested revision. An authorized `IsTombstone`
+omits the entity. Deduplicate identical physical entity rows and raise
+`ENTITY_VERSION_CORRUPTION` for conflicting payloads under one logical version.
+Recompute the semantic checksum and fail closed with `COMMIT_CHECKSUM_MISMATCH` if
+it differs.
 
 - [ ] **Step 4: Implement durable audit transitions**
 
 Audit records are append-only state transitions keyed by `OperationId` and
-idempotency key. Resolve current state from the latest transition. Before/after
-snapshots contain application IDs and semantic graph data but redact contact
-fields and credentials.
+idempotency key. States are `PENDING`, `COMMITTING`, `COMMITTED`, and `FAILED`;
+resolve current state from the latest transition. Before/after snapshots contain
+application IDs and semantic graph data but redact contact fields and credentials.
+Persist the typed inverse write set as canonical `InverseWriteSetJson`. The JSON
+uses the eight `GraphWriteSet` fields from Task 1, stable logical-ID order, sorted
+object keys, compact separators, and ASCII output.
 
 - [ ] **Step 5: Run and commit**
 
@@ -587,7 +702,7 @@ git add backend/repositories/airtable backend/tests/unit/repositories
 git commit -m "feat: persist committed Shajra graph revisions"
 ```
 
-### Task 4: Upstash Lease, Fencing, Revocation, and Rate Limits
+### Task 4: Upstash Commit Coordination, Revocation, and Rate Limits
 
 **Files:**
 - Create: `backend/coordination/__init__.py`
@@ -598,7 +713,9 @@ git commit -m "feat: persist committed Shajra graph revisions"
 - Modify: `backend/requirements.txt`
 
 **Interfaces:**
-- Produces: `LeaseManager`, `RevocationStore`, and `RateLimiter` implementations.
+- Consumes: `GraphCommit` and `CommitPermit` from Task 1.
+- Produces: `Lease`, `LeaseManager`, `CommitReservation`, `CommitCoordinator`,
+  `RevocationStore`, and `RateLimiter` contracts plus Upstash implementations.
 
 - [ ] **Step 1: Add pinned runtime dependencies and settings**
 
@@ -621,26 +738,117 @@ development or unit tests.
 - [ ] **Step 2: Write fake-client tests for atomic scripts**
 
 Test acquisition, contention, renewal by owner, rejected renewal by another owner,
-compare-and-delete release, stale fencing token, TTL expiry, revocation expiry,
-and fixed-window rate limits.
+compare-and-delete release, stale fencing token, TTL expiry, revision mismatch,
+and fixed-window rate limits. Add commit-coordinator tests proving:
 
-- [ ] **Step 3: Implement atomic lease Lua scripts**
+- authorization rejects lease loss, wrong owner, wrong fencing token, wrong base
+  revision, non-sequential commit revision, and a conflicting reservation;
+- an exact authorization retry returns the same permit;
+- the `COMMITTING` reservation has no TTL and blocks new writers after lease expiry;
+- confirmation requires the exact permit and canonical commit SHA-256;
+- confirmation advances the revision exactly once and identical retries succeed;
+- release and lease expiry never delete or invalidate a reservation; and
+- Upstash errors from acquire, authorize, confirm, revocation, and rate limiting
+  fail closed with stable service errors.
 
-Acquire with one `EVAL` that increments the fencing key and sets the lock with
-`NX PX`. Store value `owner:fencing_token`. Renew and release compare that full
-value before `PEXPIRE` or `DEL`. Prefix every key with
-`{REDIS_NAMESPACE}:shajra:`. Use a 15-second default lease and renew before five
-seconds remain.
+- [ ] **Step 3: Implement commit-coordinator contracts and atomic Lua scripts**
+
+Define these Task 4-only contracts in `backend/coordination/protocols.py`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class Lease:
+    scope: str
+    owner: str
+    fencing_token: int
+    base_revision: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CommitReservation:
+    scope: str
+    state: Literal["COMMITTING"]
+    permit: CommitPermit
+    commit: GraphCommit
+    commit_sha256: str
+
+
+class LeaseManager(Protocol):
+    def acquire(self, scope: str, owner: str, ttl_ms: int) -> Lease: ...
+    def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
+    def assert_owned(self, lease: Lease) -> None: ...
+    def release(self, lease: Lease) -> None: ...
+
+
+class CommitCoordinator(Protocol):
+    def acquire(
+        self,
+        scope: str,
+        owner: str,
+        committed_revision: int,
+        ttl_ms: int,
+    ) -> Lease: ...
+    def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
+    def assert_owned(self, lease: Lease) -> None: ...
+    def authorize_commit(
+        self, lease: Lease, commit: GraphCommit
+    ) -> CommitPermit: ...
+    def get_reservation(self, scope: str) -> CommitReservation | None: ...
+    def confirm_commit(
+        self, permit: CommitPermit, commit: GraphCommit
+    ) -> None: ...
+    def release(self, lease: Lease) -> None: ...
+```
+
+`LeaseManager` is the generic TTL lease used by enrichment and returns leases with
+`base_revision=None`; such a lease cannot authorize a graph commit.
+`CommitCoordinator.acquire` is graph-specific and returns a lease whose
+`base_revision` equals `committed_revision`.
+
+Prefix every key with `{REDIS_NAMESPACE}:shajra:`. Per graph scope use `lock`,
+`fence`, `confirmed-revision`, `commit-reservation`, and `last-confirmed` keys.
+Only `lock` has a TTL. `commit-reservation` has no expiry. Use a 15-second default
+lease and renew before five seconds remain.
+
+Acquire with one `EVAL`. It rejects an existing reservation, initializes an absent
+`confirmed-revision` from the caller's committed Airtable revision, otherwise
+requires an exact revision match, increments the fencing key, and sets the lock
+with `NX PX`. Store lock value `owner:fencing_token`. Renew and release compare
+that full value before `PEXPIRE` or `DEL`.
 
 The acquire script's behavior is:
 
 ```lua
+if redis.call('EXISTS', KEYS[4]) == 1 then return {'COMMIT_RECOVERY_REQUIRED'} end
+local current = redis.call('GET', KEYS[3])
+if not current then
+  redis.call('SET', KEYS[3], ARGV[2])
+elseif tonumber(current) ~= tonumber(ARGV[2]) then
+  return {'COORDINATION_REVISION_MISMATCH'}
+end
 local fence = redis.call('INCR', KEYS[2])
 local value = ARGV[1] .. ':' .. fence
-local acquired = redis.call('SET', KEYS[1], value, 'NX', 'PX', ARGV[2])
-if acquired then return {value, fence} end
+local acquired = redis.call('SET', KEYS[1], value, 'NX', 'PX', ARGV[3])
+if acquired then return {value, fence, ARGV[2]} end
 return nil
 ```
+
+`authorize_commit` receives a `GraphCommit` whose `permit_id` is already a
+caller-generated `cpr_<uuid4 hex>`. One Lua operation checks the exact lock value,
+checks both `lease.base_revision` and `confirmed-revision` equal
+`commit.revision - 1`, and writes canonical commit JSON plus its SHA-256 as a
+`COMMITTING` reservation using `SET NX` without expiry. If an existing reservation
+has the same canonical JSON and SHA-256, return its original permit; otherwise
+return `COMMIT_RECOVERY_REQUIRED`. Once returned, the permit remains valid after
+lease expiry and the reserved commit may not be aborted or replaced.
+
+`confirm_commit` runs only after the repository has read back the logical Airtable
+commit. One Lua operation requires the exact reservation JSON, permit fields, and
+commit SHA-256; sets `confirmed-revision` to `commit.revision`; stores a
+`last-confirmed` receipt for idempotent retries; and deletes the active reservation.
+An identical confirmation retry succeeds from `last-confirmed`. A mismatch fails
+closed. `get_reservation` is read-only and returns the canonical reserved commit for
+recovery.
 
 - [ ] **Step 4: Implement revocation and rate-limit stores**
 
@@ -666,7 +874,7 @@ git commit -m "feat: coordinate Shajra serverless mutations"
 - Create: `backend/tests/unit/services/test_relationships.py`
 
 **Interfaces:**
-- Consumes: graph core, repositories, audit, and lease manager.
+- Consumes: graph core, repositories, audit, and `CommitCoordinator`.
 - Produces: `RelationshipService.preview`, `execute`, and `compensate`.
 
 ```python
@@ -704,12 +912,19 @@ class MutationResult:
 
 Cover preview with no writes, successful commit, stale revision `409`, duplicate
 idempotency replay, invalid graph no writes, lock unavailable `503`, stage failure,
-commit failure, missing/changed/expired preview digest, expired lease, and
-compensation as a new operation. Add scenarios proving a repeated canonical adult
+missing/changed/expired preview digest, and compensation as a new operation. Cover
+lease expiry before authorization, authorization failure, commit response loss,
+lease expiry after authorization, confirmation failure, and audit failure after
+authorization. Every pre-authorization failure must leave no visible commit and
+may become `FAILED`; every post-authorization failure must remain `COMMITTING` and
+must complete through retry/recovery. Add scenarios proving a repeated canonical adult
 pair is rejected for divorced, widowed, separated, ended, and unknown-status
 units unless every current unit is explicitly confirmed; dates/status cannot
 confirm it. Cover unresolved add/same-ID supersede/remove through preview, commit,
-reload, checksum, and compensation.
+reload, checksum, and compensation. Cover compensation of newly added people,
+family units, parent-child links, and unresolved annotations; exact restoration of
+prior entity values; and `409 COMPENSATION_CONFLICT` after any later change to a
+touched logical ID.
 
 The idempotency assertion is:
 
@@ -731,31 +946,54 @@ expired previews, and compares a fresh value in constant time before staging.
 
 - [ ] **Step 3: Implement execute in this exact order**
 
-1. Resolve an existing idempotency result.
-2. Acquire the graph lease and fencing token.
+1. Resolve an existing idempotency result. Return `COMMITTED`; resume the exact
+   reservation for `COMMITTING`; reject a different payload under the same key.
+2. Acquire the graph lease with `committed_revision=request.expected_revision`.
 3. Reload committed state under the lease.
 4. Reject stale `expected_revision`.
 5. Apply commands and reject blocking validation issues.
-6. Create pending audit state.
-7. Stage complete version rows for `revision + 1`.
-8. Verify staged rows and lease ownership.
-9. Append `GraphCommits` with semantic checksum.
-10. Best-effort update `GraphState` cache.
-11. Append committed audit transition and release the lease.
+6. Diff complete before/after snapshots into a forward `GraphWriteSet` and the
+   typed inverse `GraphWriteSet` described below.
+7. Create `PENDING` audit state with commands, before/after snapshots, and canonical
+   `InverseWriteSetJson`.
+8. Stage the forward write set for `revision + 1` using the lease fencing token.
+9. Verify the exact staged rows and assert lease ownership.
+10. Generate one `cpr_<uuid4 hex>` permit ID and freeze a `GraphCommit` containing
+    it, the proposed revision, operation ID, fencing token, checksum, and timestamp.
+11. Call `CommitCoordinator.authorize_commit(lease, commit)`. On success, the
+    operation is irrevocably commit-bound; append a `COMMITTING` audit transition.
+12. Call `GraphRepository.append_commit(commit, permit)`. Its read-back confirms
+    the logical Airtable commit and its best-effort `GraphState` update.
+13. Call `CommitCoordinator.confirm_commit(permit, commit)` to advance coordination
+    revision and clear the reservation.
+14. Append the `COMMITTED` audit transition and release the lease if still owned.
 
 Persist `source_reference` in the audit operation. The API permits `None` or a
 validated `rev_` review ID; graph-domain commands remain independent of submission
 types.
 
-If failure occurs before commit, append failed audit state and leave uncommitted
-versions invisible. If failure occurs after commit, return the committed result
-derived from `GraphCommits`; never delete committed rows.
+If failure occurs before `authorize_commit`, append `FAILED` audit state when
+possible and leave staged versions invisible. If failure occurs after authorization,
+never append `FAILED` and never issue a replacement permit: continue the exact
+reserved append/confirm sequence or return `503 COMMIT_RECOVERY_REQUIRED` for the
+recovery path. A matching logical `GraphCommit` is success even if Airtable created
+identical physical duplicates. Never delete committed rows.
 
 - [ ] **Step 4: Implement compensation**
 
-Generate inverse commands from the committed audit snapshot, then execute them as
-a new revision with a new operation ID. Reject compensation when later revisions
-depend on the target unless the preview explicitly includes their reassignment.
+Build the target operation's inverse write set from before-images when executing
+the original operation: a prior value becomes an inverse upsert, while an entity
+that did not previously exist becomes an inverse tombstone. A forward tombstone's
+inverse is its exact prior value. Store this typed value as canonical
+`InverseWriteSetJson`; do not add graph-core remove commands.
+
+`compensate` requires `expected_revision`, `Idempotency-Key`, actor, and request ID.
+Load the current committed snapshot and require every logical ID touched by the
+target operation to equal that operation's stored after-image. Return
+`409 COMPENSATION_CONFLICT` on any mismatch. Otherwise overlay the inverse write
+set, validate the complete proposed snapshot, compute its checksum and the inverse
+of this compensation, then execute the same stage, authorize, append, and confirm
+pipeline as a new operation and revision.
 
 - [ ] **Step 5: Run and commit**
 
@@ -833,6 +1071,17 @@ for every nested DTO below, including `versionRevision`, `createdRevision`, and
 `distinctUnionConfirmed`. Validate that adding `Email`, `PhoneNumber`,
 `SourceRecordId`, `headOperationId`, `fencingToken`, or any unknown field at any
 level fails schema validation.
+
+In `test_admin_graph.py`, assert the graph precondition matrix exactly:
+
+- `POST /api/admin/v2/graph/preview`,
+  `POST /api/admin/v2/graph/mutations`, and
+  `POST /api/admin/v2/operations/{operation_id}/compensate` require
+  `Idempotency-Key` and integer `If-Match`;
+- a missing header is `400`, malformed `If-Match` is `400`, and a stale graph
+  revision is `409`;
+- compensation forwards both headers to `RelationshipService.compensate`; and
+- login, reads, health, and operation-list routes require neither header.
 
 ```python
 assert set(public_body["issues"][0]) == {
@@ -1002,7 +1251,9 @@ GET  /api/admin/v2/operations
 POST /api/admin/v2/operations/{operation_id}/compensate
 ```
 
-Mutation routes require `Idempotency-Key` and integer `If-Match`. Return RFC 9457
+The three graph proposal/mutation routes named above require `Idempotency-Key` and
+integer `If-Match`; the router builds `expected_revision` and `idempotency_key`
+from those headers rather than trusting duplicate body fields. Return RFC 9457
 problem JSON with stable codes. `POST /api/admin/heal` returns `410`.
 
 - [ ] **Step 5: Reduce `main.py` to application composition**
@@ -1080,7 +1331,9 @@ responses expose the submission ID and status only, never contact fields.
 Assert a valid submission is persisted before AI is called; AI timeout still
 returns an accepted submission ID; AI candidate IDs remain suggestions; invalid
 dates/contact fields make no write; duplicate idempotency key returns the original
-submission.
+submission. Assert submission creation and media-upload attempts reject a missing
+`Idempotency-Key`, accept requests without graph `If-Match`, and reject reuse of a
+key with a different canonical request body.
 
 - [ ] **Step 2: Implement normalized submission schemas**
 
@@ -1091,6 +1344,11 @@ Accept explicit candidate `PersonId` plus separate unresolved text for father,
 mother, and partners. Validate supported partial dates, alive/deceased consistency,
 email, E.164-like phone shape, biography length, and 5 MiB media limit. Return
 `202 Accepted` after the raw pending record is durable.
+
+Public submission creation and upload attempts require `Idempotency-Key` and do
+not require graph `If-Match`. Their repositories store a canonical request digest
+with the key so an identical retry returns the original result and a different
+payload under the same key returns `409 IDEMPOTENCY_CONFLICT`.
 
 AI enrichment runs only from an authenticated admin action. It receives public
 candidate context, returns ranked suggestions with confidence, and cannot approve
@@ -1129,7 +1387,11 @@ time signatures, and replayed keys.
 
 Move these routes to `content.py`, validate application IDs and lengths, apply
 public-field allowlists and rate limits, and remove Airtable IDs from responses.
-Writes remain behind `PUBLIC_WRITES_ENABLED` until rollout.
+Create routes for comments, stories, albums, and email-verification attempts
+require `Idempotency-Key` but not graph `If-Match`. A route that transitions an
+existing non-graph resource must enforce the expected state/version declared by
+that route's request schema. Writes remain behind `PUBLIC_WRITES_ENABLED` until
+rollout.
 
 - [ ] **Step 7: Run and commit**
 
@@ -1156,7 +1418,8 @@ git commit -m "feat: harden Shajra submissions and media"
 - Delete after route cutover: `backend/ai_service.py`
 
 **Interfaces:**
-- Consumes: raw submissions, committed graph snapshots, append-only repository patterns, Upstash leases, and authenticated admin dependencies.
+- Consumes: raw submissions, committed graph snapshots, append-only repository
+  patterns, Task 4 `LeaseManager`, and authenticated admin dependencies.
 - Produces: immutable enrichment attempts and field-level review decisions; it exposes no graph-write dependency.
 
 Use these contracts in `models.py` and `provider.py`:
@@ -1342,7 +1605,11 @@ POST /api/admin/v2/submissions/{submission_id}/reviews
 Assert authentication, feature flag, rate limit, `Idempotency-Key`, status filter,
 sanitized failure response, field-level decisions, unknown candidate rejection,
 and that review returns `{ reviewId, mutationDraft }` without invoking preview or
-commit. Assert such a review is `READY_TO_APPLY`, not `RESOLVED`.
+commit. Assert such a review is `READY_TO_APPLY`, not `RESOLVED`. For both
+enrichment-attempt and review-create POST routes, assert missing
+`Idempotency-Key` is rejected, graph `If-Match` is not required, an identical retry
+returns the original attempt/review, and a changed payload under the same key
+returns `409 IDEMPOTENCY_CONFLICT`.
 
 - [ ] **Step 9: Implement admin enrichment routes and remove the legacy pipeline**
 
@@ -1359,6 +1626,11 @@ If that append fails, queue reads derive resolution from committed
 mutation. Delete the old broad-context prompt and
 automatic `AIMatched*Id` approval flow with `backend/ai_service.py`. Legacy pending
 rows remain readable but cannot auto-populate normalized links.
+
+The enrichment-attempt and review-create routes persist a canonical request digest
+with `Idempotency-Key` and do not consume graph `If-Match`. Applying the returned
+`mutationDraft` is a separate call to the Task 6 graph mutation route and requires
+both graph headers there.
 
 - [ ] **Step 10: Run and commit**
 
@@ -1502,9 +1774,13 @@ Render, plan, plan-check, provision, and preflight all consume the same immutabl
 Production `migrate` refuses to run without `--apply`, the exact SHA-256 of the
 reviewed plan file, a verified restore-drill receipt, and all blocking ambiguities
 resolved or explicitly retained as unresolved in that reviewed plan. Recovery
-requires the operator to select an exact `operationId` from `audit.json`, then run
+requires the operator to select the exact `operationId` from the active Upstash
+`COMMITTING` reservation and its matching entry in `audit.json`, then run
 `python -m ops.cli recover-operation --operation-id $operationId --target production --apply`;
-the CLI rejects empty values and IDs outside the `op_` namespace.
+the CLI rejects empty values, IDs outside the `op_` namespace, an operation ID that
+does not match the active reservation, and any attempt to run without
+`--allow-production` for production. Implementation and local tests never execute
+this production command.
 
 - [ ] **Step 6: Implement migration semantics**
 
@@ -1516,14 +1792,38 @@ source-field/ordinal slot (`FatherName#0`, `MotherName#0`, or
 `SpouseName#0`), and assert one row containing all three scalar fields yields
 three distinct IDs that are unchanged on rerun. Do not split the scalar spouse
 cell. Produce expected row counts and semantic checksum before any apply. Batch
-Airtable writes and retry `429` with bounded backoff.
+Airtable writes and retry `429` with bounded backoff. Restore and migration graph
+writes use the same Task 5 sequence: acquire, stage, verify, authorize the exact
+commit, append/read back, and confirm. They never append `GraphCommits` without a
+`CommitPermit`.
 
 - [ ] **Step 7: Implement verification and recovery**
 
 Verification reloads the committed staging graph, checks exact ID sets, counts,
-all invariants, and checksum. Recovery inspects pending/failed operations and
-either appends the missing commit after full verification or marks them failed;
-it never deletes committed revisions.
+all invariants, and checksum.
+
+`recover-operation` reads the immutable reservation from `CommitCoordinator` and
+accepts only its exact operation ID. If the matching logical `GraphCommit` already
+exists, verify its canonical fields and checksum and call `confirm_commit`. If it
+does not exist, verify the complete staged row set against the reservation,
+materialize and validate the proposed snapshot, verify its semantic checksum, call
+`append_commit(reservation.commit, reservation.permit)`, read it back, and confirm
+it. Lease expiry does not affect this path. A `COMMITTING` reservation is never
+aborted, replaced, or marked `FAILED`.
+
+If staged rows, canonical commit fields, permit fields, or checksum conflict,
+report stable corruption details and perform no further mutation. Upstash outage
+fails closed. When no reservation exists, operator recovery may reconcile an idle
+coordination revision to the highest contiguous, non-conflicting Airtable commit;
+it may mark only pre-authorization `PENDING` operations failed. Recovery never
+deletes committed revisions.
+
+In `test_recovery.py`, cover an authorization-response retry, lease expiry before
+append, an existing identical logical commit, identical physical commit duplicates,
+append-response loss, confirmation-response loss, a conflicting duplicate commit,
+staged-row checksum mismatch, wrong operation ID, and Upstash outage. Assert every
+authorized case either reaches the exact reserved commit or remains blocked for
+recovery, never `FAILED`.
 
 - [ ] **Step 8: Run CLI tests and commit**
 
@@ -1557,8 +1857,13 @@ that fails if the base ID equals production's configured base ID.
 - [ ] **Step 2: Test real provider contracts only in staging**
 
 Create and commit one synthetic graph revision under a run-specific namespace,
-verify it, exercise lease acquire/renew/release and rate limits, then archive the
-synthetic staging records. Tests never use family names or production snapshots.
+verify it, and exercise lease acquire/renew, commit authorization, Airtable append
+and read-back, confirmation, release, and rate limits. Stage a second synthetic
+operation at the same revision before committing the selected operation and prove
+the unselected rows remain invisible. Exercise an exact authorization retry and
+an exact confirmation retry. Then append semantic archive/tombstone versions for
+the synthetic staging entities through another authorized revision. Tests never
+use family names or production snapshots.
 
 The Groq contract test is additionally skipped unless
 `RUN_AI_PROVIDER_TEST=true`, `GROQ_API_KEY`, and `GROQ_MODEL` are set. Send only the
@@ -1604,8 +1909,10 @@ git commit -m "test: gate Shajra normalized backend"
 
 ## Completion Gate
 
-This plan is complete only when append-only visibility, lease fencing, idempotency,
-authentication, public allowlists, submission safety, review-only AI enrichment,
-and migration behavior pass locally; staging tests remain opt-in; no production
-or cloud state has changed; and the worktree is clean. Continue with
+This plan is complete only when operation-bound append-only visibility, immutable
+commit authorization, crash recovery, exact inverse-write-set compensation,
+idempotency, graph preconditions, authentication, public allowlists, submission
+safety, review-only AI enrichment, and migration behavior pass locally; staging
+tests remain opt-in; no production or cloud state has changed; and the worktree is
+clean. Continue with
 `2026-08-03-shajra-frontend-graph-and-forms.md`.
