@@ -113,6 +113,29 @@ class GraphState:
     semantic_checksum: str
 
 
+def _require_matching_key(collection: str, key: str, entity_id: str) -> None:
+    if key != entity_id:
+        raise ValueError(f"{collection} map key does not match embedded stable ID")
+
+
+def _validate_mapping_keys(
+    people: Mapping[PersonId, Person],
+    family_units: Mapping[FamilyUnitId, FamilyUnit],
+    links: Mapping[LinkId, ParentChildLink],
+    unresolved: Mapping[UnresolvedRelationshipId, UnresolvedRelationship],
+) -> None:
+    for person_id, person in people.items():
+        _require_matching_key("people", person_id, person.person_id)
+    for family_unit_id, family_unit in family_units.items():
+        _require_matching_key(
+            "family_units", family_unit_id, family_unit.family_unit_id
+        )
+    for link_id, link in links.items():
+        _require_matching_key("links", link_id, link.link_id)
+    for unresolved_id, annotation in unresolved.items():
+        _require_matching_key("unresolved", unresolved_id, annotation.unresolved_id)
+
+
 @dataclass(frozen=True, slots=True)
 class GraphSnapshot:
     state: GraphState
@@ -122,6 +145,12 @@ class GraphSnapshot:
     unresolved: Mapping[UnresolvedRelationshipId, UnresolvedRelationship]
 
     def __post_init__(self) -> None:
+        _validate_mapping_keys(
+            self.people,
+            self.family_units,
+            self.links,
+            self.unresolved,
+        )
         object.__setattr__(self, "people", MappingProxyType(dict(self.people)))
         object.__setattr__(
             self, "family_units", MappingProxyType(dict(self.family_units))

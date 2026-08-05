@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 
 from domain.dates import DatePrecision, PartialDate
@@ -23,6 +25,21 @@ def test_rejects_invalid_calendar_date():
 def test_rejects_unsupported_date_format():
     with pytest.raises(ValueError, match="Date must be YYYY, YYYY-MM, or YYYY-MM-DD"):
         PartialDate.parse("1960/04")
+
+
+@pytest.mark.parametrize(
+    ("precision", "earliest", "latest"),
+    [
+        (DatePrecision.DAY, date(1960, 1, 1), date(1960, 12, 31)),
+        (DatePrecision.YEAR, date(1959, 1, 1), date(1960, 12, 31)),
+        (DatePrecision.YEAR, date(1960, 1, 1), date(1960, 1, 1)),
+    ],
+)
+def test_direct_construction_rejects_noncanonical_partial_date_fields(
+    precision, earliest, latest
+):
+    with pytest.raises(ValueError, match="PartialDate fields must match value"):
+        PartialDate("1960", precision, earliest, latest)
 
 
 def test_precision_aware_ordering_uses_possible_ranges():

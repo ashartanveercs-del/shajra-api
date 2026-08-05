@@ -1,9 +1,10 @@
 from dataclasses import replace
+from datetime import date
 
 import pytest
 
 from domain.checksum import semantic_checksum
-from domain.dates import PartialDate
+from domain.dates import DatePrecision, PartialDate
 from domain.ids import (
     FamilyUnitId,
     LinkId,
@@ -197,7 +198,7 @@ def test_checksum_is_independent_of_two_adult_family_slot_order():
 @pytest.mark.parametrize(
     "collection", ["people", "family_units", "links", "unresolved"]
 )
-def test_checksum_rejects_mapping_key_mismatched_with_embedded_stable_id(collection):
+def test_snapshot_rejects_mapping_key_mismatched_with_embedded_stable_id(collection):
     snapshot = _snapshot()
     people = dict(snapshot.people)
     family_units = dict(snapshot.family_units)
@@ -217,16 +218,38 @@ def test_checksum_rejects_mapping_key_mismatched_with_embedded_stable_id(collect
         _, annotation = unresolved.popitem()
         unresolved[UnresolvedRelationshipId("unr_mismatched_key")] = annotation
 
-    malformed = GraphSnapshot(
-        snapshot.state,
-        people,
-        family_units,
-        links,
-        unresolved,
-    )
-
     with pytest.raises(ValueError, match=f"{collection} map key does not match"):
-        semantic_checksum(malformed)
+        GraphSnapshot(
+            snapshot.state,
+            people,
+            family_units,
+            links,
+            unresolved,
+        )
+
+
+def test_snapshot_cannot_contain_a_noncanonical_direct_partial_date():
+    person_id = PersonId("per_noncanonical_date")
+
+    with pytest.raises(ValueError, match="PartialDate fields must match value"):
+        GraphSnapshot(
+            GraphState(0, None, 0, ""),
+            {
+                person_id: Person(
+                    person_id,
+                    "Noncanonical Date",
+                    birth=PartialDate(
+                        "2000",
+                        DatePrecision.YEAR,
+                        date(2000, 1, 1),
+                        date(2000, 1, 1),
+                    ),
+                )
+            },
+            {},
+            {},
+            {},
+        )
 
 
 def test_checksum_rejects_non_snapshot_input():

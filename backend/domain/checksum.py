@@ -10,6 +10,7 @@ from domain.models import (
     ParentChildLink,
     Person,
     UnresolvedRelationship,
+    _validate_mapping_keys,
 )
 
 
@@ -26,6 +27,12 @@ def sha256_json(value: object) -> str:
 def semantic_checksum(snapshot: GraphSnapshot) -> str:
     if not isinstance(snapshot, GraphSnapshot):
         raise TypeError("semantic_checksum requires a GraphSnapshot")
+    _validate_mapping_keys(
+        snapshot.people,
+        snapshot.family_units,
+        snapshot.links,
+        snapshot.unresolved,
+    )
 
     return sha256_json(
         {
@@ -46,7 +53,6 @@ def _partial_date_value(value: PartialDate | None) -> dict[str, str] | None:
 def _people_value(people: Mapping[PersonId, Person]) -> dict[str, object]:
     value: dict[str, object] = {}
     for person_id, person in sorted(people.items(), key=lambda item: str(item[0])):
-        _require_matching_key("people", person_id, person.person_id)
         value[str(person_id)] = {
             "person_id": str(person.person_id),
             "full_name": person.full_name,
@@ -71,9 +77,6 @@ def _family_units_value(
     for family_unit_id, family_unit in sorted(
         family_units.items(), key=lambda item: str(item[0])
     ):
-        _require_matching_key(
-            "family_units", family_unit_id, family_unit.family_unit_id
-        )
         value[str(family_unit_id)] = {
             "family_unit_id": str(family_unit.family_unit_id),
             "kind": family_unit.kind.value,
@@ -89,7 +92,6 @@ def _family_units_value(
 def _links_value(links: Mapping[LinkId, ParentChildLink]) -> dict[str, object]:
     value: dict[str, object] = {}
     for link_id, link in sorted(links.items(), key=lambda item: str(item[0])):
-        _require_matching_key("links", link_id, link.link_id)
         value[str(link_id)] = {
             "link_id": str(link.link_id),
             "parent_id": str(link.parent_id),
@@ -110,7 +112,6 @@ def _unresolved_value(
     for unresolved_id, annotation in sorted(
         unresolved.items(), key=lambda item: str(item[0])
     ):
-        _require_matching_key("unresolved", unresolved_id, annotation.unresolved_id)
         value[str(unresolved_id)] = {
             "unresolved_id": str(annotation.unresolved_id),
             "subject_person_id": str(annotation.subject_person_id),
@@ -125,8 +126,3 @@ def _family_adult_ids(family_unit: FamilyUnit) -> list[str]:
     if family_unit.adult_b_id is not None:
         adult_ids.append(str(family_unit.adult_b_id))
     return sorted(adult_ids)
-
-
-def _require_matching_key(collection: str, key: str, entity_id: str) -> None:
-    if key != entity_id:
-        raise ValueError(f"{collection} map key does not match embedded stable ID")
