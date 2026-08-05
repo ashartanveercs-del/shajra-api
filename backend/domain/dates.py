@@ -34,6 +34,8 @@ class PartialDate:
 
     def __post_init__(self) -> None:
         precision, earliest, latest = _canonical_parts(self.value)
+        if not isinstance(self.precision, DatePrecision):
+            raise ValueError("PartialDate precision must be a DatePrecision")
         if (self.precision, self.earliest, self.latest) != (
             precision,
             earliest,
