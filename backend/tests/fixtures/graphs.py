@@ -420,3 +420,88 @@ def deterministic_projection_snapshot() -> GraphSnapshot:
             unresolved_b.unresolved_id: unresolved_b,
         },
     )
+
+
+def canonical_pedigree_collapse_snapshot() -> GraphSnapshot:
+    ancestor = PersonId("per_canonical_ancestor")
+    path_a = PersonId("per_canonical_path_a")
+    path_b = PersonId("per_canonical_path_b")
+    descendant = PersonId("per_canonical_descendant")
+    family_a = FamilyUnitId("fam_canonical_path_a")
+    family_b = FamilyUnitId("fam_canonical_path_b")
+    descendant_family = FamilyUnitId("fam_canonical_descendant")
+    links = (
+        _link("lnk_canonical_ancestor_a", ancestor, path_a, family_a),
+        _link("lnk_canonical_ancestor_b", ancestor, path_b, family_b),
+        _link("lnk_canonical_path_a", path_a, descendant, descendant_family),
+        _link("lnk_canonical_path_b", path_b, descendant, descendant_family),
+    )
+    return GraphSnapshot(
+        _state(),
+        {
+            ancestor: Person(ancestor, "Canonical Ancestor"),
+            path_a: Person(path_a, "Canonical Path A", primary_family_unit_id=family_a),
+            path_b: Person(path_b, "Canonical Path B", primary_family_unit_id=family_b),
+            descendant: Person(
+                descendant,
+                "Canonical Descendant",
+                primary_family_unit_id=descendant_family,
+            ),
+        },
+        {
+            family_a: FamilyUnit(
+                family_a,
+                FamilyUnitKind.SINGLE_PARENT,
+                ancestor,
+                distinct_union_confirmed=True,
+            ),
+            family_b: FamilyUnit(
+                family_b,
+                FamilyUnitKind.SINGLE_PARENT,
+                ancestor,
+                distinct_union_confirmed=True,
+            ),
+            descendant_family: FamilyUnit(
+                descendant_family,
+                FamilyUnitKind.UNION,
+                path_a,
+                path_b,
+            ),
+        },
+        {link.link_id: link for link in links},
+        {},
+    )
+
+
+def archived_reference_candidates_snapshot() -> GraphSnapshot:
+    snapshot = archived_two_parent_snapshot()
+    retained_adult = PersonId("per_retained_adult")
+    retained_relative = PersonId("per_retained_relative")
+    cross_family = _link(
+        "lnk_archived_cross_family",
+        retained_adult,
+        retained_relative,
+        FAMILY,
+    )
+    guardian = ParentChildLink(
+        LinkId("lnk_archived_guardian"),
+        PARENT,
+        retained_relative,
+        ParentRole.PARENT,
+        RelationshipType.GUARDIAN,
+        None,
+    )
+    return GraphSnapshot(
+        snapshot.state,
+        {
+            **snapshot.people,
+            retained_relative: Person(retained_relative, "Retained Relative"),
+        },
+        snapshot.family_units,
+        {
+            **snapshot.links,
+            cross_family.link_id: cross_family,
+            guardian.link_id: guardian,
+        },
+        snapshot.unresolved,
+    )

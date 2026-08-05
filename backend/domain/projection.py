@@ -340,24 +340,28 @@ def _descendant_edges(
 def _relationship_references(
     links: tuple[ProjectedLink, ...],
 ) -> tuple[RelationshipReference, ...]:
-    candidates = tuple(
-        link
-        for link in links
-        if not link.primary and link.relationship_type in _ANCESTRY_TYPES
+    ancestry_links = tuple(
+        link for link in links if link.relationship_type in _ANCESTRY_TYPES
     )
     adjacency: dict[PersonId, list[ProjectedLink]] = defaultdict(list)
-    incoming: set[PersonId] = set()
-    for link in candidates:
-        adjacency[link.parent_id].append(link)
-        incoming.add(link.child_id)
+    parent_ids: set[PersonId] = set()
+    for link in ancestry_links:
+        adjacency[link.child_id].append(link)
+        parent_ids.add(link.parent_id)
     for outgoing in adjacency.values():
-        outgoing.sort(key=lambda link: link.link_id)
+        outgoing.sort(key=lambda link: (link.parent_id, link.link_id))
 
-    labels: dict[LinkId, ReferenceLabel] = {}
+    references = [
+        _relationship_reference(link, "non_primary")
+        for link in links
+        if link.relationship_type is RelationshipType.GUARDIAN
+    ]
     expanded: set[PersonId] = set()
+    primary_family_sources: dict[FamilyUnitId, PersonId] = {}
     starts = sorted(
-        {link.parent_id for link in candidates} | {link.child_id for link in candidates},
-        key=lambda person_id: (person_id in incoming, person_id),
+        {link.parent_id for link in ancestry_links}
+        | {link.child_id for link in ancestry_links},
+        key=lambda person_id: (person_id in parent_ids, person_id),
     )
     for start_id in starts:
         if start_id in expanded:
@@ -372,34 +376,47 @@ def _relationship_references(
                 continue
             link = outgoing[link_index]
             frames[-1] = (person_id, link_index + 1)
-            if link.family_unit_id is not None:
-                labels[link.link_id] = "cross_family"
-            elif link.child_id in expanded:
-                labels[link.link_id] = "repeated_ancestor"
-            else:
-                labels[link.link_id] = "non_primary"
-            if link.child_id not in expanded:
-                expanded.add(link.child_id)
-                frames.append((link.child_id, 0))
+            if link.primary and link.family_unit_id is not None:
+                source_id = primary_family_sources.setdefault(
+                    link.family_unit_id, link.child_id
+                )
+                if source_id != link.child_id:
+                    continue
+            if not link.primary:
+                label: ReferenceLabel = (
+                    "cross_family"
+                    if link.family_unit_id is not None
+                    else "non_primary"
+                )
+                references.append(_relationship_reference(link, label))
+            elif link.parent_id in expanded:
+                references.append(
+                    _relationship_reference(link, "repeated_ancestor")
+                )
+            if link.parent_id not in expanded:
+                expanded.add(link.parent_id)
+                frames.append((link.parent_id, 0))
 
-    references = [
-        RelationshipReference(
-            _reference_id(link, labels[link.link_id]),
-            link.parent_id,
-            link.child_id,
-            link.family_unit_id,
-            link.relationship_type,
-            labels[link.link_id],
-        )
-        for link in candidates
-    ]
     return tuple(sorted(references, key=lambda reference: reference.reference_id))
+
+
+def _relationship_reference(
+    link: ProjectedLink, label: ReferenceLabel
+) -> RelationshipReference:
+    return RelationshipReference(
+        _reference_id(link, label),
+        link.child_id,
+        link.parent_id,
+        link.family_unit_id,
+        link.relationship_type,
+        label,
+    )
 
 
 def _reference_id(link: ProjectedLink, label: ReferenceLabel) -> str:
     value = [
-        link.parent_id,
         link.child_id,
+        link.parent_id,
         link.family_unit_id or "",
         link.relationship_type,
         label,
@@ -448,35 +465,32 @@ def _components(
     people_by_root: dict[PersonId, list[PersonId]] = defaultdict(list)
     for person_id in sorted(parents):
         people_by_root[find(person_id)].append(person_id)
-    family_root = {
-        family.family_unit_id: find(family.adult_a_id) for family in families
-    }
+    family_roots: dict[FamilyUnitId, PersonId] = {}
+    families_by_root: dict[PersonId, list[FamilyUnitId]] = defaultdict(list)
+    for family in families:
+        root_id = find(family.adult_a_id)
+        family_roots[family.family_unit_id] = root_id
+        families_by_root[root_id].append(family.family_unit_id)
+
+    links_by_root: dict[PersonId, list[LinkId]] = defaultdict(list)
+    for link in links:
+        root_id = find(link.parent_id)
+        if find(link.child_id) != root_id:
+            continue
+        if (
+            link.family_unit_id is not None
+            and family_roots.get(link.family_unit_id) != root_id
+        ):
+            continue
+        links_by_root[root_id].append(link.link_id)
+
     placed_children = {edge.child_id for edge in descendants}
 
     components: list[GraphComponent] = []
     for root_id, component_people in people_by_root.items():
         person_ids = tuple(sorted(component_people))
-        person_id_set = set(person_ids)
-        family_ids = tuple(
-            sorted(
-                family_id
-                for family_id, component_root in family_root.items()
-                if component_root == root_id
-            )
-        )
-        family_id_set = set(family_ids)
-        component_link_ids = tuple(
-            sorted(
-                link.link_id
-                for link in links
-                if link.parent_id in person_id_set
-                and link.child_id in person_id_set
-                and (
-                    link.family_unit_id is None
-                    or link.family_unit_id in family_id_set
-                )
-            )
-        )
+        family_ids = tuple(sorted(families_by_root.get(root_id, ())))
+        component_link_ids = tuple(sorted(links_by_root.get(root_id, ())))
         roots = tuple(
             person_id for person_id in person_ids if person_id not in placed_children
         )

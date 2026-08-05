@@ -28,6 +28,7 @@ from domain.projection import (
     PublicGraphIssue,
     RelationshipReference,
     TreeProjection,
+    _components,
     project_graph,
 )
 from domain.validation import validate_snapshot
@@ -37,6 +38,8 @@ from tests.fixtures.graphs import (
     PARENT,
     adoptive_cycle_snapshot,
     archived_two_parent_snapshot,
+    archived_reference_candidates_snapshot,
+    canonical_pedigree_collapse_snapshot,
     cousin_union_snapshot,
     deterministic_projection_snapshot,
     disconnected_components_snapshot,
@@ -298,7 +301,7 @@ def test_cousin_union_keeps_partner_unit_without_promoting_raw_ancestry_links():
     }
 
 
-def test_repeated_ancestor_is_primary_once_and_later_path_is_a_stable_reference():
+def test_familyless_repeated_ancestor_paths_remain_child_to_parent_non_primary_references():
     projection = project_graph(repeated_ancestor_snapshot())
     primary_ids = [person.person_id for person in projection.people]
     assert len(primary_ids) == len(set(primary_ids))
@@ -306,19 +309,71 @@ def test_repeated_ancestor_is_primary_once_and_later_path_is_a_stable_reference(
     assert projection.references[0].target_person_id in set(primary_ids)
 
     assert set(_ids(projection.references, "reference_id")) == {
-        "ref_143fb2fb8c81e9d39cfdc4c928e41ef962f362a56317dd1b9ddf962e21715507",
-        "ref_1a17063d1a3ff42a7d26d3afc14e73bdcf8fb17dff3d1696c004c1e30e01580b",
-        "ref_1a40defa7f6f76338215250b4e4e63da380d4e86cdf42feccdf26d3a2c6f9bbb",
-        "ref_808f25afd18359d67a3c43b40e994871997ac183e5231af8e023f72f0dae8a9e",
+        "ref_0175897ff47fc1771c6964abb73eb88f8b1284621dcff8e2d19d9116a28d9c08",
+        "ref_01ecb8eaaaf46982c5e2a23d0e4a6e52c2993d494e9ed7ba898fb44db4ef9612",
+        "ref_1ec9ddb88af799ec3c3bcddb82b6f8b3604263f75abf47bb5e81455e69beb3e7",
+        "ref_541df4274b3cb385ec39efb05d120dfd4577c749ebcd7602254e850e9e6a234a",
     }
-    repeated = [
-        reference
+    assert {reference.label for reference in projection.references} == {"non_primary"}
+    assert {
+        (reference.source_person_id, reference.target_person_id)
         for reference in projection.references
-        if reference.label == "repeated_ancestor"
-    ]
-    assert [(reference.source_person_id, reference.target_person_id) for reference in repeated] == [
-        (PersonId("per_path_b"), PersonId("per_descendant"))
-    ]
+    } == {
+        (PersonId("per_descendant"), PersonId("per_path_a")),
+        (PersonId("per_descendant"), PersonId("per_path_b")),
+        (PersonId("per_path_a"), PersonId("per_ancestor")),
+        (PersonId("per_path_b"), PersonId("per_ancestor")),
+    }
+
+
+def test_canonical_primary_pedigree_collapse_references_the_repeated_ancestor():
+    projection = project_graph(canonical_pedigree_collapse_snapshot())
+
+    assert projection.references == (
+        RelationshipReference(
+            "ref_f058b36ec0333aa35a4a1c5bbbc45ca853485c2885eb50a70ae5265f12e7130c",
+            PersonId("per_canonical_path_b"),
+            PersonId("per_canonical_ancestor"),
+            FamilyUnitId("fam_canonical_path_b"),
+            RelationshipType.BIOLOGICAL,
+            "repeated_ancestor",
+        ),
+    )
+    assert projection.components[0].root_person_ids == (
+        PersonId("per_canonical_ancestor"),
+    )
+
+
+def test_siblings_in_one_primary_family_do_not_repeat_the_same_ancestry_path():
+    snapshot = single_parent_family_snapshot()
+    sibling = PersonId("per_single_sibling")
+    sibling_link = LinkId("lnk_single_parent_sibling")
+    with_sibling = GraphSnapshot(
+        snapshot.state,
+        {
+            **snapshot.people,
+            sibling: Person(
+                sibling,
+                "Single Sibling",
+                primary_family_unit_id=FamilyUnitId("fam_single_parent"),
+            ),
+        },
+        snapshot.family_units,
+        {
+            **snapshot.links,
+            sibling_link: ParentChildLink(
+                sibling_link,
+                PersonId("per_single_parent"),
+                sibling,
+                ParentRole.PARENT,
+                RelationshipType.BIOLOGICAL,
+                FamilyUnitId("fam_single_parent"),
+            ),
+        },
+        snapshot.unresolved,
+    )
+
+    assert project_graph(with_sibling).references == ()
 
 
 def test_partner_only_component_has_two_roots_and_no_fake_descendants():
@@ -358,9 +413,9 @@ def test_non_primary_raw_link_becomes_a_full_sha256_reference():
 
     assert projection.references == (
         RelationshipReference(
-            "ref_cc449e4fe49d04949c842d0e2415427ebc6d96b0bb642b55c3b0756514a00bcd",
-            PARENT,
+            "ref_823c82e35ecb3f7285560aeaef7a612cc10ecb215170c1b1ac5d917bbf3d06dc",
             CHILD,
+            PARENT,
             None,
             RelationshipType.BIOLOGICAL,
             "non_primary",
@@ -383,6 +438,13 @@ def test_family_link_outside_primary_placement_is_a_cross_family_reference():
     assert projection.descendant_edges == ()
     assert {reference.label for reference in projection.references} == {
         "cross_family"
+    }
+    assert {reference.source_person_id for reference in projection.references} == {
+        CHILD
+    }
+    assert {reference.target_person_id for reference in projection.references} == {
+        PARENT,
+        PersonId("per_parent_b"),
     }
     assert all(not link.primary for link in projection.parent_child_links)
 
@@ -422,7 +484,16 @@ def test_guardian_link_is_detail_only_even_when_family_matches_primary_placement
 
     assert projection.parent_child_links[0].primary is True
     assert projection.descendant_edges == ()
-    assert projection.references == ()
+    assert projection.references == (
+        RelationshipReference(
+            "ref_e196b02aa02b171d3029947f1e73dfa5e62f2d54359f2605195e0c43f75c9c0b",
+            child,
+            adult,
+            family_id,
+            RelationshipType.GUARDIAN,
+            "non_primary",
+        ),
+    )
     assert any(
         component.root_person_ids == (child,)
         for component in projection.components
@@ -449,6 +520,29 @@ def test_projection_is_deterministic_across_ten_four_map_input_shuffles():
         assert asdict(actual) == expected_dict
         assert _ids(actual.components, "component_id") == expected_component_ids
         assert _ids(actual.references, "reference_id") == expected_reference_ids
+
+
+def test_component_link_ids_are_bucketed_in_one_pass_after_roots_finalize():
+    class CountingLinks(tuple):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    projection = project_graph(disconnected_components_snapshot())
+    links = CountingLinks(projection.parent_child_links)
+
+    components = _components(
+        projection.people,
+        projection.family_units,
+        links,
+        projection.adult_memberships,
+        projection.descendant_edges,
+    )
+
+    assert components == projection.components
+    assert links.iterations == 1
 
 
 def test_projection_carries_the_snapshot_semantic_checksum_without_rehashing():
@@ -591,6 +685,54 @@ def test_archived_family_filter_removes_incident_topology_without_dangling_ids()
         dict(snapshot.links),
         dict(snapshot.unresolved),
     )
+
+
+def test_archived_filter_removes_real_guardian_and_cross_family_references():
+    snapshot = archived_reference_candidates_snapshot()
+    unarchived_people = dict(snapshot.people)
+    unarchived_people[PARENT] = replace(unarchived_people[PARENT], archived=False)
+    unarchived = GraphSnapshot(
+        snapshot.state,
+        unarchived_people,
+        snapshot.family_units,
+        snapshot.links,
+        snapshot.unresolved,
+    )
+
+    candidate_projection = project_graph(unarchived)
+    assert {
+        (
+            reference.label,
+            reference.source_person_id,
+            reference.target_person_id,
+            reference.family_unit_id,
+        )
+        for reference in candidate_projection.references
+    } == {
+        (
+            "cross_family",
+            PersonId("per_retained_relative"),
+            PersonId("per_retained_adult"),
+            FAMILY,
+        ),
+        (
+            "non_primary",
+            PersonId("per_retained_relative"),
+            PARENT,
+            None,
+        ),
+    }
+
+    projection = project_graph(snapshot)
+
+    assert projection.references == ()
+    assert LinkId("lnk_archived_cross_family") not in _ids(
+        projection.parent_child_links, "link_id"
+    )
+    assert LinkId("lnk_archived_guardian") not in _ids(
+        projection.parent_child_links, "link_id"
+    )
+    _assert_all_public_ids_resolve(projection)
 
 
 def test_projection_is_pure_for_a_non_archived_snapshot():
