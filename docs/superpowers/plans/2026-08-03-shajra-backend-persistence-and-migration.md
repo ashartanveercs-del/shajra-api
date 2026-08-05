@@ -108,10 +108,12 @@ field type, or required option is incompatible.
 ```python
 @dataclass(frozen=True, slots=True)
 class CommitPermit:
+    scope: str
     operation_id: OperationId
     revision: int
     fencing_token: int
     permit_id: str
+    commit_sha256: str
 
 
 class GraphRepository(Protocol):
@@ -123,7 +125,7 @@ class GraphRepository(Protocol):
 class AuditRepository(Protocol):
     def find_by_idempotency_key(self, key: str) -> AuditOperation | None: ...
     def create_pending(self, operation: AuditOperation) -> None: ...
-    def transition(self, operation_id: OperationId, state: OperationState) -> None: ...
+    def transition(self, operation_id: OperationId, state: AuditOperationState) -> None: ...
 
 class CommitCoordinator(Protocol):
     def acquire(
@@ -132,7 +134,7 @@ class CommitCoordinator(Protocol):
     def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
     def assert_owned(self, lease: Lease) -> None: ...
     def authorize_commit(self, lease: Lease, commit: GraphCommit) -> CommitPermit: ...
-    def get_reservation(self, scope: str) -> CommitReservation | None: ...
+    def get_status(self, scope: str) -> CommitCoordinatorStatus: ...
     def confirm_commit(self, permit: CommitPermit, commit: GraphCommit) -> None: ...
     def release(self, lease: Lease) -> None: ...
 
@@ -206,7 +208,9 @@ def test_only_committing_operation_is_visible_when_two_stage_same_revision(
 Also prove that a mismatched operation ID or fencing token stays invisible,
 tombstones remove entities of all four kinds, a permit mismatch adds no commit,
 identical logical commit duplicates are idempotent, and conflicting duplicate
-commits fail closed.
+commits fail closed. Add two payload-binding regressions: mutate only
+`semantic_checksum` and only `committed_at` on an otherwise permit-matching commit;
+each call must reject before append and leave `commit_count == 0`.
 
 - [ ] **Step 2: Run the focused test and confirm failure**
 
@@ -254,8 +258,35 @@ Upserts preserve graph-core revision metadata and family units preserve
 stable logical-ID sorting inside each field, sorted object keys, compact
 separators, and ASCII output. `GraphCommit` contains `operation_id`, `revision`,
 `fencing_token`, `permit_id`, `semantic_checksum`, and `committed_at`.
-`CommitPermit` contains exactly `operation_id`, `revision`, `fencing_token`, and
-`permit_id`; permit IDs use `cpr_<uuid4 hex>`.
+`CommitPermit` contains `scope`, `operation_id`, `revision`, `fencing_token`,
+`permit_id`, and `commit_sha256`; permit IDs use `cpr_<uuid4 hex>`. Scope is the
+configured graph coordination namespace and is not an Airtable record ID.
+
+Task 1 defines the single canonical commit serialization used by every later task:
+
+```python
+def canonical_graph_commit_json(commit: GraphCommit) -> str:
+    value = {
+        "operation_id": str(commit.operation_id),
+        "revision": commit.revision,
+        "fencing_token": commit.fencing_token,
+        "permit_id": commit.permit_id,
+        "semantic_checksum": commit.semantic_checksum,
+        "committed_at": commit.committed_at.astimezone(UTC).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z"),
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def graph_commit_sha256(commit: GraphCommit) -> str:
+    return hashlib.sha256(canonical_graph_commit_json(commit).encode("ascii")).hexdigest()
+```
+
+Reject a naive `committed_at` before hashing. The digest covers every canonical
+commit field, including permit ID. `AuditOperation` uses `AuditOperationState` and
+contains `commit_scope`, `graph_commit_json`, and `commit_sha256` from its first
+`PENDING` record onward; the JSON and digest must equal these Task 1 functions.
 
 - [ ] **Step 4: Implement in-memory append-only semantics**
 
@@ -272,10 +303,13 @@ requested revision for each logical ID. A highest authorized tombstone omits the
 entity for all four kinds. Identical physical entity rows are one logical version;
 conflicting payloads under the same identity raise `ENTITY_VERSION_CORRUPTION`.
 
-`append_commit(commit, permit)` requires an exact match of operation ID, revision,
-fencing token, and permit ID. It rejects non-sequential revisions and permit
-mismatches, returns the existing state for an identical logical commit, and fails
-closed for a conflicting duplicate. It performs no lease lookup.
+`append_commit(commit, permit)` first requires `permit.scope` to equal the memory
+repository's configured graph namespace, then requires an exact match of operation
+ID, revision, fencing token, and permit ID. Before any commit lookup or append, it
+recomputes `graph_commit_sha256(commit)` and compares it in constant time with
+`permit.commit_sha256`. It rejects non-sequential revisions and any identity or
+digest mismatch, returns the existing state for an identical logical commit, and
+fails closed for a conflicting duplicate. It performs no lease lookup.
 
 - [ ] **Step 5: Run and commit**
 
@@ -312,7 +346,8 @@ For each of `PersonVersions`, `FamilyUnits`, `ParentChildLinks`, and
 with precision `0`, text `OperationId`, and checkbox `IsTombstone` with the
 declared icon/color options. Assert `Archived` remains a separate checkbox on
 `PersonVersions`, `GraphCommits` has text `PermitId`, and `ChangeLog` has canonical
-`InverseWriteSetJson`. Add negative validator fixtures for a
+`InverseWriteSetJson`, text `CommitScope`, long text `GraphCommitJson`, and text
+`CommitSha256`. Add negative validator fixtures for a
 missing table, wrong primary field, `Revision` as `singleLineText`, and number
 precision `2`. Then create formula tests using names with quotes, backslashes,
 parentheses, and Airtable function text:
@@ -451,7 +486,9 @@ NORMALIZED_SCHEMA = MappingProxyType({
         text("ActorId"), text("RequestId"), text("SourceReference"),
         integer("ExpectedRevision"), integer("ResultRevision"),
         integer("FencingToken"), long_text("CommandsJson"),
-        long_text("InverseWriteSetJson"), text("CreatedAt"), text("UpdatedAt"),
+        long_text("InverseWriteSetJson"), text("CommitScope"),
+        long_text("GraphCommitJson"), text("CommitSha256"),
+        text("CreatedAt"), text("UpdatedAt"),
     )),
     "GraphCommits": TableSpec("GraphCommits", "OperationId", (
         text("OperationId"), integer("Revision"), integer("FencingToken"),
@@ -631,6 +668,11 @@ missing commit causes staged rows to be ignored. Reproduce the Task 1 regression
 with two operations staging the same revision and assert only rows matching the
 committed operation ID and fencing token load.
 
+Add permit-binding tests that configure repository scope `graph:main`, reject a
+permit for any other scope, and reject commits whose `semantic_checksum` or
+`committed_at` differs from the commit hashed into an otherwise matching permit.
+Assert each rejection occurs before any `GraphCommits` table read or write.
+
 ```python
 assert fake_tables.write_order == [
     "PersonVersions",
@@ -662,8 +704,11 @@ contains:
 }
 ```
 
-`append_commit(commit, permit)` checks the exact operation ID, revision, fencing
-token, and permit ID before any write and has no coordination or Redis dependency.
+`append_commit(commit, permit)` checks `permit.scope` against the repository's
+configured graph namespace and checks the exact operation ID, revision, fencing
+token, and permit ID. It then recomputes Task 1 `graph_commit_sha256(commit)` and
+compares it in constant time with `permit.commit_sha256` before any Airtable access.
+It has no coordination or Redis dependency.
 Append the commit after staged-row verification. Resolve an ambiguous create by
 reading the revision back. Treat canonical-identical physical `GraphCommits` rows
 as one logical commit; any canonical difference within a revision is
@@ -690,7 +735,10 @@ resolve current state from the latest transition. Before/after snapshots contain
 application IDs and semantic graph data but redact contact fields and credentials.
 Persist the typed inverse write set as canonical `InverseWriteSetJson`. The JSON
 uses the eight `GraphWriteSet` fields from Task 1, stable logical-ID order, sorted
-object keys, compact separators, and ASCII output.
+object keys, compact separators, and ASCII output. From `PENDING` onward, each
+audit transition also persists `CommitScope`, Task 1 canonical `GraphCommitJson`,
+and `CommitSha256`, so an interrupted post-confirmation audit transition can be
+repaired without inferring permit ID or commit time.
 
 - [ ] **Step 5: Run and commit**
 
@@ -714,7 +762,8 @@ git commit -m "feat: persist committed Shajra graph revisions"
 
 **Interfaces:**
 - Consumes: `GraphCommit` and `CommitPermit` from Task 1.
-- Produces: `Lease`, `LeaseManager`, `CommitReservation`, `CommitCoordinator`,
+- Produces: `Lease`, `LeaseManager`, `CommitReservation`,
+  `ConfirmedCommitReceipt`, `CommitCoordinatorStatus`, `CommitCoordinator`,
   `RevocationStore`, and `RateLimiter` contracts plus Upstash implementations.
 
 - [ ] **Step 1: Add pinned runtime dependencies and settings**
@@ -747,6 +796,8 @@ and fixed-window rate limits. Add commit-coordinator tests proving:
 - the `COMMITTING` reservation has no TTL and blocks new writers after lease expiry;
 - confirmation requires the exact permit and canonical commit SHA-256;
 - confirmation advances the revision exactly once and identical retries succeed;
+- `get_status(scope)` returns confirmed revision, active reservation, and the
+  last-confirmed receipt without mutation;
 - release and lease expiry never delete or invalidate a reservation; and
 - Upstash errors from acquire, authorize, confirm, revocation, and rate limiting
   fail closed with stable service errors.
@@ -773,6 +824,22 @@ class CommitReservation:
     commit_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ConfirmedCommitReceipt:
+    scope: str
+    permit: CommitPermit
+    commit: GraphCommit
+    commit_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CommitCoordinatorStatus:
+    scope: str
+    confirmed_revision: int
+    active_reservation: CommitReservation | None
+    last_confirmed_receipt: ConfirmedCommitReceipt | None
+
+
 class LeaseManager(Protocol):
     def acquire(self, scope: str, owner: str, ttl_ms: int) -> Lease: ...
     def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
@@ -793,7 +860,7 @@ class CommitCoordinator(Protocol):
     def authorize_commit(
         self, lease: Lease, commit: GraphCommit
     ) -> CommitPermit: ...
-    def get_reservation(self, scope: str) -> CommitReservation | None: ...
+    def get_status(self, scope: str) -> CommitCoordinatorStatus: ...
     def confirm_commit(
         self, permit: CommitPermit, commit: GraphCommit
     ) -> None: ...
@@ -803,7 +870,9 @@ class CommitCoordinator(Protocol):
 `LeaseManager` is the generic TTL lease used by enrichment and returns leases with
 `base_revision=None`; such a lease cannot authorize a graph commit.
 `CommitCoordinator.acquire` is graph-specific and returns a lease whose
-`base_revision` equals `committed_revision`.
+`base_revision` equals `committed_revision`. `get_status(scope)` is the only
+read-only commit-coordination status method and returns all three status fields in
+the contract above.
 
 Prefix every key with `{REDIS_NAMESPACE}:shajra:`. Per graph scope use `lock`,
 `fence`, `confirmed-revision`, `commit-reservation`, and `last-confirmed` keys.
@@ -836,19 +905,25 @@ return nil
 `authorize_commit` receives a `GraphCommit` whose `permit_id` is already a
 caller-generated `cpr_<uuid4 hex>`. One Lua operation checks the exact lock value,
 checks both `lease.base_revision` and `confirmed-revision` equal
-`commit.revision - 1`, and writes canonical commit JSON plus its SHA-256 as a
-`COMMITTING` reservation using `SET NX` without expiry. If an existing reservation
-has the same canonical JSON and SHA-256, return its original permit; otherwise
-return `COMMIT_RECOVERY_REQUIRED`. Once returned, the permit remains valid after
-lease expiry and the reserved commit may not be aborted or replaced.
+`commit.revision - 1`, and writes Task 1 canonical JSON and
+`graph_commit_sha256(commit)` computed by `authorize_commit` immediately before
+the script as a `COMMITTING` reservation using `SET NX` without expiry. It returns `CommitPermit` with
+`scope=lease.scope` and `commit_sha256` equal to the stored digest. If an existing
+reservation has the same scope, canonical JSON, and SHA-256, return its original
+permit; otherwise return `COMMIT_RECOVERY_REQUIRED`. Once returned, the permit
+remains valid after lease expiry and the reserved commit may not be aborted or
+replaced.
 
 `confirm_commit` runs only after the repository has read back the logical Airtable
-commit. One Lua operation requires the exact reservation JSON, permit fields, and
-commit SHA-256; sets `confirmed-revision` to `commit.revision`; stores a
-`last-confirmed` receipt for idempotent retries; and deletes the active reservation.
-An identical confirmation retry succeeds from `last-confirmed`. A mismatch fails
-closed. `get_reservation` is read-only and returns the canonical reserved commit for
-recovery.
+commit. It routes exclusively through `permit.scope`, recomputes Task 1
+`graph_commit_sha256(commit)`, and rejects a mismatch with
+`permit.commit_sha256`. One Lua operation then requires the exact reservation JSON,
+permit scope, operation ID, revision, fencing token, permit ID, and commit digest;
+sets `confirmed-revision` to `commit.revision`; stores a
+`ConfirmedCommitReceipt` in the one-slot `last-confirmed` key; and deletes the
+active reservation. An identical confirmation retry succeeds from
+`last-confirmed`. A mismatch fails closed. `get_status(scope)` reads
+`confirmed-revision`, `commit-reservation`, and `last-confirmed` without mutation.
 
 - [ ] **Step 4: Implement revocation and rate-limit stores**
 
@@ -916,8 +991,9 @@ missing/changed/expired preview digest, and compensation as a new operation. Cov
 lease expiry before authorization, authorization failure, commit response loss,
 lease expiry after authorization, confirmation failure, and audit failure after
 authorization. Every pre-authorization failure must leave no visible commit and
-may become `FAILED`; every post-authorization failure must remain `COMMITTING` and
-must complete through retry/recovery. Add scenarios proving a repeated canonical adult
+may become `FAILED`; every post-authorization failure must leave recoverable
+`PENDING` or `COMMITTING` audit, never `FAILED`, and must complete through
+retry/recovery. Add scenarios proving a repeated canonical adult
 pair is rejected for divorced, widowed, separated, ended, and unknown-status
 units unless every current unit is explicitly confirmed; dates/status cannot
 confirm it. Cover unresolved add/same-ID supersede/remove through preview, commit,
@@ -925,6 +1001,14 @@ reload, checksum, and compensation. Cover compensation of newly added people,
 family units, parent-child links, and unresolved annotations; exact restoration of
 prior entity values; and `409 COMPENSATION_CONFLICT` after any later change to a
 touched logical ID.
+
+Add post-confirmation crash tests for audit state left `COMMITTING` and audit state
+left `PENDING`. Prove direct repair when `get_status(scope)` has the exact
+last-confirmed receipt and exact logical `GraphCommit`. Then confirm a later
+revision so the one-slot receipt is replaced and prove repair from
+`confirmed_revision >= target.revision`, a contiguous non-conflicting commit
+sequence, and the exact target commit/digest. In every repair case assert no stage,
+append, authorize, or confirm call is repeated.
 
 The idempotency assertion is:
 
@@ -946,22 +1030,28 @@ expired previews, and compares a fresh value in constant time before staging.
 
 - [ ] **Step 3: Implement execute in this exact order**
 
-1. Resolve an existing idempotency result. Return `COMMITTED`; resume the exact
-   reservation for `COMMITTING`; reject a different payload under the same key.
+1. Resolve an existing idempotency result. Return `COMMITTED`; inspect
+   `CommitCoordinator.get_status(scope)` for `PENDING` or `COMMITTING`; resume an
+   exact active reservation, repair already-confirmed audit as described below,
+   and reject a different payload under the same key.
 2. Acquire the graph lease with `committed_revision=request.expected_revision`.
 3. Reload committed state under the lease.
 4. Reject stale `expected_revision`.
 5. Apply commands and reject blocking validation issues.
 6. Diff complete before/after snapshots into a forward `GraphWriteSet` and the
    typed inverse `GraphWriteSet` described below.
-7. Create `PENDING` audit state with commands, before/after snapshots, and canonical
-   `InverseWriteSetJson`.
-8. Stage the forward write set for `revision + 1` using the lease fencing token.
-9. Verify the exact staged rows and assert lease ownership.
-10. Generate one `cpr_<uuid4 hex>` permit ID and freeze a `GraphCommit` containing
-    it, the proposed revision, operation ID, fencing token, checksum, and timestamp.
-11. Call `CommitCoordinator.authorize_commit(lease, commit)`. On success, the
-    operation is irrevocably commit-bound; append a `COMMITTING` audit transition.
+7. Generate one `cpr_<uuid4 hex>` permit ID and freeze a `GraphCommit` containing
+   it, the proposed revision, operation ID, fencing token, checksum, and timestamp;
+   compute Task 1 canonical JSON and `graph_commit_sha256`.
+8. Create `PENDING` audit state with commands, before/after snapshots, canonical
+   `InverseWriteSetJson`, `CommitScope`, `GraphCommitJson`, and `CommitSha256`.
+9. Stage the forward write set for `revision + 1` using the lease fencing token.
+10. Verify the exact staged rows and assert lease ownership.
+11. Call `CommitCoordinator.authorize_commit(lease, commit)` and require the
+    returned permit scope and digest to equal the planned audit identity. On success, the
+    operation is irrevocably commit-bound; attempt a `COMMITTING` audit transition,
+    but continue exact commit completion if that audit append fails because the
+    `PENDING` record already holds the canonical commit identity.
 12. Call `GraphRepository.append_commit(commit, permit)`. Its read-back confirms
     the logical Airtable commit and its best-effort `GraphState` update.
 13. Call `CommitCoordinator.confirm_commit(permit, commit)` to advance coordination
@@ -978,6 +1068,16 @@ never append `FAILED` and never issue a replacement permit: continue the exact
 reserved append/confirm sequence or return `503 COMMIT_RECOVERY_REQUIRED` for the
 recovery path. A matching logical `GraphCommit` is success even if Airtable created
 identical physical duplicates. Never delete committed rows.
+
+For idempotent retry after reservation clearance, load the canonical target commit
+identity from `PENDING` or `COMMITTING` audit and call `get_status(commit_scope)`.
+The exact logical `GraphCommit` plus an exact `last_confirmed_receipt` is direct
+confirmation proof. If that one-slot receipt now names a later commit,
+`confirmed_revision >= target.revision`, a contiguous non-conflicting logical
+commit sequence through the target, and the exact target commit/digest prove the
+earlier sequential confirmation. Append only the missing `COMMITTED` audit
+transition and return the recorded mutation result; do not stage, append,
+authorize, or confirm the graph again.
 
 - [ ] **Step 4: Implement compensation**
 
@@ -1774,13 +1874,12 @@ Render, plan, plan-check, provision, and preflight all consume the same immutabl
 Production `migrate` refuses to run without `--apply`, the exact SHA-256 of the
 reviewed plan file, a verified restore-drill receipt, and all blocking ambiguities
 resolved or explicitly retained as unresolved in that reviewed plan. Recovery
-requires the operator to select the exact `operationId` from the active Upstash
-`COMMITTING` reservation and its matching entry in `audit.json`, then run
+requires the operator to select an exact `operationId` from `audit.json`, then run
 `python -m ops.cli recover-operation --operation-id $operationId --target production --apply`;
-the CLI rejects empty values, IDs outside the `op_` namespace, an operation ID that
-does not match the active reservation, and any attempt to run without
-`--allow-production` for production. Implementation and local tests never execute
-this production command.
+the CLI rejects empty values, IDs outside the `op_` namespace, an operation that
+has neither an exact active reservation nor post-confirmation proof, and any
+attempt to run without `--allow-production` for production. Implementation and
+local tests never execute this production command.
 
 - [ ] **Step 6: Implement migration semantics**
 
@@ -1795,23 +1894,34 @@ cell. Produce expected row counts and semantic checksum before any apply. Batch
 Airtable writes and retry `429` with bounded backoff. Restore and migration graph
 writes use the same Task 5 sequence: acquire, stage, verify, authorize the exact
 commit, append/read back, and confirm. They never append `GraphCommits` without a
-`CommitPermit`.
+`CommitPermit`. The permit scope must equal the target's configured graph namespace
+and its `commit_sha256` must equal Task 1 `graph_commit_sha256(commit)`.
 
 - [ ] **Step 7: Implement verification and recovery**
 
 Verification reloads the committed staging graph, checks exact ID sets, counts,
 all invariants, and checksum.
 
-`recover-operation` reads the immutable reservation from `CommitCoordinator` and
-accepts only its exact operation ID. If the matching logical `GraphCommit` already
-exists, verify its canonical fields and checksum and call `confirm_commit`. If it
-does not exist, verify the complete staged row set against the reservation,
-materialize and validate the proposed snapshot, verify its semantic checksum, call
+`recover-operation` calls `CommitCoordinator.get_status(target_scope)`. When the
+requested operation matches `status.active_reservation`, recovery remains exact
+and irrevocable. If the matching logical `GraphCommit` already exists, verify its
+canonical fields and digest and call `confirm_commit`. If it does not exist, verify
+the complete staged row set against the reservation, materialize and validate the
+proposed snapshot, verify its semantic checksum, call
 `append_commit(reservation.commit, reservation.permit)`, read it back, and confirm
-it. Lease expiry does not affect this path. A `COMMITTING` reservation is never
-aborted, replaced, or marked `FAILED`.
+it. Lease expiry does not affect this path. An active `COMMITTING` reservation is
+never aborted, replaced, or marked `FAILED`.
 
-If staged rows, canonical commit fields, permit fields, or checksum conflict,
+When no matching active reservation exists, `recover-operation` may repair audit
+state but may not repeat a graph write. Load `CommitScope`, `GraphCommitJson`, and
+`CommitSha256` from `PENDING` or `COMMITTING` audit. The exact target logical commit
+plus an exact `last_confirmed_receipt` is direct proof. If the one-slot receipt has
+advanced, require `status.confirmed_revision >= target.revision`, a contiguous
+non-conflicting logical commit sequence through the target revision, and the exact
+target commit/digest. On either proof, append only the missing `COMMITTED` audit
+transition. Without either proof, fail closed.
+
+If staged rows, canonical commit fields, permit scope/identity/digest, or checksum conflict,
 report stable corruption details and perform no further mutation. Upstash outage
 fails closed. When no reservation exists, operator recovery may reconcile an idle
 coordination revision to the highest contiguous, non-conflicting Airtable commit;
@@ -1821,9 +1931,11 @@ deletes committed revisions.
 In `test_recovery.py`, cover an authorization-response retry, lease expiry before
 append, an existing identical logical commit, identical physical commit duplicates,
 append-response loss, confirmation-response loss, a conflicting duplicate commit,
-staged-row checksum mismatch, wrong operation ID, and Upstash outage. Assert every
-authorized case either reaches the exact reserved commit or remains blocked for
-recovery, never `FAILED`.
+staged-row checksum mismatch, wrong active operation ID, and Upstash outage. Add
+post-confirmation repair tests for `PENDING` and `COMMITTING` audit with an exact
+last-confirmed receipt and with a later receipt plus sequential proof. Assert active
+authorized cases either reach the exact reserved commit or remain blocked for
+recovery, never `FAILED`; audit-only repair performs no graph append or confirmation.
 
 - [ ] **Step 8: Run CLI tests and commit**
 
