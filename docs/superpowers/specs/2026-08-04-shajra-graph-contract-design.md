@@ -265,12 +265,13 @@ commands. `GraphSnapshot.unresolved` is an immutable
 The migrated factory accepts
 `(source_table, source_record_id, source_relation_slot)`. The slot is a non-empty,
 case-sensitive mapper-owned field/ordinal discriminator such as `FatherName#0`,
-`MotherName#0`, or `SpouseNames#1`. Its UUID5 name is the compact ASCII JSON array
+`MotherName#0`, or `SpouseName#0`. Its UUID5 name is the compact ASCII JSON array
 `["shajra","unresolved","v1",source_table,source_record_id,source_relation_slot]`
-encoded with separators `(",", ":")`; no delimiter-joined string is used. Legacy
-list fields preserve source order and use a zero-based ordinal, so every relation
-from one row has a distinct ID and an unchanged row produces the same IDs on
-every migration rerun.
+encoded with separators `(",", ":")`; no delimiter-joined string is used. The
+current `ApprovedMembers` schema has scalar `FatherName`, `MotherName`, and
+`SpouseName` fields, so each uses ordinal `#0`; no delimiter splitting or
+synthetic plural spouse field is permitted. Every relation from one row has a
+distinct ID and an unchanged row produces the same IDs on every migration rerun.
 
 The immutable model is:
 

@@ -20,7 +20,8 @@
 - Redis stores only leases, counters, JWT revocation IDs, and rate-limit state.
 - `AI_ENRICHMENT_ENABLED` defaults to `false`; AI receives no contact fields and
   can never call a graph repository or relationship mutation service.
-- Migration, backup, restore, and recovery run only as operator CLI commands.
+- Schema render/plan/provision, migration, backup, restore, and recovery run only
+  as operator CLI commands and are never imported by the API runtime.
 - No command in this plan is run against production Airtable or production Vercel.
 - Staging integration tests are opt-in and skipped without explicit staging variables.
 - Every task ends with focused tests and a local commit.
@@ -58,7 +59,7 @@ Create:
 - `backend/api/routes/health.py`, `public_graph.py`, `submissions.py`, `content.py`
 - `backend/api/routes/admin_auth.py`, `admin_graph.py`, `admin_enrichment.py`
 - `backend/ops/__init__.py`, `backend/ops/cli.py`
-- `backend/ops/backup.py`, `backend/ops/migration.py`, `backend/ops/recovery.py`
+- `backend/ops/schema.py`, `backend/ops/backup.py`, `backend/ops/migration.py`, `backend/ops/recovery.py`
 - Backend unit, API, CLI, and opt-in integration tests described per task.
 
 Modify:
@@ -82,13 +83,15 @@ New Airtable tables for staging and migration:
 - `EnrichmentAttempts`
 - `SubmissionReviews`
 
-Add `PersonId` and `ArchivedAt` to `ApprovedMembers`.
+Keep legacy `ApprovedMembers` read-only and schema-unchanged. Deterministic
+`PersonId` values and archive state exist only in normalized `PersonVersions`.
 
-This list is the canonical normalized-schema provisioning inventory and is
-implemented once in `repositories/airtable/schema.py`. Runtime API requests never
-auto-create tables. Operator provisioning and every target preflight use that
-same manifest and fail before any row write when a table or required field is
-missing.
+This list is backed by the canonical typed provisioning manifest in
+`repositories/airtable/schema.py`, including primary field, field type, and
+required options for every table. Runtime API requests never auto-create tables.
+Operator planning/provisioning and every target preflight use that same manifest
+and fail before any row write when a table, field, primary-field assignment,
+field type, or required option is incompatible.
 
 ## Interfaces
 
@@ -212,11 +215,14 @@ git commit -m "feat: add append-only Shajra repository contracts"
 
 - [ ] **Step 1: Write schema-manifest and formula-injection tests**
 
-First assert the canonical schema manifest has exactly these table names and that
-`UnresolvedRelationships` requires `UnresolvedId`, `SubjectPersonId`, `Kind`,
-`UnresolvedName`, `Revision`, `OperationId`, `FencingToken`, and `IsRemoved`.
-Then create formula tests using names with quotes, backslashes, parentheses, and
-Airtable function text:
+First assert the typed canonical schema manifest has exactly these table names.
+For `UnresolvedRelationships`, assert primary field `UnresolvedId`; text fields
+`SubjectPersonId`, `Kind`, and `UnresolvedName`; integer fields `Revision` and
+`FencingToken` with precision `0`; text `OperationId`; and checkbox `IsRemoved`
+with the declared icon/color options. Add negative validator fixtures for a
+missing table, wrong primary field, `Revision` as `singleLineText`, and number
+precision `2`. Then create formula tests using names with quotes, backslashes,
+parentheses, and Airtable function text:
 
 ```python
 def test_exact_match_escapes_user_text():
@@ -234,61 +240,223 @@ def test_field_name_is_allowlisted():
 Define immutable `NORMALIZED_SCHEMA` in `schema.py`; its keys are exactly
 `PersonVersions`, `FamilyUnits`, `ParentChildLinks`,
 `UnresolvedRelationships`, `ChangeLog`, `GraphCommits`, `GraphState`,
-`EnrichmentAttempts`, and `SubmissionReviews`, and each value is the complete
-required field-name frozenset. Repository table construction and operator
-preflight both import this object:
+`EnrichmentAttempts`, and `SubmissionReviews`. It is the sole source for create
+payloads and read-only schema validation:
 
 ```python
+from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import Literal, Mapping
+
+from pyairtable.models.schema import BaseSchema
+
+
+AirtableFieldType = Literal[
+    "singleLineText", "multilineText", "number", "checkbox"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSpec:
+    name: str
+    airtable_type: AirtableFieldType
+    required_options: Mapping[str, object] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def create_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {"name": self.name, "type": self.airtable_type}
+        if self.required_options:
+            payload["options"] = dict(self.required_options)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TableSpec:
+    name: str
+    primary_field: str
+    fields: tuple[FieldSpec, ...]
+
+    def __post_init__(self) -> None:
+        names = tuple(field.name for field in self.fields)
+        if not names or names[0] != self.primary_field or len(names) != len(set(names)):
+            raise ValueError("Primary field must be first and field names must be unique")
+
+    def create_fields(self) -> list[dict[str, object]]:
+        return [field.create_payload() for field in self.fields]
+
+
+SchemaIssueCode = Literal[
+    "MISSING_TABLE",
+    "PRIMARY_FIELD_MISMATCH",
+    "MISSING_FIELD",
+    "UNEXPECTED_FIELD",
+    "FIELD_TYPE_MISMATCH",
+    "FIELD_OPTION_MISMATCH",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaIssue:
+    code: SchemaIssueCode
+    table: str
+    field: str | None
+    expected: object | None
+    actual: object | None
+
+
+def text(name: str) -> FieldSpec:
+    return FieldSpec(name, "singleLineText")
+
+
+def long_text(name: str) -> FieldSpec:
+    return FieldSpec(name, "multilineText")
+
+
+def integer(name: str) -> FieldSpec:
+    return FieldSpec(name, "number", MappingProxyType({"precision": 0}))
+
+
+def checkbox(name: str) -> FieldSpec:
+    return FieldSpec(
+        name,
+        "checkbox",
+        MappingProxyType({"icon": "check", "color": "greenBright"}),
+    )
 
 
 NORMALIZED_SCHEMA = MappingProxyType({
-    "PersonVersions": frozenset({
-        "PersonId", "FullName", "Gender", "Birth", "Death", "IsAlive",
-        "PrimaryFamilyUnitId", "Archived", "VersionRevision", "Revision",
-        "OperationId", "FencingToken",
-    }),
-    "FamilyUnits": frozenset({
-        "FamilyUnitId", "Kind", "AdultAId", "AdultBId", "Status", "Start",
-        "End", "DistinctUnionConfirmed", "CreatedRevision", "Revision",
-        "OperationId", "FencingToken",
-    }),
-    "ParentChildLinks": frozenset({
-        "LinkId", "ParentId", "ChildId", "Role", "RelationshipType",
-        "FamilyUnitId", "CreatedRevision", "Revision", "OperationId",
-        "FencingToken",
-    }),
-    "UnresolvedRelationships": frozenset({
-        "UnresolvedId", "SubjectPersonId", "Kind", "UnresolvedName",
-        "CreatedRevision", "Revision", "OperationId", "FencingToken",
-        "IsRemoved",
-    }),
-    "ChangeLog": frozenset({
-        "OperationId", "IdempotencyKey", "State", "ActorId", "RequestId",
-        "SourceReference", "ExpectedRevision", "ResultRevision",
-        "FencingToken", "CommandsJson", "InverseCommandsJson", "CreatedAt",
-        "UpdatedAt",
-    }),
-    "GraphCommits": frozenset({
-        "Revision", "OperationId", "FencingToken", "SemanticChecksum",
-        "CommittedAt",
-    }),
-    "GraphState": frozenset({
-        "Revision", "HeadOperationId", "FencingToken", "SemanticChecksum",
-        "UpdatedAt",
-    }),
-    "EnrichmentAttempts": frozenset({
-        "AttemptId", "Sequence", "Status", "SubmissionId", "InputSha256",
-        "RequestSha256", "PromptVersion", "Model", "CandidateIdsJson",
-        "SuggestionJson", "SuggestionSha256", "ErrorCode", "CreatedAt",
-    }),
-    "SubmissionReviews": frozenset({
-        "ReviewId", "DecisionId", "AttemptId", "SuggestionKey", "Decision",
-        "ReplacementPersonId", "ReplacementValue", "ActorId", "Status",
-        "CreatedAt",
-    }),
+    "PersonVersions": TableSpec("PersonVersions", "PersonId", (
+        text("PersonId"), text("FullName"), text("Gender"), text("Birth"),
+        text("Death"), text("IsAlive"), text("PrimaryFamilyUnitId"),
+        checkbox("Archived"), integer("VersionRevision"), integer("Revision"),
+        text("OperationId"), integer("FencingToken"),
+    )),
+    "FamilyUnits": TableSpec("FamilyUnits", "FamilyUnitId", (
+        text("FamilyUnitId"), text("Kind"), text("AdultAId"), text("AdultBId"),
+        text("Status"), text("Start"), text("End"),
+        checkbox("DistinctUnionConfirmed"), integer("CreatedRevision"),
+        integer("Revision"), text("OperationId"), integer("FencingToken"),
+    )),
+    "ParentChildLinks": TableSpec("ParentChildLinks", "LinkId", (
+        text("LinkId"), text("ParentId"), text("ChildId"), text("Role"),
+        text("RelationshipType"), text("FamilyUnitId"),
+        integer("CreatedRevision"), integer("Revision"), text("OperationId"),
+        integer("FencingToken"),
+    )),
+    "UnresolvedRelationships": TableSpec(
+        "UnresolvedRelationships", "UnresolvedId", (
+            text("UnresolvedId"), text("SubjectPersonId"), text("Kind"),
+            text("UnresolvedName"), integer("CreatedRevision"),
+            integer("Revision"), text("OperationId"), integer("FencingToken"),
+            checkbox("IsRemoved"),
+        ),
+    ),
+    "ChangeLog": TableSpec("ChangeLog", "OperationId", (
+        text("OperationId"), text("IdempotencyKey"), text("State"),
+        text("ActorId"), text("RequestId"), text("SourceReference"),
+        integer("ExpectedRevision"), integer("ResultRevision"),
+        integer("FencingToken"), long_text("CommandsJson"),
+        long_text("InverseCommandsJson"), text("CreatedAt"), text("UpdatedAt"),
+    )),
+    "GraphCommits": TableSpec("GraphCommits", "OperationId", (
+        text("OperationId"), integer("Revision"), integer("FencingToken"),
+        text("SemanticChecksum"), text("CommittedAt"),
+    )),
+    "GraphState": TableSpec("GraphState", "StateKey", (
+        text("StateKey"), integer("Revision"), text("HeadOperationId"),
+        integer("FencingToken"), text("SemanticChecksum"), text("UpdatedAt"),
+    )),
+    "EnrichmentAttempts": TableSpec("EnrichmentAttempts", "AttemptId", (
+        text("AttemptId"), integer("Sequence"), text("Status"),
+        text("SubmissionId"), text("InputSha256"), text("RequestSha256"),
+        text("PromptVersion"), text("Model"), long_text("CandidateIdsJson"),
+        long_text("SuggestionJson"), text("SuggestionSha256"), text("ErrorCode"),
+        text("CreatedAt"),
+    )),
+    "SubmissionReviews": TableSpec("SubmissionReviews", "ReviewId", (
+        text("ReviewId"), text("DecisionId"), text("AttemptId"),
+        text("SuggestionKey"), text("Decision"), text("ReplacementPersonId"),
+        long_text("ReplacementValue"), text("ActorId"), text("Status"),
+        text("CreatedAt"),
+    )),
 })
+
+
+def _actual_options(field_schema: object) -> Mapping[str, object]:
+    options = getattr(field_schema, "options", None)
+    if options is None:
+        return {}
+    if isinstance(options, Mapping):
+        return options
+    return options.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+
+def validate_normalized_schema(actual: BaseSchema) -> tuple[SchemaIssue, ...]:
+    issues: list[SchemaIssue] = []
+    actual_tables = {table.name: table for table in actual.tables}
+    for table_name, expected_table in NORMALIZED_SCHEMA.items():
+        actual_table = actual_tables.get(table_name)
+        if actual_table is None:
+            issues.append(SchemaIssue("MISSING_TABLE", table_name, None, table_name, None))
+            continue
+
+        actual_fields = {field.name: field for field in actual_table.fields}
+        primary = next(
+            (field.name for field in actual_table.fields if field.id == actual_table.primary_field_id),
+            None,
+        )
+        if primary != expected_table.primary_field:
+            issues.append(SchemaIssue(
+                "PRIMARY_FIELD_MISMATCH", table_name, None,
+                expected_table.primary_field, primary,
+            ))
+
+        expected_names = {field.name for field in expected_table.fields}
+        for missing in sorted(expected_names - actual_fields.keys()):
+            issues.append(SchemaIssue("MISSING_FIELD", table_name, missing, missing, None))
+        for extra in sorted(actual_fields.keys() - expected_names):
+            issues.append(SchemaIssue("UNEXPECTED_FIELD", table_name, extra, None, extra))
+
+        for expected_field in expected_table.fields:
+            actual_field = actual_fields.get(expected_field.name)
+            if actual_field is None:
+                continue
+            actual_type = str(getattr(actual_field.type, "value", actual_field.type))
+            if actual_type != expected_field.airtable_type:
+                issues.append(SchemaIssue(
+                    "FIELD_TYPE_MISMATCH", table_name, expected_field.name,
+                    expected_field.airtable_type, actual_type,
+                ))
+                continue
+            actual_options = _actual_options(actual_field)
+            for key, expected_value in expected_field.required_options.items():
+                if actual_options.get(key) != expected_value:
+                    issues.append(SchemaIssue(
+                        "FIELD_OPTION_MISMATCH", table_name, expected_field.name,
+                        {key: expected_value}, {key: actual_options.get(key)},
+                    ))
+    return tuple(issues)
 ```
+
+Enums and ISO timestamps are stored as `singleLineText` and validated by the
+domain/API layers; nullable `IsAlive` is serialized as `"true"`, `"false"`, or
+blank so unknown is not collapsed into false. `number` fields require precision
+`0`, and checkbox icon/color options are part of compatibility checks. Airtable's
+primary field is a display/index field, not a uniqueness constraint; logical ID,
+revision, and sequence checks remain repository responsibilities.
+
+`validate_normalized_schema(actual: BaseSchema) -> tuple[SchemaIssue, ...]`
+treats unrelated legacy tables as out of scope but requires every normalized
+table. Within each normalized table it resolves `primary_field_id`, requires the
+declared primary-field name, requires the exact field-name set, compares every
+field `type`, and compares every declared option key/value. Stable issue codes are
+`MISSING_TABLE`, `PRIMARY_FIELD_MISMATCH`, `MISSING_FIELD`, `UNEXPECTED_FIELD`,
+`FIELD_TYPE_MISMATCH`, and `FIELD_OPTION_MISMATCH`. Preflight fails on any
+issue. `plan-schema` may convert only `MISSING_TABLE` issues into ordered
+`createTables` actions; every other issue blocks planning/provisioning. After
+those missing tables are created from a reviewed plan, full validation must
+return no issues before any record write.
 
 Use `pyairtable.formulas.match` and a fixed field allowlist:
 
@@ -312,12 +480,12 @@ Assert one-element Airtable linked lists map to application IDs through an
 explicit ID map, empty lists map to `None`, multiple values fail where cardinality
 is one, and public mappers never include `Email`, `PhoneNumber`, source IDs, or
 record IDs. Map legacy unresolved father/mother/spouse names to stable `unr_`
-annotations. For one `ApprovedMembers` row containing father, mother, and two
-spouse-list values, pass the exact slots `FatherName#0`, `MotherName#0`,
-`SpouseNames#0`, and `SpouseNames#1` to
-`migrated_unresolved_relationship_id`; assert four unique IDs and identical IDs
-and annotations on an idempotent rerun. Legacy list ordinals are zero-based and
-preserve source order. Add a test proving two repository rows with different
+annotations. For one `ApprovedMembers` row containing scalar father, mother, and
+spouse values, pass the exact slots `FatherName#0`, `MotherName#0`, and
+`SpouseName#0` to `migrated_unresolved_relationship_id`; assert three unique IDs
+and identical IDs and annotations on an idempotent rerun. The mapper must not
+split delimiters or synthesize a plural spouse field. Add a test proving two
+repository rows with different
 `SourceRecordId`/`MigrationRunId` values produce identical domain snapshots and
 semantic checksums when their family semantics match.
 
@@ -391,8 +559,9 @@ version row. `GraphCommits` contains:
 }
 ```
 
-Append the commit after staged-row verification. Update `GraphState` only after
-the commit and tolerate cache-update failure.
+Append the commit after staged-row verification. Update the single `GraphState`
+cache row with primary field `StateKey="graph"` only after the commit and tolerate
+cache-update failure.
 
 - [ ] **Step 3: Implement committed snapshot loading**
 
@@ -1205,12 +1374,15 @@ git commit -m "feat: add review-only Shajra AI enrichment"
 
 **Files:**
 - Create: `backend/ops/__init__.py`, `backend/ops/cli.py`
-- Create: `backend/ops/backup.py`, `backend/ops/migration.py`, `backend/ops/recovery.py`
-- Create: `backend/tests/cli/test_backup.py`, `test_migration.py`, `test_recovery.py`
+- Create: `backend/ops/schema.py`, `backend/ops/backup.py`, `backend/ops/migration.py`, `backend/ops/recovery.py`
+- Create: `backend/tests/cli/test_schema.py`, `test_backup.py`, `test_migration.py`, `test_recovery.py`
 - Modify: `backend/requirements-dev.txt`, `.gitignore`
 
 **Interfaces:**
-- Produces: `preflight`, `backup`, `audit`, `plan`, `restore`, `migrate`, `verify`, and `recover-operation` commands.
+- Produces: `render-schema`, `plan-schema`, `provision-schema`, `preflight`,
+  `backup`, `audit`, `plan`, `restore`, `migrate`, `verify`, and
+  `recover-operation` commands. Schema mutation is operator-owned CLI work and is
+  never imported or called by the FastAPI/Vercel runtime.
 
 - [ ] **Step 1: Add CLI-only encryption dependency**
 
@@ -1230,7 +1402,18 @@ Write an ASCII magic header `SHAJRA-BACKUP-1`, then base64 salt, nonce, and
 ciphertext. Authenticate the header as associated data. Store the checksum in a
 separate non-sensitive `.sha256` file.
 
-- [ ] **Step 4: Write migration-planner tests for the current edge cases**
+- [ ] **Step 4: Write schema and migration-planner tests**
+
+In `test_schema.py`, fake `Base.schema(force=True)` and `Base.create_table`.
+Assert render output is deterministic; in preflight mode, missing
+`UnresolvedRelationships`, wrong primary field, `Revision` with type
+`singleLineText`, and precision `2` each produce the exact stable issue code
+and zero create calls. Assert a reviewed schema plan converts only the missing
+table into a create action, passes each `TableSpec.create_fields()` with the
+primary field first, is idempotent on rerun, and rejects a changed observed-schema
+digest, missing `--apply`, wrong plan SHA, or production without
+`--allow-production`. Also reject a plan whose `manifestSha256` differs from the
+currently rendered canonical manifest.
 
 Fixtures must cover exact parent IDs, reciprocal spouse pairs, the three known
 name/ID spelling mismatches, the one non-reciprocal spouse, unresolved mother,
@@ -1242,6 +1425,12 @@ substring-only name creates a relationship.
 Use `argparse` and require explicit environments. Exact operator surface:
 
 ```powershell
+python -m ops.cli render-schema --output migration-artifacts/airtable-schema.json
+python -m ops.cli plan-schema --target staging --output migration-artifacts/staging-schema-plan.json
+
+$schemaPlan = "migration-artifacts/staging-schema-plan.json"
+$schemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+python -m ops.cli provision-schema --target staging --plan $schemaPlan --apply --confirm-sha $schemaPlanSha
 python -m ops.cli preflight --source production --read-only
 python -m ops.cli preflight --target staging --read-only
 python -m ops.cli backup --source production --output D:\shajra-backups\snapshot.sbk
@@ -1255,13 +1444,31 @@ $planSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $plan).Hash.ToLowerInvar
 python -m ops.cli migrate --target production --plan $plan --apply --confirm-sha $planSha
 ```
 
+`render-schema` is local and network-free. `plan-schema` reads target metadata and
+writes canonical JSON containing `schemaVersion`, `target`, `manifestSha256`,
+`observedSchemaSha256`, ordered `createTables`, and `incompatibilities`; it exits
+nonzero when an existing table is incompatible. Both SHA-256 values hash
+sorted-key compact ASCII JSON. The observed digest contains table names, explicit
+missing-table markers, resolved primary-field names, field names/types, and
+declared option key/value pairs; it excludes Airtable table/field IDs and
+descriptions. `provision-schema` parses the plan and, before any no-op or mutation,
+requires the command target to match the plan, the current rendered manifest to
+match `manifestSha256`, `--apply`, the exact plan SHA, and `--allow-production`
+for production. It then re-reads metadata. Full validation returns idempotent
+no-op success; otherwise the observed digest must match and every issue must map
+exactly to the plan's ordered missing-table actions. Only then may it call
+`Base.create_table` using each typed `TableSpec`. It never modifies, renames, or
+deletes existing schema and finishes with read-only validation. Execution of the
+production command belongs only to the separately reviewed rollout plan; no
+schema command is run against cloud state while implementing this task.
+
 Source preflight verifies only the declared legacy read schema. Target preflight
-imports `NORMALIZED_SCHEMA` and verifies every normalized table and required
-field, including `UnresolvedRelationships`, without creating or updating cloud
-state. Add CLI tests where that table alone is absent and assert preflight fails
-before repository construction or any write. The reviewed provisioning checklist
-is generated directly from the same manifest, so table creation and verification
-cannot use divergent inventories.
+calls `Base.schema(force=True)` and `validate_normalized_schema`, including
+primary fields, exact normalized field sets, field types, integer precision, and
+checkbox options, without mutation. A missing `UnresolvedRelationships` table or
+any incompatible field fails before repository construction or record writes.
+Render, plan, provision, and preflight all consume the same immutable
+`NORMALIZED_SCHEMA`.
 
 Production `migrate` refuses to run without `--apply`, the exact SHA-256 of the
 reviewed plan file, a verified restore-drill receipt, and all blocking ambiguities
@@ -1277,10 +1484,10 @@ Create family units only from exact ID pairs or reviewed reciprocal links. Creat
 parent-child links only from existing exact IDs. Put every name-only relation in
 the ambiguity report. Generate each unresolved annotation ID with its exact
 source-field/ordinal slot (`FatherName#0`, `MotherName#0`, or
-`SpouseNames#{zero_based_index}`), and assert one multi-relation row yields
-distinct IDs that are unchanged on rerun. Produce expected row counts and
-semantic checksum before any apply. Batch Airtable writes and retry `429` with
-bounded backoff.
+`SpouseName#0`), and assert one row containing all three scalar fields yields
+three distinct IDs that are unchanged on rerun. Do not split the scalar spouse
+cell. Produce expected row counts and semantic checksum before any apply. Batch
+Airtable writes and retry `429` with bounded backoff.
 
 - [ ] **Step 7: Implement verification and recovery**
 

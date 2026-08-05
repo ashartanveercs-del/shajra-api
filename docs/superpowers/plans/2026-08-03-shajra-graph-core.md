@@ -113,7 +113,7 @@ def test_migrated_ids_are_deterministic_and_table_scoped():
 
 
 def test_migrated_unresolved_ids_are_relation_slot_scoped_and_idempotent():
-    slots = ("FatherName#0", "MotherName#0", "SpouseNames#0", "SpouseNames#1")
+    slots = ("FatherName#0", "MotherName#0", "SpouseName#0")
     first_run = [
         migrated_unresolved_relationship_id("ApprovedMembers", "rec123", slot)
         for slot in slots
@@ -231,10 +231,11 @@ def migrated_run_id(source_table: str, source_record_id: str) -> MigrationRunId:
 
 `source_relation_slot` is a non-empty, case-sensitive source-field/ordinal token
 owned by the legacy mapper. Use exact values such as `FatherName#0`,
-`MotherName#0`, and `SpouseNames#0`; list ordinals are zero-based and preserve
-source order. The compact ASCII JSON array in `_migrated_unresolved` is the
-canonical UUID5 name, so delimiter characters inside source values cannot make
-two identities ambiguous.
+`MotherName#0`, and `SpouseName#0`. Those are the three scalar relation fields in
+the current `ApprovedMembers` schema; do not split delimiters or invent a plural
+field. The compact ASCII JSON array in `_migrated_unresolved` is the canonical
+UUID5 name, so delimiter characters inside source values cannot make two
+identities ambiguous.
 
 - [ ] **Step 4: Write failing partial-date tests**
 

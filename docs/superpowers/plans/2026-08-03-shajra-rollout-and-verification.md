@@ -267,14 +267,30 @@ Vercel variables. Stop if any provider requests billing or a card.
 
 - [ ] **Step 2: Create or select a staging Airtable base**
 
-Use the existing account only. Confirm its base ID differs from production. Create
-the normalized schema through `python -m ops.cli preflight --target staging` and
-the guarded schema command. Seed synthetic names only, such as `Fixture Parent A`,
-never production biographies, contacts, or submissions.
+Use the existing account only. Confirm its base ID differs from production. Render,
+plan, review, and provision the normalized schema through the operator-only CLI:
+
+```powershell
+$schemaDir = "D:\shajra-rollout-evidence\current\schema"
+New-Item -ItemType Directory -Force -Path $schemaDir | Out-Null
+python -m ops.cli render-schema --output "$schemaDir\airtable-schema.json"
+python -m ops.cli plan-schema --target staging --output "$schemaDir\staging-schema-plan.json"
+
+$schemaPlan = "$schemaDir\staging-schema-plan.json"
+$schemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+python -m ops.cli provision-schema --target staging --plan $schemaPlan --apply --confirm-sha $schemaPlanSha
+python -m ops.cli preflight --target staging --read-only
+```
+
+Review the rendered manifest and plan before provisioning. The plan must contain
+only the expected missing-table actions and no incompatibilities. Seed synthetic
+names only, such as `Fixture Parent A`, never production biographies, contacts, or
+submissions.
 
 The staging schema includes `PersonVersions`, `FamilyUnits`, `ParentChildLinks`,
-`ChangeLog`, `GraphCommits`, `GraphState`, `EnrichmentAttempts`, and
-`SubmissionReviews`, plus stable-ID fields on the existing staging person table.
+`UnresolvedRelationships`, `ChangeLog`, `GraphCommits`, `GraphState`,
+`EnrichmentAttempts`, and `SubmissionReviews`. The legacy staging person table
+remains read-only and schema-unchanged.
 
 If the PAT lacks schema scope, stop and request the minimum schema permission;
 do not broaden unrelated account access.
@@ -520,7 +536,8 @@ healthy and no new production Airtable rows may appear.
 
 **Interfaces:**
 - Consumes: production read access and staging restore target.
-- Produces: encrypted backup, reviewed migration plan, and explicit apply gate.
+- Produces: encrypted backup, reviewed schema and migration plans, and explicit
+  apply gate for both plan SHAs.
 
 This task intentionally creates no repository diff; do not make an empty commit.
 
@@ -548,17 +565,25 @@ python -m ops.cli backup --source production --output $backup
 Verify the `.sha256`, file permissions, successful decrypt in memory, and that
 `git status --short` shows no backup artifact.
 
-- [ ] **Step 3: Generate audit and deterministic migration plan**
+- [ ] **Step 3: Generate audit and deterministic schema and migration plans**
 
 ```powershell
 $artifactDir = "D:\shajra-backups\$stamp\artifacts"
 New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
 python -m ops.cli audit --backup $backup --output "$artifactDir\audit.json"
+python -m ops.cli plan-schema --target production --output "$artifactDir\production-schema-plan.json"
 python -m ops.cli plan --backup $backup --output "$artifactDir\plan.json"
+
+$schemaPlan = "$artifactDir\production-schema-plan.json"
+$schemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+$migrationPlan = "$artifactDir\plan.json"
+$migrationPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $migrationPlan).Hash.ToLowerInvariant()
 ```
 
-Summarize counts, checksum, exact-ID relationships, ambiguities, and unresolved
-names to the user without exposing contact data or full biographies.
+Require an empty schema `incompatibilities` list. Summarize the schema create
+actions, both plan SHAs, counts, checksum, exact-ID relationships, ambiguities,
+and unresolved names to the user without exposing contact data or full
+biographies.
 
 - [ ] **Step 4: Restore and verify in staging**
 
@@ -571,9 +596,15 @@ Run the complete preview graph and form suite against the restored staging data.
 
 - [ ] **Step 5: Stop for explicit production migration approval**
 
-Present the migration report, current ambiguities, backup checksum, staging
-verification, rollback procedure, and exact production write count. Do not run
-production `migrate` until the user explicitly approves this reviewed report.
+Present the schema and migration reports, both plan SHAs, current ambiguities,
+backup checksum, staging verification, rollback procedure, and exact production
+write count. Do not run production `provision-schema` or `migrate` until the user
+explicitly approves this reviewed report.
+
+After approval, record `schemaPlanPath`, `schemaPlanSha256`,
+`observedSchemaSha256`, `migrationPlanPath`, `migrationPlanSha256`, the source
+checksum/counts, approval timestamp, and approval reference in the redacted Task
+7 evidence file. Never record credentials or family row contents.
 
 ### Task 8: Apply Migration and Enable Normalized Reads
 
@@ -581,37 +612,73 @@ production `migrate` until the user explicitly approves this reviewed report.
 - Write redacted external evidence only: `D:\shajra-rollout-evidence\current\08-production-migration.json`
 
 **Interfaces:**
-- Consumes: exact approved plan SHA and drift-free production preflight.
+- Consumes: exact approved schema and migration plan SHAs and drift-free
+  production preflight.
 - Produces: verified normalized production revision with reversible read cutover.
 
 This task intentionally creates no repository diff; do not make an empty commit.
 
-**External mutations:** normalized production Airtable rows and backend production flag.
+**External mutations:** missing normalized production Airtable tables, normalized
+production rows, and backend production flag.
 
 - [ ] **Step 1: Re-run read-only preflight and detect drift**
 
-If production counts or checksum differ from Task 7, discard the migration plan,
-take a new backup, restore it to staging, and request approval again.
+```powershell
+$approvalPath = "D:\shajra-rollout-evidence\current\07-migration-review.json"
+$approval = Get-Content -LiteralPath $approvalPath -Raw | ConvertFrom-Json
+$driftPlan = Join-Path (Split-Path -Parent $approval.schemaPlanPath) "production-schema-drift-check.json"
 
-- [ ] **Step 2: Apply the exact reviewed plan**
+python -m ops.cli preflight --source production --read-only
+python -m ops.cli plan-schema --target production --output $driftPlan
+
+$currentSchemaPlan = Get-Content -LiteralPath $driftPlan -Raw | ConvertFrom-Json
+if ($currentSchemaPlan.observedSchemaSha256 -ne $approval.observedSchemaSha256) {
+    throw "Production Airtable schema changed after approval"
+}
+```
+
+Compare source counts/checksum with the approved evidence as well. If they differ,
+or if `plan-schema` reports an incompatibility, discard both reviewed plans, take
+a new backup, restore it to staging, and request approval again.
+
+- [ ] **Step 2: Provision the exact reviewed schema plan**
 
 ```powershell
-$plan = "$artifactDir\plan.json"
-$planSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $plan).Hash.ToLowerInvariant()
-python -m ops.cli migrate --target production --plan $plan --apply --confirm-sha $planSha
-python -m ops.cli verify --target production --plan $plan
+$schemaPlan = [string]$approval.schemaPlanPath
+$actualSchemaPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $schemaPlan).Hash.ToLowerInvariant()
+if ($actualSchemaPlanSha -ne $approval.schemaPlanSha256) {
+    throw "Approved schema plan file changed"
+}
+python -m ops.cli provision-schema --target production --plan $schemaPlan --apply --confirm-sha $approval.schemaPlanSha256 --allow-production
+python -m ops.cli preflight --target production --read-only
+```
+
+Expected: the command creates only reviewed missing tables, or returns no-op
+success if the complete normalized schema already exists. Target preflight must
+then report no schema issue before any record write.
+
+- [ ] **Step 3: Apply the exact reviewed migration plan**
+
+```powershell
+$migrationPlan = [string]$approval.migrationPlanPath
+$actualMigrationPlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $migrationPlan).Hash.ToLowerInvariant()
+if ($actualMigrationPlanSha -ne $approval.migrationPlanSha256) {
+    throw "Approved migration plan file changed"
+}
+python -m ops.cli migrate --target production --plan $migrationPlan --apply --confirm-sha $approval.migrationPlanSha256
+python -m ops.cli verify --target production --plan $migrationPlan
 ```
 
 Expected: actual counts equal plan counts, all blocking issues absent, semantic
 checksum exact, and legacy people unchanged.
 
-- [ ] **Step 3: Enable normalized reads only**
+- [ ] **Step 4: Enable normalized reads only**
 
 Set production `NORMALIZED_READS_ENABLED=true` while both write flags remain
 `false`. Redeploy/promote backend, verify v2 checksum and person accounting, then
 verify frontend graph geometry and every route.
 
-- [ ] **Step 4: Prove read rollback**
+- [ ] **Step 5: Prove read rollback**
 
 In staging, toggle normalized reads off, verify legacy adapter, then restore it to
 on. In production, retain the flag rollback command and previous deployment ID;
