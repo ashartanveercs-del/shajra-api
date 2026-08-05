@@ -10,11 +10,13 @@ from domain.issues import GraphIssue, IssueSeverity, ValidationReport
 from domain.models import (
     FamilyUnit,
     FamilyUnitKind,
+    Gender,
     GraphSnapshot,
     ParentChildLink,
     ParentRole,
     Person,
     RelationshipType,
+    UnionStatus,
 )
 from domain.projection import (
     PUBLIC_ISSUE_MESSAGES,
@@ -561,6 +563,62 @@ def test_component_link_ids_are_bucketed_in_one_pass_after_roots_finalize():
     assert links.iterations == 1
 
 
+def test_components_omit_a_link_attached_to_a_different_family_component():
+    adult_a = PersonId("per_component_a")
+    adult_b = PersonId("per_component_b")
+    adult_c = PersonId("per_component_c")
+    adult_d = PersonId("per_component_d")
+    family_a = FamilyUnitId("fam_component_a")
+    family_b = FamilyUnitId("fam_component_b")
+    people = tuple(
+        ProjectedPerson(person_id, str(person_id), Gender.UNKNOWN, None, None, None)
+        for person_id in (adult_a, adult_b, adult_c, adult_d)
+    )
+    families = (
+        ProjectedFamilyUnit(
+            family_a,
+            FamilyUnitKind.UNION,
+            adult_a,
+            adult_b,
+            UnionStatus.UNKNOWN,
+            None,
+            None,
+        ),
+        ProjectedFamilyUnit(
+            family_b,
+            FamilyUnitKind.UNION,
+            adult_c,
+            adult_d,
+            UnionStatus.UNKNOWN,
+            None,
+            None,
+        ),
+    )
+    memberships = (
+        AdultMembershipEdge("adult:fam_component_a:per_component_a", family_a, adult_a, "adult_a"),
+        AdultMembershipEdge("adult:fam_component_a:per_component_b", family_a, adult_b, "adult_b"),
+        AdultMembershipEdge("adult:fam_component_b:per_component_c", family_b, adult_c, "adult_a"),
+        AdultMembershipEdge("adult:fam_component_b:per_component_d", family_b, adult_d, "adult_b"),
+    )
+    misplaced_link = ProjectedLink(
+        LinkId("lnk_misplaced_component"),
+        adult_a,
+        adult_b,
+        ParentRole.PARENT,
+        RelationshipType.BIOLOGICAL,
+        family_b,
+        False,
+    )
+
+    components = _components(people, families, (misplaced_link,), memberships, ())
+
+    assert {component.family_unit_ids for component in components} == {
+        (family_a,),
+        (family_b,),
+    }
+    assert all(component.link_ids == () for component in components)
+
+
 def test_projection_carries_the_snapshot_semantic_checksum_without_rehashing():
     snapshot = deterministic_projection_snapshot()
     projection = project_graph(snapshot)
@@ -700,6 +758,23 @@ def test_archived_family_filter_removes_incident_topology_without_dangling_ids()
         dict(snapshot.family_units),
         dict(snapshot.links),
         dict(snapshot.unresolved),
+    )
+
+
+def test_archived_topology_adds_a_public_warning_when_validation_has_none(monkeypatch):
+    monkeypatch.setattr(
+        "domain.projection.validate_snapshot",
+        lambda _: ValidationReport(()),
+    )
+
+    projection = project_graph(archived_two_parent_snapshot())
+
+    assert projection.issues == (
+        PublicGraphIssue(
+            "ARCHIVED_RELATIONSHIP_OMITTED",
+            IssueSeverity.WARNING,
+            "Some relationships are hidden because an archived person is involved.",
+        ),
     )
 
 

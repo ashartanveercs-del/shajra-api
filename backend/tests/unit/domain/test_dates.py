@@ -20,6 +20,11 @@ def test_rejects_invalid_calendar_date():
         PartialDate.parse("2024-02-31")
 
 
+def test_rejects_unsupported_date_format():
+    with pytest.raises(ValueError, match="Date must be YYYY, YYYY-MM, or YYYY-MM-DD"):
+        PartialDate.parse("1960/04")
+
+
 def test_precision_aware_ordering_uses_possible_ranges():
     year = PartialDate.parse("1960")
     next_year = PartialDate.parse("1961")

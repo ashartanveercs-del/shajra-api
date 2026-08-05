@@ -25,7 +25,11 @@ from domain.models import (
     UnresolvedRelationship,
     UnresolvedRelationshipKind,
 )
-from tests.fixtures.graphs import duplicate_historical_union_snapshot
+from domain.projection import project_graph
+from tests.fixtures.graphs import (
+    duplicate_historical_union_snapshot,
+    two_parent_family_snapshot,
+)
 
 
 def _snapshot() -> GraphSnapshot:
@@ -228,3 +232,16 @@ def test_checksum_rejects_mapping_key_mismatched_with_embedded_stable_id(collect
 def test_checksum_rejects_non_snapshot_input():
     with pytest.raises(TypeError):
         semantic_checksum(object())
+
+
+def test_projection_carries_the_snapshot_checksum():
+    snapshot = two_parent_family_snapshot()
+
+    assert project_graph(snapshot).semantic_checksum == semantic_checksum(snapshot)
+
+
+def test_checksum_rejects_a_projection():
+    snapshot = two_parent_family_snapshot()
+
+    with pytest.raises(TypeError):
+        semantic_checksum(project_graph(snapshot))
