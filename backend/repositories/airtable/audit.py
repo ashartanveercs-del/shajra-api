@@ -59,15 +59,13 @@ _PHONE_CANDIDATE = re.compile(
     re.IGNORECASE,
 )
 _PHONE_LABEL = re.compile(
-    r"\b(?:mobile|phone|tel|telephone|whatsapp)\b\.?\s*"
-    r"(?:(?:no|number)\.?\s*)?[:=]?\s*",
+    r"\b(?:cellphone|telephone|whatsapp|mobile|phone|call|reach|cell|mob|tel)\b\.?\s*"
+    r"(?:(?:no|number)\.?\s*)?"
+    r"(?:(?:me\s+(?:at|on)|is|at|on)\s*)?[:=#-]?\s*",
     re.IGNORECASE,
 )
 _PARTIAL_DATE_CANDIDATE = re.compile(
     r"(?<![0-9])(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-[0-9]{2}|[0-9]{4})(?![0-9])"
-)
-_PHONE_RUN_CHARACTERS = frozenset(
-    "0123456789 +().,/-\u2010\u2011\u2012\u2013\u2014\u2015"
 )
 _CREDENTIAL_VALUE = re.compile(
     r"(?i)(?:bearer\s+\S+|(?:api[-_]?key|password|secret|token)\s*[:=]\s*\S+|"
@@ -430,16 +428,8 @@ class AirtableAuditRepository:
             return True
         if _CREDENTIAL_VALUE.search(stripped):
             return True
-        for original_candidate in _PHONE_CANDIDATE.finditer(stripped):
-            number = original_candidate.group("number")
-            if (
-                number.startswith("+")
-                and AirtableAuditRepository._digit_count(number) >= 7
-            ):
-                return True
-        masked = AirtableAuditRepository._mask_partial_dates(stripped)
-        for label in _PHONE_LABEL.finditer(masked):
-            labeled_candidate = _PHONE_CANDIDATE.match(masked, label.end())
+        for label in _PHONE_LABEL.finditer(stripped):
+            labeled_candidate = _PHONE_CANDIDATE.match(stripped, label.end())
             if (
                 labeled_candidate is not None
                 and AirtableAuditRepository._digit_count(
@@ -448,10 +438,18 @@ class AirtableAuditRepository:
                 >= 7
             ):
                 return True
+        for original_candidate in _PHONE_CANDIDATE.finditer(stripped):
+            number = original_candidate.group("number")
+            if (
+                number.startswith("+")
+                and AirtableAuditRepository._digit_count(number) >= 7
+            ):
+                return True
+        masked = AirtableAuditRepository._mask_partial_dates(stripped)
         for masked_candidate in _PHONE_CANDIDATE.finditer(masked):
             number = masked_candidate.group("number")
             digits = AirtableAuditRepository._digit_count(number)
-            if digits >= 10 or (number.startswith("+") and digits >= 7):
+            if digits >= 10:
                 return True
         return False
 
@@ -460,10 +458,6 @@ class AirtableAuditRepository:
         parts: list[str] = []
         position = 0
         for candidate in _PARTIAL_DATE_CANDIDATE.finditer(value):
-            if AirtableAuditRepository._has_adjacent_phone_digits(
-                value, candidate.start(), candidate.end()
-            ):
-                continue
             try:
                 PartialDate.parse(candidate.group(0))
             except ValueError:
@@ -473,17 +467,6 @@ class AirtableAuditRepository:
             position = candidate.end()
         parts.append(value[position:])
         return "".join(parts)
-
-    @staticmethod
-    def _has_adjacent_phone_digits(value: str, start: int, end: int) -> bool:
-        left = start
-        while left > 0 and value[left - 1] in _PHONE_RUN_CHARACTERS:
-            left -= 1
-        right = end
-        while right < len(value) and value[right] in _PHONE_RUN_CHARACTERS:
-            right += 1
-        adjacent = value[left:start] + value[end:right]
-        return any(character.isdigit() for character in adjacent)
 
     @staticmethod
     def _digit_count(value: str) -> int:
