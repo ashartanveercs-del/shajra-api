@@ -59,7 +59,9 @@ _PHONE_CANDIDATE = re.compile(
     re.IGNORECASE,
 )
 _PHONE_LABEL = re.compile(
-    r"\b(?:mobile|phone|tel|telephone|whatsapp)\b\s*[:=]?\s*", re.IGNORECASE
+    r"\b(?:mobile|phone|tel|telephone|whatsapp)\b\.?\s*"
+    r"(?:(?:no|number)\.?\s*)?[:=]?\s*",
+    re.IGNORECASE,
 )
 _PARTIAL_DATE_CANDIDATE = re.compile(
     r"(?<![0-9])(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-[0-9]{2}|[0-9]{4})(?![0-9])"
@@ -428,16 +430,26 @@ class AirtableAuditRepository:
             return True
         if _CREDENTIAL_VALUE.search(stripped):
             return True
-        masked = AirtableAuditRepository._mask_partial_dates(stripped)
-        for label in _PHONE_LABEL.finditer(masked):
-            candidate = _PHONE_CANDIDATE.match(masked, label.end())
+        for original_candidate in _PHONE_CANDIDATE.finditer(stripped):
+            number = original_candidate.group("number")
             if (
-                candidate is not None
-                and AirtableAuditRepository._digit_count(candidate.group("number")) >= 7
+                number.startswith("+")
+                and AirtableAuditRepository._digit_count(number) >= 7
             ):
                 return True
-        for candidate in _PHONE_CANDIDATE.finditer(masked):
-            number = candidate.group("number")
+        masked = AirtableAuditRepository._mask_partial_dates(stripped)
+        for label in _PHONE_LABEL.finditer(masked):
+            labeled_candidate = _PHONE_CANDIDATE.match(masked, label.end())
+            if (
+                labeled_candidate is not None
+                and AirtableAuditRepository._digit_count(
+                    labeled_candidate.group("number")
+                )
+                >= 7
+            ):
+                return True
+        for masked_candidate in _PHONE_CANDIDATE.finditer(masked):
+            number = masked_candidate.group("number")
             digits = AirtableAuditRepository._digit_count(number)
             if digits >= 10 or (number.startswith("+") and digits >= 7):
                 return True
