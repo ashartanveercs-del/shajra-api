@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from domain.dates import PartialDate
 from domain.ids import OperationId
 from repositories.airtable.graph import RepositoryCorruptionError
 from repositories.protocols import (
@@ -51,12 +52,21 @@ _SENSITIVE_KEY_TOKENS = (
 )
 _EMAIL_VALUE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _AIRTABLE_RECORD_ID_VALUE = re.compile(r"rec[A-Za-z0-9]{14,}")
-_PHONE_VALUE = re.compile(
-    r"(?<!\w)\+?[0-9][0-9\s()./-]{5,}[0-9]"
-    r"(?:\s*(?:ext(?:ension)?\.?|x)\s*[0-9]{1,6})?",
+_PHONE_CANDIDATE = re.compile(
+    r"(?<!\w)(?P<number>\+?(?:\([0-9]|[0-9])"
+    r"[0-9\s().,/\-\u2010-\u2015]*[0-9])"
+    r"(?P<extension>\s*(?:ext(?:ension)?\.?|x)\s*[0-9]{1,6})?(?!\w)",
     re.IGNORECASE,
 )
-_PARTIAL_DATE_VALUE = re.compile(r"[0-9]{4}(?:-[0-9]{2})?(?:-[0-9]{2})?")
+_PHONE_LABEL = re.compile(
+    r"\b(?:mobile|phone|tel|telephone|whatsapp)\b\s*[:=]?\s*", re.IGNORECASE
+)
+_PARTIAL_DATE_CANDIDATE = re.compile(
+    r"(?<![0-9])(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-[0-9]{2}|[0-9]{4})(?![0-9])"
+)
+_PHONE_RUN_CHARACTERS = frozenset(
+    "0123456789 +().,/-\u2010\u2011\u2012\u2013\u2014\u2015"
+)
 _CREDENTIAL_VALUE = re.compile(
     r"(?i)(?:bearer\s+\S+|(?:api[-_]?key|password|secret|token)\s*[:=]\s*\S+|"
     r"(?:sk|pk|api)[-_][A-Za-z0-9_-]{8,})"
@@ -418,17 +428,54 @@ class AirtableAuditRepository:
             return True
         if _CREDENTIAL_VALUE.search(stripped):
             return True
-        if _PARTIAL_DATE_VALUE.fullmatch(stripped):
-            return False
-        for match in _PHONE_VALUE.finditer(stripped):
-            candidate = match.group(0)
-            digits = sum(character.isdigit() for character in candidate)
-            has_phone_punctuation = candidate.startswith("+") or any(
-                character in candidate for character in " ()./-"
-            )
-            if digits >= 10 or (digits >= 7 and has_phone_punctuation):
+        masked = AirtableAuditRepository._mask_partial_dates(stripped)
+        for label in _PHONE_LABEL.finditer(masked):
+            candidate = _PHONE_CANDIDATE.match(masked, label.end())
+            if (
+                candidate is not None
+                and AirtableAuditRepository._digit_count(candidate.group("number")) >= 7
+            ):
+                return True
+        for candidate in _PHONE_CANDIDATE.finditer(masked):
+            number = candidate.group("number")
+            digits = AirtableAuditRepository._digit_count(number)
+            if digits >= 10 or (number.startswith("+") and digits >= 7):
                 return True
         return False
+
+    @staticmethod
+    def _mask_partial_dates(value: str) -> str:
+        parts: list[str] = []
+        position = 0
+        for candidate in _PARTIAL_DATE_CANDIDATE.finditer(value):
+            if AirtableAuditRepository._has_adjacent_phone_digits(
+                value, candidate.start(), candidate.end()
+            ):
+                continue
+            try:
+                PartialDate.parse(candidate.group(0))
+            except ValueError:
+                continue
+            parts.append(value[position : candidate.start()])
+            parts.append("DATE")
+            position = candidate.end()
+        parts.append(value[position:])
+        return "".join(parts)
+
+    @staticmethod
+    def _has_adjacent_phone_digits(value: str, start: int, end: int) -> bool:
+        left = start
+        while left > 0 and value[left - 1] in _PHONE_RUN_CHARACTERS:
+            left -= 1
+        right = end
+        while right < len(value) and value[right] in _PHONE_RUN_CHARACTERS:
+            right += 1
+        adjacent = value[left:start] + value[end:right]
+        return any(character.isdigit() for character in adjacent)
+
+    @staticmethod
+    def _digit_count(value: str) -> int:
+        return sum(character.isdigit() for character in value)
 
     @staticmethod
     def _fields(record: object) -> Mapping[str, object]:

@@ -1144,6 +1144,64 @@ def test_audit_removes_embedded_phone_pii_but_preserves_partial_dates(
     assert phone_text not in str(fake.tables["ChangeLog"].records)
 
 
+@pytest.mark.parametrize(
+    "safe_text",
+    (
+        "Born 1980-01-02",
+        "Year 1980",
+        "Reference 12345678",
+    ),
+    ids=("embedded-date", "embedded-year", "unlabeled-eight-digits"),
+)
+def test_audit_preserves_embedded_partial_dates_and_short_unlabeled_numbers(
+    safe_text: str,
+) -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = replace(
+        _audit_operation(),
+        after_snapshot_json=json.dumps({"note": safe_text}),
+    )
+
+    repository.create_pending(operation)
+    found = repository.find_by_idempotency_key(operation.idempotency_key)
+
+    assert found is not None
+    assert json.loads(found.after_snapshot_json) == {"note": safe_text}
+    row = fake.tables["ChangeLog"].records[0]["fields"]
+    assert json.loads(row["AfterSnapshotJson"])["note"] == safe_text  # type: ignore[arg-type,index]
+
+
+@pytest.mark.parametrize(
+    "private_text",
+    (
+        "Call 202, 555, 0199",
+        "Call 202\u2013555\u20130199",
+        "Phone: 12345678",
+        "Born 1980-01-02; call 202, 555, 0199",
+    ),
+    ids=("comma", "en-dash", "labeled-eight-digits", "date-and-phone"),
+)
+def test_audit_removes_general_and_labeled_phone_candidates(
+    private_text: str,
+) -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = replace(
+        _audit_operation(),
+        after_snapshot_json=json.dumps({"note": private_text, "safe": "kept"}),
+    )
+
+    repository.create_pending(operation)
+    found = repository.find_by_idempotency_key(operation.idempotency_key)
+
+    assert found is not None
+    assert json.loads(found.after_snapshot_json) == {"safe": "kept"}
+    row = fake.tables["ChangeLog"].records[0]["fields"]
+    assert private_text not in row["AfterSnapshotJson"]  # type: ignore[operator,index]
+    assert private_text not in str(fake.tables["ChangeLog"].records)
+
+
 def test_audit_scope_rejects_cross_scope_create_and_filters_reads() -> None:
     fake = FakeAirtable()
     repository = _audit_repository(fake)
