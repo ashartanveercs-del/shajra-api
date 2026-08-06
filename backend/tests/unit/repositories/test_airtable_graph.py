@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import importlib
 import json
 from dataclasses import replace
@@ -472,6 +473,98 @@ def test_identical_commit_retry_repairs_the_graph_state_cache() -> None:
     }
 
 
+def test_fresh_repository_recovers_identical_commit_and_repairs_cache() -> None:
+    fake = FakeAirtable()
+    first_repository = _graph_repository(fake)
+    person = Person(PersonId("per_one"), "One")
+    receipt = first_repository.stage(
+        GraphWriteSet(person_upserts=(person,)), _context("op_one", 1, 5)
+    )
+    first_repository.verify_staged(receipt)
+    snapshot = _snapshot(1, "op_one", 5, people=(person,))
+    commit, permit = _commit_and_permit(receipt, snapshot)
+    expected_state = first_repository.append_commit(commit, permit)
+    fake.tables["GraphState"].records.clear()
+
+    recovered_state = _graph_repository(fake).append_commit(commit, permit)
+
+    assert recovered_state == expected_state
+    assert len(fake.tables["GraphCommits"].records) == 1
+    assert fake.tables["GraphState"].records[0]["fields"]["StateKey"] == SCOPE  # type: ignore[index]
+
+
+def test_verification_ignores_malformed_semantics_outside_receipt_tuple() -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    receipt = repository.stage(
+        GraphWriteSet(person_upserts=(Person(PersonId("per_one"), "One"),)),
+        _context("op_one", 1, 5),
+    )
+    valid = fake.tables["PersonVersions"].records[0]["fields"]
+    for overrides in (
+        {"OperationId": "op_abandoned"},
+        {"FencingToken": 999},
+        {"Revision": 2},
+    ):
+        malformed = copy.deepcopy(valid)
+        malformed.pop("FullName")  # type: ignore[union-attr]
+        malformed.update(overrides)  # type: ignore[union-attr]
+        fake.tables["PersonVersions"].seed(malformed)  # type: ignore[arg-type]
+
+    repository.verify_staged(receipt)
+
+
+def test_committed_load_ignores_malformed_semantics_outside_commit_tuple() -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    person = Person(PersonId("per_one"), "One")
+    receipt = repository.stage(
+        GraphWriteSet(person_upserts=(person,)), _context("op_one", 1, 5)
+    )
+    repository.verify_staged(receipt)
+    commit, permit = _commit_and_permit(
+        receipt, _snapshot(1, "op_one", 5, people=(person,))
+    )
+    repository.append_commit(commit, permit)
+    valid = fake.tables["PersonVersions"].records[0]["fields"]
+    for overrides in (
+        {"OperationId": "op_abandoned"},
+        {"FencingToken": 999},
+        {"Revision": 2},
+    ):
+        malformed = copy.deepcopy(valid)
+        malformed.pop("FullName")  # type: ignore[union-attr]
+        malformed.update(overrides)  # type: ignore[union-attr]
+        fake.tables["PersonVersions"].seed(malformed)  # type: ignore[arg-type]
+
+    assert repository.load_committed().people == {person.person_id: person}
+
+
+@pytest.mark.parametrize("phase", ("verify", "load"))
+def test_authorized_rows_with_malformed_semantics_fail_closed(phase: str) -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    person = Person(PersonId("per_one"), "One")
+    receipt = repository.stage(
+        GraphWriteSet(person_upserts=(person,)), _context("op_one", 1, 5)
+    )
+    if phase == "load":
+        repository.verify_staged(receipt)
+        commit, permit = _commit_and_permit(
+            receipt, _snapshot(1, "op_one", 5, people=(person,))
+        )
+        repository.append_commit(commit, permit)
+    malformed = copy.deepcopy(fake.tables["PersonVersions"].records[0]["fields"])
+    malformed.pop("FullName")  # type: ignore[union-attr]
+    fake.tables["PersonVersions"].seed(malformed)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError):
+        if phase == "verify":
+            repository.verify_staged(receipt)
+        else:
+            repository.load_committed()
+
+
 def test_uncommitted_rows_are_invisible_and_exact_commit_tuple_authorizes_rows() -> (
     None
 ):
@@ -601,6 +694,40 @@ def test_conflicting_commit_rows_and_semantic_checksum_mismatch_fail_closed() ->
     fake.tables["GraphCommits"].seed({**commit_row, "SemanticChecksum": "0" * 64})
     with pytest.raises(RuntimeError, match="COMMIT_CHECKSUM_MISMATCH"):
         repository.load_committed()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("OperationId", "bad"),
+        ("Revision", 0),
+        ("Revision", -1),
+        ("FencingToken", 0),
+        ("FencingToken", -1),
+        ("PermitId", "bad"),
+        ("SemanticChecksum", "bad"),
+        ("CommittedAt", "2026-08-05T12:30:45"),
+    ),
+)
+def test_malformed_commit_rows_fail_with_stable_corruption(
+    field: str, value: object
+) -> None:
+    fake = FakeAirtable()
+    fake.tables["GraphCommits"].seed(
+        {
+            "GraphScope": SCOPE,
+            "Revision": 1,
+            "OperationId": "op_one",
+            "FencingToken": 1,
+            "PermitId": "cpr_one",
+            "SemanticChecksum": "a" * 64,
+            "CommittedAt": COMMITTED_AT.isoformat(),
+            field: value,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="COMMIT_LOG_CORRUPTION"):
+        _graph_repository(fake).load_committed()
 
 
 @pytest.mark.parametrize(
@@ -781,6 +908,88 @@ def test_audit_pending_is_append_only_canonical_redacted_and_record_id_free() ->
     )
 
 
+def test_audit_recursively_removes_private_keys_and_values() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = replace(
+        _audit_operation(),
+        commands_json=json.dumps(
+            [
+                {
+                    "kind": "rename",
+                    "person_id": "per_a",
+                    "metadata": {
+                        "primary_email_address": "first@example.test",
+                        "api_token_hash": "hash-secret",
+                    },
+                }
+            ]
+        ),
+        before_snapshot_json=json.dumps(
+            {
+                "person_id": "per_a",
+                "full_name": "Ada",
+                "nested": {
+                    "auth": {"kind": "password", "value": "hunter2"},
+                    "items": [
+                        "safe",
+                        "second@example.test",
+                        "+1 (202) 555-0199",
+                        "rec12345678901234",
+                        {"kind": "password", "value": "generic-secret"},
+                    ],
+                },
+            }
+        ),
+        after_snapshot_json=json.dumps(
+            {
+                "person_id": "per_a",
+                "full_name": "Ada Updated",
+                "payload": "third@example.test",
+                "details": {"value": "+442071838750"},
+            }
+        ),
+    )
+
+    repository.create_pending(operation)
+    found = repository.find_by_idempotency_key(operation.idempotency_key)
+
+    assert found is not None
+    assert json.loads(found.commands_json) == [
+        {"kind": "rename", "metadata": {}, "person_id": "per_a"}
+    ]
+    assert json.loads(found.before_snapshot_json) == {
+        "full_name": "Ada",
+        "nested": {"items": ["safe"]},
+        "person_id": "per_a",
+    }
+    assert json.loads(found.after_snapshot_json) == {
+        "details": {},
+        "full_name": "Ada Updated",
+        "person_id": "per_a",
+    }
+    serialized = " ".join(
+        (
+            found.commands_json,
+            found.before_snapshot_json,
+            found.after_snapshot_json,
+            str(fake.tables["ChangeLog"].records),
+        )
+    )
+    for secret in (
+        "first@example.test",
+        "hash-secret",
+        "hunter2",
+        "second@example.test",
+        "+1 (202) 555-0199",
+        "rec12345678901234",
+        "generic-secret",
+        "third@example.test",
+        "+442071838750",
+    ):
+        assert secret not in serialized
+
+
 def test_audit_scope_rejects_cross_scope_create_and_filters_reads() -> None:
     fake = FakeAirtable()
     repository = _audit_repository(fake)
@@ -852,6 +1061,111 @@ def test_audit_pending_retry_is_idempotent_and_conflicting_key_fails_closed() ->
             )
         )
     assert len(fake.tables["ChangeLog"].records) == 1
+
+
+def test_blank_source_reference_round_trips_as_idempotent_none() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    blank = replace(_audit_operation(), source_reference="")
+
+    repository.create_pending(blank)
+    repository.create_pending(replace(blank, source_reference=None))
+    found = repository.find_by_idempotency_key(blank.idempotency_key)
+
+    assert found is not None
+    assert found.source_reference is None
+    assert len(fake.tables["ChangeLog"].records) == 1
+    assert fake.tables["ChangeLog"].records[0]["fields"]["SourceReference"] is None  # type: ignore[index]
+
+
+def test_later_repetition_of_the_same_audit_state_is_corruption() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    repository.create_pending(operation)
+    repeated = copy.deepcopy(fake.tables["ChangeLog"].records[0]["fields"])
+    repeated["UpdatedAt"] = (COMMITTED_AT + timedelta(microseconds=1)).isoformat()  # type: ignore[index]
+    fake.tables["ChangeLog"].seed(repeated)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="AUDIT_LOG_CORRUPTION"):
+        repository.find_by_idempotency_key(operation.idempotency_key)
+
+
+def test_exact_duplicate_audit_transition_is_a_physical_retry() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    repository.create_pending(operation)
+    duplicate = copy.deepcopy(fake.tables["ChangeLog"].records[0]["fields"])
+    fake.tables["ChangeLog"].seed(duplicate)  # type: ignore[arg-type]
+
+    found = repository.find_by_idempotency_key(operation.idempotency_key)
+
+    assert found is not None
+    assert found.state is AuditOperationState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("operation_id", "bad"),
+        ("revision", 0),
+        ("revision", -1),
+        ("fencing_token", 0),
+        ("fencing_token", -1),
+        ("permit_id", "bad"),
+        ("semantic_checksum", "bad"),
+        ("committed_at", "2026-08-05T12:30:45"),
+    ),
+)
+def test_audit_rejects_invalid_graph_commit_json(field: str, value: object) -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    commit_value = json.loads(operation.graph_commit_json)
+    commit_value[field] = value
+    malformed_json = json.dumps(commit_value)
+
+    with pytest.raises(ValueError):
+        repository.create_pending(
+            replace(
+                operation,
+                graph_commit_json=malformed_json,
+                commit_sha256=hashlib.sha256(
+                    malformed_json.encode("ascii")
+                ).hexdigest(),
+            )
+        )
+
+    assert fake.tables["ChangeLog"].records == []
+
+
+@pytest.mark.parametrize("document", ("commit", "commands", "snapshot"))
+def test_audit_rejects_duplicate_json_object_keys(document: str) -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    if document == "commit":
+        duplicate = operation.graph_commit_json.replace(
+            '"operation_id":"op_audit"',
+            '"operation_id":"op_audit","operation_id":"op_other"',
+            1,
+        )
+        operation = replace(operation, graph_commit_json=duplicate)
+    elif document == "commands":
+        operation = replace(
+            operation, commands_json='[{"kind":"rename","kind":"delete"}]'
+        )
+    else:
+        operation = replace(
+            operation,
+            before_snapshot_json='{"person":{"full_name":"Ada","full_name":"Other"}}',
+        )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        repository.create_pending(operation)
+
+    assert fake.tables["ChangeLog"].records == []
 
 
 @pytest.mark.parametrize(

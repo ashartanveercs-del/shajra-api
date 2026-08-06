@@ -39,6 +39,7 @@ from repositories.protocols import (
 
 SCOPE = "test:shajra"
 COMMITTED_AT = datetime(2026, 8, 5, 12, 30, 45, 123456, tzinfo=UTC)
+VALID_CHECKSUM = "a" * 64
 
 
 @pytest.fixture
@@ -59,7 +60,7 @@ def context_for(operation_id: str, revision: int, fencing_token: int) -> WriteCo
 def commit_and_permit_for(
     receipt,
     *,
-    semantic_checksum: str = "checksum",
+    semantic_checksum: str = VALID_CHECKSUM,
     committed_at: datetime = COMMITTED_AT,
 ) -> tuple[GraphCommit, CommitPermit]:
     commit = GraphCommit(
@@ -254,7 +255,7 @@ def test_permit_mismatches_reject_before_adding_a_commit(
 @pytest.mark.parametrize(
     "mutate_commit",
     [
-        lambda commit: replace(commit, semantic_checksum="altered"),
+        lambda commit: replace(commit, semantic_checksum="b" * 64),
         lambda commit: replace(
             commit, committed_at=commit.committed_at + timedelta(seconds=1)
         ),
@@ -293,7 +294,7 @@ def test_conflicting_logical_commit_duplicate_fails_closed(
     receipt = memory_repository.stage(GraphWriteSet(), context_for("op_one", 1, 1))
     commit, permit = commit_and_permit_for(receipt)
     memory_repository.append_commit(commit, permit)
-    conflicting_commit = replace(commit, semantic_checksum="other")
+    conflicting_commit = replace(commit, semantic_checksum="b" * 64)
     conflicting_permit = replace(
         permit, commit_sha256=graph_commit_sha256(conflicting_commit)
     )
@@ -375,7 +376,7 @@ def test_memory_commit_history_requires_positive_contiguous_revisions(
             revision=revision,
             fencing_token=revision,
             permit_id=f"cpr_{revision}",
-            semantic_checksum="checksum",
+            semantic_checksum=VALID_CHECKSUM,
             committed_at=COMMITTED_AT,
         )
         for revision in revisions
@@ -397,13 +398,13 @@ def test_commits_must_be_sequential(
         memory_repository.append_commit(later_commit, later_permit)
 
 
-def test_commit_hash_uses_canonical_utc_timestamp_and_rejects_naive_time() -> None:
+def test_commit_hash_uses_canonical_utc_timestamp_and_normalized_checksum() -> None:
     commit = GraphCommit(
         operation_id=OperationId("op_one"),
         revision=1,
         fencing_token=1,
         permit_id="cpr_one",
-        semantic_checksum="checksum",
+        semantic_checksum="A" * 64,
         committed_at=datetime(
             2026, 8, 5, 17, 30, 45, 123456, tzinfo=timezone(timedelta(hours=5))
         ),
@@ -412,10 +413,47 @@ def test_commit_hash_uses_canonical_utc_timestamp_and_rejects_naive_time() -> No
     assert canonical_graph_commit_json(commit) == (
         '{"committed_at":"2026-08-05T12:30:45.123456Z","fencing_token":1,'
         '"operation_id":"op_one","permit_id":"cpr_one","revision":1,'
-        '"semantic_checksum":"checksum"}'
+        f'"semantic_checksum":"{VALID_CHECKSUM}"}}'
     )
     with pytest.raises(ValueError, match="timezone-aware"):
         graph_commit_sha256(replace(commit, committed_at=datetime(2026, 8, 5)))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda commit: replace(commit, operation_id=OperationId("bad")),
+        lambda commit: replace(commit, revision=0),
+        lambda commit: replace(commit, revision=-1),
+        lambda commit: replace(commit, fencing_token=0),
+        lambda commit: replace(commit, fencing_token=-1),
+        lambda commit: replace(commit, permit_id="bad"),
+        lambda commit: replace(commit, semantic_checksum="not-a-checksum"),
+        lambda commit: replace(commit, committed_at=datetime(2026, 8, 5)),
+    ),
+    ids=(
+        "operation-id",
+        "zero-revision",
+        "negative-revision",
+        "zero-fence",
+        "negative-fence",
+        "permit-id",
+        "checksum",
+        "naive-timestamp",
+    ),
+)
+def test_graph_commit_canonicalization_rejects_invalid_commits(mutate) -> None:
+    commit = GraphCommit(
+        OperationId("op_one"),
+        1,
+        1,
+        "cpr_one",
+        VALID_CHECKSUM,
+        COMMITTED_AT,
+    )
+
+    with pytest.raises(ValueError):
+        canonical_graph_commit_json(mutate(commit))
 
 
 def test_write_set_json_is_ascii_and_sorted_by_logical_id() -> None:
@@ -498,6 +536,30 @@ def test_graph_write_set_json_parser_round_trips_all_typed_entity_kinds() -> Non
     parsed = graph_write_set_from_json(canonical_graph_write_set_json(write_set))
 
     assert parsed == write_set
+
+
+@pytest.mark.parametrize("nested", (False, True), ids=("top-level", "nested"))
+def test_graph_write_set_json_parser_rejects_duplicate_object_keys(
+    nested: bool,
+) -> None:
+    encoded = canonical_graph_write_set_json(
+        GraphWriteSet(person_upserts=(Person(PersonId("per_one"), "One"),))
+    )
+    if nested:
+        encoded = encoded.replace(
+            '"full_name":"One"',
+            '"full_name":"One","full_name":"Other"',
+            1,
+        )
+    else:
+        encoded = encoded.replace(
+            '"person_upserts":',
+            '"person_upserts":[],"person_upserts":',
+            1,
+        )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        graph_write_set_from_json(encoded)
 
 
 def _valid_graph_write_set_json_value() -> dict[str, object]:

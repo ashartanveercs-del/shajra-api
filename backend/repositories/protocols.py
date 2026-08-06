@@ -2,7 +2,8 @@
 
 import hashlib
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
@@ -129,9 +130,56 @@ class AuditRepository(Protocol):
     ) -> None: ...
 
 
-def canonical_graph_commit_json(commit: GraphCommit) -> str:
+_SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def strict_json_loads(value: str) -> object:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = item
+        return result
+
+    return json.loads(value, object_pairs_hook=reject_duplicate_keys)
+
+
+def validate_graph_commit(commit: GraphCommit) -> GraphCommit:
+    if not isinstance(commit.operation_id, str):
+        raise ValueError("operation_id must be text")
+    operation_id = commit.operation_id
+    if not operation_id.startswith("op_") or len(operation_id) == len("op_"):
+        raise ValueError("operation_id must be a non-empty op_ logical ID")
+    if (
+        isinstance(commit.revision, bool)
+        or not isinstance(commit.revision, int)
+        or commit.revision <= 0
+    ):
+        raise ValueError("revision must be a positive integer")
+    if (
+        isinstance(commit.fencing_token, bool)
+        or not isinstance(commit.fencing_token, int)
+        or commit.fencing_token <= 0
+    ):
+        raise ValueError("fencing_token must be a positive integer")
+    if not isinstance(commit.permit_id, str):
+        raise ValueError("permit_id must be text")
+    if not commit.permit_id.startswith("cpr_") or len(commit.permit_id) == len("cpr_"):
+        raise ValueError("permit_id must be a non-empty cpr_ logical ID")
+    if not isinstance(commit.semantic_checksum, str) or not _SHA256_PATTERN.fullmatch(
+        commit.semantic_checksum
+    ):
+        raise ValueError("semantic_checksum must be a 64-character hexadecimal digest")
+    if not isinstance(commit.committed_at, datetime):
+        raise ValueError("committed_at must be a datetime")
     if commit.committed_at.tzinfo is None or commit.committed_at.utcoffset() is None:
         raise ValueError("committed_at must be timezone-aware")
+    return replace(commit, semantic_checksum=commit.semantic_checksum.lower())
+
+
+def canonical_graph_commit_json(commit: GraphCommit) -> str:
+    commit = validate_graph_commit(commit)
     value = {
         "operation_id": str(commit.operation_id),
         "revision": commit.revision,
@@ -182,7 +230,7 @@ def graph_write_set_sha256(write_set: GraphWriteSet) -> str:
 
 
 def graph_write_set_from_json(value: str) -> GraphWriteSet:
-    parsed = json.loads(value)
+    parsed = strict_json_loads(value)
     fields = (
         "person_upserts",
         "person_tombstones",

@@ -208,6 +208,13 @@ scope. Audit repositories are configured with the same scope, require
 `AuditOperation.commit_scope` to match it, and ignore other scopes before
 resolving idempotency or transition state.
 
+The normalized schema is a pre-deployment path only after an operator preflight
+proves every target normalized table is empty. If any target row already exists,
+rollout must stop until a scoped backfill supplies `GraphScope` on entity and
+commit rows and supplies the dedicated `BeforeSnapshotJson` and
+`AfterSnapshotJson` audit columns. The backfill must be verified before readers
+or writers use the normalized repositories; no additional table is introduced.
+
 ## Operation-Bound Visibility
 
 A committed revision authorizes rows by the exact tuple:
@@ -224,6 +231,11 @@ commit history must be exactly the positive contiguous sequence `1..head`.
 at `N`. Revision `0` returns the initial snapshot only when the scope has no
 commits. An authorized tombstone removes that logical ID from the materialized
 snapshot.
+
+Readers parse only `GraphScope`, `Revision`, `OperationId`, and `FencingToken`
+before authorization. Rows outside a relevant commit or receipt tuple are
+discarded without parsing semantic fields. Semantic mapping occurs only for an
+authorized candidate, and malformed semantics on such a candidate fail closed.
 
 Rows with a revision but a different operation ID or fencing token are ignored.
 Therefore, if operations A and B both stage revision 7 and only B commits, no row

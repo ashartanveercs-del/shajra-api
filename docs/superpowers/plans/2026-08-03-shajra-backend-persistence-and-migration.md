@@ -353,6 +353,13 @@ missing table, wrong primary field, `Revision` as `singleLineText`, and number
 precision `2`. Then create formula tests using names with quotes, backslashes,
 parentheses, and Airtable function text:
 
+Before using this normalized manifest as a pre-deployment schema correction, an
+operator preflight must prove all normalized target tables are empty. A non-empty
+target requires rollout to stop and a scoped backfill to populate `GraphScope`
+on entity and commit rows plus dedicated `BeforeSnapshotJson` and
+`AfterSnapshotJson` values on audit rows. Verify that backfill before enabling
+the repositories; do not add a tenth table.
+
 ```python
 def test_exact_match_escapes_user_text():
     value = "Robert') & DELETE() & ('"
@@ -718,7 +725,9 @@ reading the revision back. Treat canonical-identical physical `GraphCommits` row
 as one logical commit; any canonical difference within a revision is
 `COMMIT_LOG_CORRUPTION`. Existing identical-commit retries materialize and verify
 the committed semantic checksum before returning and best-effort repair the
-cache. Update the `GraphState` cache row with primary field
+cache, including from a fresh repository process with no local receipt memory.
+Only publication of a new logical commit requires the exact staged receipt to
+have been verified and immediately reverified. Update the `GraphState` cache row with primary field
 `StateKey=repository.scope` only after verified success and tolerate cache-update
 failure.
 
@@ -733,6 +742,9 @@ is valid only for an empty log. For each logical entity ID, discard every row
 whose `(Revision, OperationId, FencingToken)` does not exactly match the logical
 commit for that row's revision, then select the highest authorized row at or
 below the selected revision. An authorized `IsTombstone` omits the entity.
+Parse only `GraphScope` and the authorization tuple before this filtering;
+discard irrelevant rows without semantic mapping, while malformed semantics on
+an authorized row fail closed.
 Deduplicate identical physical entity rows and raise
 `ENTITY_VERSION_CORRUPTION` for conflicting payloads under one logical version.
 Recompute the semantic checksum and fail closed with `COMMIT_CHECKSUM_MISMATCH` if

@@ -45,6 +45,7 @@ from repositories.protocols import (
     canonical_graph_write_set_json,
     graph_commit_sha256,
     graph_write_set_sha256,
+    validate_graph_commit,
 )
 
 
@@ -102,19 +103,8 @@ class AirtableGraphRepository:
         self._verified_receipts.add(receipt)
 
     def append_commit(self, commit: GraphCommit, permit: CommitPermit) -> GraphState:
+        commit = validate_graph_commit(commit)
         self._validate_permit(commit, permit)
-        verified_receipt = next(
-            (
-                receipt
-                for receipt in self._verified_receipts
-                if self._receipt_identity(receipt) == self._commit_identity(commit)
-            ),
-            None,
-        )
-        if verified_receipt is None:
-            raise ValueError("staged write receipt has not been verified")
-        self.verify_staged(verified_receipt)
-
         commits = self._logical_commits()
         existing = commits.get(commit.revision)
         if existing is not None:
@@ -130,6 +120,18 @@ class AirtableGraphRepository:
             state = self._state_for_commit(existing)
             self._update_state_cache(state, existing.committed_at)
             return state
+
+        verified_receipt = next(
+            (
+                receipt
+                for receipt in self._verified_receipts
+                if self._receipt_identity(receipt) == self._commit_identity(commit)
+            ),
+            None,
+        )
+        if verified_receipt is None:
+            raise ValueError("staged write receipt has not been verified")
+        self.verify_staged(verified_receipt)
 
         head_revision = max(commits, default=0)
         if commit.revision != head_revision + 1:
@@ -255,15 +257,16 @@ class AirtableGraphRepository:
             fields = self._fields(record)
             if fields.get("GraphScope") != self.scope:
                 continue
-            version = mapper(fields)
-            commit = commits.get(version.revision)
+            row_revision, operation_id, fencing_token = self._authorization(fields)
+            commit = commits.get(row_revision)
             if (
                 commit is None
-                or version.revision > revision
-                or version.operation_id != commit.operation_id
-                or version.fencing_token != commit.fencing_token
+                or row_revision > revision
+                or operation_id != commit.operation_id
+                or fencing_token != commit.fencing_token
             ):
                 continue
+            version = mapper(fields)
             logical_id = self._version_id(version, id_attribute)
             key = (
                 logical_id,
@@ -291,13 +294,14 @@ class AirtableGraphRepository:
                 fields = self._fields(record)
                 if fields.get("GraphScope") != self.scope:
                     continue
-                version = mapper(fields)
-                if (
-                    version.revision != receipt.revision
-                    or version.operation_id != receipt.operation_id
-                    or version.fencing_token != receipt.fencing_token
+                authorization = self._authorization(fields)
+                if authorization != (
+                    receipt.revision,
+                    receipt.operation_id,
+                    receipt.fencing_token,
                 ):
                     continue
+                version = mapper(fields)
                 logical_id = self._version_id(version, id_attribute)
                 previous = versions.get(logical_id)
                 if previous is not None and previous != version:
@@ -376,8 +380,7 @@ class AirtableGraphRepository:
                 ),
                 committed_at=committed_at,
             )
-            canonical_graph_commit_json(commit)
-            return commit
+            return validate_graph_commit(commit)
         except (TypeError, ValueError) as error:
             raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION") from error
 
@@ -502,6 +505,16 @@ class AirtableGraphRepository:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{field} must be an integer")
         return value
+
+    @staticmethod
+    def _authorization(
+        row: Mapping[str, object],
+    ) -> tuple[int, OperationId, int]:
+        return (
+            AirtableGraphRepository._integer(row, "Revision"),
+            OperationId(AirtableGraphRepository._required_text(row, "OperationId")),
+            AirtableGraphRepository._integer(row, "FencingToken"),
+        )
 
     @staticmethod
     def _receipt_identity(receipt: StagedWriteReceipt) -> tuple[OperationId, int, int]:

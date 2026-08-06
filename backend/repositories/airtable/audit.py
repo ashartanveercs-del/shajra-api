@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,8 @@ from repositories.protocols import (
     canonical_graph_commit_json,
     canonical_graph_write_set_json,
     graph_write_set_from_json,
+    strict_json_loads,
+    validate_graph_commit,
 )
 
 
@@ -32,28 +35,29 @@ _ALLOWED_TRANSITIONS = {
     AuditOperationState.COMMITTED: frozenset(),
     AuditOperationState.FAILED: frozenset(),
 }
-_SENSITIVE_KEYS = frozenset(
-    {
-        "apikey",
-        "airtablerecordid",
-        "contact",
-        "contacts",
-        "credential",
-        "credentials",
-        "email",
-        "mobile",
-        "password",
-        "personalaccesstoken",
-        "phone",
-        "phonenumber",
-        "recordid",
-        "secret",
-        "sourcerecordid",
-        "token",
-        "whatsapp",
-    }
+_SENSITIVE_KEY_TOKENS = (
+    "email",
+    "phone",
+    "mobile",
+    "contact",
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "auth",
+    "whatsapp",
+    "apikey",
+    "recordid",
 )
-_SENSITIVE_KEY_SUFFIXES = tuple(_SENSITIVE_KEYS)
+_EMAIL_VALUE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_AIRTABLE_RECORD_ID_VALUE = re.compile(r"rec[A-Za-z0-9]{14,}")
+_PHONE_VALUE = re.compile(r"\+?[0-9][0-9 ()-]{5,}[0-9]")
+_PARTIAL_DATE_VALUE = re.compile(r"[0-9]{4}(?:-[0-9]{2})?(?:-[0-9]{2})?")
+_CREDENTIAL_VALUE = re.compile(
+    r"(?i)(?:bearer\s+\S+|(?:api[-_]?key|password|secret|token)\s*[:=]\s*\S+|"
+    r"(?:sk|pk|api)[-_][A-Za-z0-9_-]{8,})"
+)
+_DROP = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,8 +175,7 @@ class AirtableAuditRepository:
             raise RepositoryCorruptionError("AUDIT_LOG_CORRUPTION")
         for candidate in ordered[1:]:
             if candidate.operation.state is current.operation.state:
-                current = candidate
-                continue
+                raise RepositoryCorruptionError("AUDIT_LOG_CORRUPTION")
             if (
                 candidate.operation.state
                 not in _ALLOWED_TRANSITIONS[current.operation.state]
@@ -195,7 +198,7 @@ class AirtableAuditRepository:
             "State": operation.state.value,
             "ActorId": operation.actor_id,
             "RequestId": operation.request_id,
-            "SourceReference": operation.source_reference or "",
+            "SourceReference": operation.source_reference,
             "ExpectedRevision": commit.revision - 1,
             "ResultRevision": commit.revision,
             "FencingToken": commit.fencing_token,
@@ -267,6 +270,7 @@ class AirtableAuditRepository:
 
         return replace(
             operation,
+            source_reference=operation.source_reference or None,
             commands_json=self._canonical_redacted_json(operation.commands_json),
             before_snapshot_json=self._canonical_redacted_json(
                 operation.before_snapshot_json
@@ -289,7 +293,7 @@ class AirtableAuditRepository:
 
     @staticmethod
     def _commit_from_json(value: str) -> GraphCommit:
-        parsed = json.loads(value)
+        parsed = strict_json_loads(value)
         if not isinstance(parsed, dict) or set(parsed) != {
             "committed_at",
             "fencing_token",
@@ -319,13 +323,17 @@ class AirtableAuditRepository:
             for item in (operation_id, permit_id, checksum)
         ):
             raise ValueError("GraphCommitJson text fields are malformed")
-        return GraphCommit(
-            operation_id=OperationId(operation_id),
-            revision=revision,
-            fencing_token=fencing_token,
-            permit_id=permit_id,
-            semantic_checksum=checksum,
-            committed_at=datetime.fromisoformat(committed_at.replace("Z", "+00:00")),
+        return validate_graph_commit(
+            GraphCommit(
+                operation_id=OperationId(operation_id),
+                revision=revision,
+                fencing_token=fencing_token,
+                permit_id=permit_id,
+                semantic_checksum=checksum,
+                committed_at=datetime.fromisoformat(
+                    committed_at.replace("Z", "+00:00")
+                ),
+            )
         )
 
     @staticmethod
@@ -334,8 +342,10 @@ class AirtableAuditRepository:
 
     @staticmethod
     def _canonical_redacted_json(value: str) -> str:
-        parsed = json.loads(value)
+        parsed = strict_json_loads(value)
         redacted = AirtableAuditRepository._redact(parsed)
+        if redacted is _DROP:
+            redacted = None
         return json.dumps(
             redacted,
             sort_keys=True,
@@ -346,18 +356,75 @@ class AirtableAuditRepository:
     @staticmethod
     def _redact(value: object) -> object:
         if isinstance(value, dict):
-            result: dict[str, object] = {}
+            if AirtableAuditRepository._is_credential_object(value):
+                return _DROP
+            dict_result: dict[str, object] = {}
             for key, item in value.items():
                 normalized_key = "".join(
                     character for character in key.lower() if character.isalnum()
                 )
-                if normalized_key.endswith(_SENSITIVE_KEY_SUFFIXES):
+                if any(token in normalized_key for token in _SENSITIVE_KEY_TOKENS):
                     continue
-                result[key] = AirtableAuditRepository._redact(item)
-            return result
+                sanitized = AirtableAuditRepository._redact(item)
+                if sanitized is not _DROP:
+                    dict_result[key] = sanitized
+            return dict_result
         if isinstance(value, list):
-            return [AirtableAuditRepository._redact(item) for item in value]
+            list_result: list[object] = []
+            for item in value:
+                sanitized = AirtableAuditRepository._redact(item)
+                if sanitized is not _DROP:
+                    list_result.append(sanitized)
+            return list_result
+        if isinstance(value, str) and AirtableAuditRepository._private_value(value):
+            return _DROP
         return value
+
+    @staticmethod
+    def _is_credential_object(value: dict[object, object]) -> bool:
+        for key, item in value.items():
+            if not isinstance(key, str) or not isinstance(item, str):
+                continue
+            normalized_key = "".join(
+                character for character in key.lower() if character.isalnum()
+            )
+            if normalized_key not in {"kind", "method", "scheme", "type"}:
+                continue
+            normalized_value = "".join(
+                character for character in item.lower() if character.isalnum()
+            )
+            if any(
+                token in normalized_value
+                for token in (
+                    "apikey",
+                    "auth",
+                    "credential",
+                    "password",
+                    "secret",
+                    "token",
+                )
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _private_value(value: str) -> bool:
+        stripped = value.strip()
+        if _EMAIL_VALUE.search(stripped) or _AIRTABLE_RECORD_ID_VALUE.search(stripped):
+            return True
+        if _CREDENTIAL_VALUE.search(stripped):
+            return True
+        if _PARTIAL_DATE_VALUE.fullmatch(stripped):
+            return False
+        phone = _PHONE_VALUE.fullmatch(stripped)
+        if phone is None:
+            return False
+        digits = sum(character.isdigit() for character in stripped)
+        return (
+            digits >= 10
+            or stripped.startswith("+")
+            or any(character in stripped for character in " ()")
+        )
 
     @staticmethod
     def _fields(record: object) -> Mapping[str, object]:

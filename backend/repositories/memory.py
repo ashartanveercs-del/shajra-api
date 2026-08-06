@@ -23,6 +23,7 @@ from repositories.protocols import (
     canonical_graph_write_set_json,
     graph_commit_sha256,
     graph_write_set_sha256,
+    validate_graph_commit,
 )
 
 
@@ -71,6 +72,7 @@ class InMemoryGraphRepository:
             raise ValueError("staged write receipt is not present")
 
     def append_commit(self, commit: GraphCommit, permit: CommitPermit) -> GraphState:
+        commit = validate_graph_commit(commit)
         self._validate_permit(commit, permit)
         commits = self._logical_commits()
         existing = commits.get(commit.revision)
@@ -121,9 +123,12 @@ class InMemoryGraphRepository:
     def _logical_commits(self) -> dict[int, GraphCommit]:
         commits_by_revision: dict[int, dict[str, GraphCommit]] = defaultdict(dict)
         for commit in self._commits:
-            commits_by_revision[commit.revision][
-                canonical_graph_commit_json(commit)
-            ] = commit
+            try:
+                normalized = validate_graph_commit(commit)
+                canonical = canonical_graph_commit_json(normalized)
+            except ValueError as error:
+                raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION") from error
+            commits_by_revision[normalized.revision][canonical] = normalized
         logical: dict[int, GraphCommit] = {}
         for revision, candidates in commits_by_revision.items():
             if len(candidates) != 1:
