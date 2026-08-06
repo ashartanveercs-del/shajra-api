@@ -47,6 +47,7 @@ ENTITY_TABLES = (
     "ParentChildLinks",
     "UnresolvedRelationships",
 )
+MISSING = object()
 
 
 class AmbiguousCreateError(RuntimeError):
@@ -514,6 +515,61 @@ def test_verification_ignores_malformed_semantics_outside_receipt_tuple() -> Non
     repository.verify_staged(receipt)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("Revision", MISSING),
+        ("Revision", True),
+        ("Revision", "1"),
+        ("Revision", 0),
+        ("Revision", -1),
+        ("FencingToken", MISSING),
+        ("FencingToken", True),
+        ("FencingToken", "5"),
+        ("FencingToken", 0),
+        ("FencingToken", -1),
+        ("OperationId", MISSING),
+        ("OperationId", True),
+        ("OperationId", ""),
+        ("OperationId", "bad"),
+    ),
+    ids=(
+        "missing-revision",
+        "bool-revision",
+        "wrong-type-revision",
+        "zero-revision",
+        "negative-revision",
+        "missing-fence",
+        "bool-fence",
+        "wrong-type-fence",
+        "zero-fence",
+        "negative-fence",
+        "missing-operation",
+        "wrong-type-operation",
+        "empty-operation",
+        "bad-operation-id",
+    ),
+)
+def test_verify_staged_fails_closed_on_malformed_authorization_metadata(
+    field: str, value: object
+) -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    receipt = repository.stage(
+        GraphWriteSet(person_upserts=(Person(PersonId("per_one"), "One"),)),
+        _context("op_one", 1, 5),
+    )
+    malformed = copy.deepcopy(fake.tables["PersonVersions"].records[0]["fields"])
+    if value is MISSING:
+        malformed.pop(field)  # type: ignore[union-attr]
+    else:
+        malformed[field] = value  # type: ignore[index]
+    fake.tables["PersonVersions"].seed(malformed)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="AIRTABLE_ROW_CORRUPTION"):
+        repository.verify_staged(receipt)
+
+
 def test_committed_load_ignores_malformed_semantics_outside_commit_tuple() -> None:
     fake = FakeAirtable()
     repository = _graph_repository(fake)
@@ -538,6 +594,66 @@ def test_committed_load_ignores_malformed_semantics_outside_commit_tuple() -> No
         fake.tables["PersonVersions"].seed(malformed)  # type: ignore[arg-type]
 
     assert repository.load_committed().people == {person.person_id: person}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("Revision", MISSING),
+        ("Revision", True),
+        ("Revision", "1"),
+        ("Revision", 0),
+        ("Revision", -1),
+        ("FencingToken", MISSING),
+        ("FencingToken", True),
+        ("FencingToken", "5"),
+        ("FencingToken", 0),
+        ("FencingToken", -1),
+        ("OperationId", MISSING),
+        ("OperationId", True),
+        ("OperationId", ""),
+        ("OperationId", "bad"),
+    ),
+    ids=(
+        "missing-revision",
+        "bool-revision",
+        "wrong-type-revision",
+        "zero-revision",
+        "negative-revision",
+        "missing-fence",
+        "bool-fence",
+        "wrong-type-fence",
+        "zero-fence",
+        "negative-fence",
+        "missing-operation",
+        "wrong-type-operation",
+        "empty-operation",
+        "bad-operation-id",
+    ),
+)
+def test_committed_load_fails_closed_on_malformed_authorization_metadata(
+    field: str, value: object
+) -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    person = Person(PersonId("per_one"), "One")
+    receipt = repository.stage(
+        GraphWriteSet(person_upserts=(person,)), _context("op_one", 1, 5)
+    )
+    repository.verify_staged(receipt)
+    commit, permit = _commit_and_permit(
+        receipt, _snapshot(1, "op_one", 5, people=(person,))
+    )
+    repository.append_commit(commit, permit)
+    malformed = copy.deepcopy(fake.tables["PersonVersions"].records[0]["fields"])
+    if value is MISSING:
+        malformed.pop(field)  # type: ignore[union-attr]
+    else:
+        malformed[field] = value  # type: ignore[index]
+    fake.tables["PersonVersions"].seed(malformed)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="AIRTABLE_ROW_CORRUPTION"):
+        repository.load_committed()
 
 
 @pytest.mark.parametrize("phase", ("verify", "load"))
@@ -988,6 +1104,44 @@ def test_audit_recursively_removes_private_keys_and_values() -> None:
         "+442071838750",
     ):
         assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    "phone_text",
+    (
+        "Call +1 (202) 555-0199 after 5pm",
+        "Reach me at 202.555.0199 ext. 42",
+        "Phone: +44-20-7183-8750 x123",
+    ),
+    ids=("mixed-text", "dot-extension", "hyphen-extension"),
+)
+def test_audit_removes_embedded_phone_pii_but_preserves_partial_dates(
+    phone_text: str,
+) -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = replace(
+        _audit_operation(),
+        after_snapshot_json=json.dumps(
+            {
+                "birth": "1980-01-02",
+                "note": phone_text,
+                "ordinary_number": "Room 42",
+            }
+        ),
+    )
+
+    repository.create_pending(operation)
+    found = repository.find_by_idempotency_key(operation.idempotency_key)
+
+    assert found is not None
+    assert json.loads(found.after_snapshot_json) == {
+        "birth": "1980-01-02",
+        "ordinary_number": "Room 42",
+    }
+    row = fake.tables["ChangeLog"].records[0]["fields"]
+    assert phone_text not in row["AfterSnapshotJson"]  # type: ignore[operator,index]
+    assert phone_text not in str(fake.tables["ChangeLog"].records)
 
 
 def test_audit_scope_rejects_cross_scope_create_and_filters_reads() -> None:

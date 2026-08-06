@@ -510,11 +510,17 @@ class AirtableGraphRepository:
     def _authorization(
         row: Mapping[str, object],
     ) -> tuple[int, OperationId, int]:
-        return (
-            AirtableGraphRepository._integer(row, "Revision"),
-            OperationId(AirtableGraphRepository._required_text(row, "OperationId")),
-            AirtableGraphRepository._integer(row, "FencingToken"),
-        )
+        try:
+            revision = AirtableGraphRepository._integer(row, "Revision")
+            fencing_token = AirtableGraphRepository._integer(row, "FencingToken")
+            operation_id = AirtableGraphRepository._required_text(row, "OperationId")
+            if revision <= 0 or fencing_token <= 0:
+                raise ValueError("authorization integers must be positive")
+            if not operation_id.startswith("op_") or len(operation_id) == len("op_"):
+                raise ValueError("OperationId must be a non-empty op_ logical ID")
+            return revision, OperationId(operation_id), fencing_token
+        except (TypeError, ValueError) as error:
+            raise RepositoryCorruptionError("AIRTABLE_ROW_CORRUPTION") from error
 
     @staticmethod
     def _receipt_identity(receipt: StagedWriteReceipt) -> tuple[OperationId, int, int]:

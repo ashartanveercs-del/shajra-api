@@ -51,7 +51,11 @@ _SENSITIVE_KEY_TOKENS = (
 )
 _EMAIL_VALUE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _AIRTABLE_RECORD_ID_VALUE = re.compile(r"rec[A-Za-z0-9]{14,}")
-_PHONE_VALUE = re.compile(r"\+?[0-9][0-9 ()-]{5,}[0-9]")
+_PHONE_VALUE = re.compile(
+    r"(?<!\w)\+?[0-9][0-9\s()./-]{5,}[0-9]"
+    r"(?:\s*(?:ext(?:ension)?\.?|x)\s*[0-9]{1,6})?",
+    re.IGNORECASE,
+)
 _PARTIAL_DATE_VALUE = re.compile(r"[0-9]{4}(?:-[0-9]{2})?(?:-[0-9]{2})?")
 _CREDENTIAL_VALUE = re.compile(
     r"(?i)(?:bearer\s+\S+|(?:api[-_]?key|password|secret|token)\s*[:=]\s*\S+|"
@@ -416,15 +420,15 @@ class AirtableAuditRepository:
             return True
         if _PARTIAL_DATE_VALUE.fullmatch(stripped):
             return False
-        phone = _PHONE_VALUE.fullmatch(stripped)
-        if phone is None:
-            return False
-        digits = sum(character.isdigit() for character in stripped)
-        return (
-            digits >= 10
-            or stripped.startswith("+")
-            or any(character in stripped for character in " ()")
-        )
+        for match in _PHONE_VALUE.finditer(stripped):
+            candidate = match.group(0)
+            digits = sum(character.isdigit() for character in candidate)
+            has_phone_punctuation = candidate.startswith("+") or any(
+                character in candidate for character in " ()./-"
+            )
+            if digits >= 10 or (digits >= 7 and has_phone_punctuation):
+                return True
+        return False
 
     @staticmethod
     def _fields(record: object) -> Mapping[str, object]:
