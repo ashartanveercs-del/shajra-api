@@ -151,6 +151,7 @@ class ReconciledHeadReceipt:
     semantic_checksum: str
     head_commit_sha256: str | None
     evidence_sha256: str
+    admin_request_nonce_hmac: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,14 +277,16 @@ routes or ordinary service code. `get_status` routes by explicit scope and
 Every new logical acquisition uses a cryptographically random UUID acquisition
 ID. It is not an actor, process, username, or other reusable owner identity. The
 same ID is retained only while retrying an ambiguously answered acquisition; a
-later logical acquisition must use a fresh ID. Authorization, confirmation,
-and admin CAS calls likewise retain one random request nonce across transport
-retries. Graph acquisition/request nonces are conflict-detectable only within that
-graph scope's graph key domain; generic lease nonces are conflict-detectable only
-within that generic scope's key domain. They do not claim global uniqueness across
-scopes or coordination domains. Revocation and rate-limit nonces use the separate
-deployment-wide domain registries defined below, where changed canonical input is
-atomically detectable while a receipt remains retained.
+later logical acquisition must use a fresh ID. An acquisition ID must never be
+intentionally reused after its 60,000-ms result receipt expires. Authorization,
+confirmation, lease-operation, and admin CAS calls likewise retain one random
+request nonce across transport retries. Graph acquisition/request nonces are
+conflict-detectable only within that graph scope's graph key domain; generic lease
+nonces are conflict-detectable only within that generic scope's key domain. They
+do not claim global uniqueness across scopes or coordination domains. Revocation
+and rate-limit nonces use the separate deployment-wide domain registries defined
+below, where changed canonical input is atomically detectable while a receipt
+remains retained.
 
 Runtime `CommitCoordinator.acquire` never creates `confirmed-revision` or `fence`.
 It requires both to have been initialized by `CoordinationAdmin`, requires the
@@ -309,10 +312,12 @@ The versioned, collision-separated key domains are:
 {sj:v1:<deployment>:graph:<scope-hmac>}:confirmed-revision
 {sj:v1:<deployment>:graph:<scope-hmac>}:commit-reservation
 {sj:v1:<deployment>:graph:<scope-hmac>}:last-confirmation
-{sj:v1:<deployment>:graph:<scope-hmac>}:lease-result:<nonce-hmac>
-{sj:v1:<deployment>:graph:<scope-hmac>}:admin-result:<nonce-hmac>
+{sj:v1:<deployment>:graph:<scope-hmac>}:lease-result:acquire:<acquisition-id-hmac>
+{sj:v1:<deployment>:graph:<scope-hmac>}:lease-result:operation:<request-nonce-hmac>
+{sj:v1:<deployment>:graph:<scope-hmac>}:admin-result:<request-nonce-hmac>
 {sj:v1:<deployment>:generic:<scope-hmac>}:lock
-{sj:v1:<deployment>:generic:<scope-hmac>}:lease-result:<nonce-hmac>
+{sj:v1:<deployment>:generic:<scope-hmac>}:lease-result:acquire:<acquisition-id-hmac>
+{sj:v1:<deployment>:generic:<scope-hmac>}:lease-result:operation:<request-nonce-hmac>
 {sj:v1:<deployment>:revocation}:entry:<jti-hmac>
 {sj:v1:<deployment>:revocation}:nonce:<nonce-hmac>
 {sj:v1:<deployment>:rate}:counter:<policy-id>:<subject-hmac>:<window-start>
@@ -349,6 +354,42 @@ returns a retry tag rather than accepting unchecked state. Any malformed,
 partially missing, non-canonical, digest-invalid, or invariant-breaking state maps
 to the single stable `COORDINATION_STATE_CORRUPT` result. It is repairable only by
 the evidence-gated operator CAS below.
+
+An acquisition request is canonical ASCII JSON. Its exact generic fields are
+`schema:"shajra.lease-acquire-request"`, `version:1`, `domain:"GENERIC"`,
+`scope_hmac`, `acquisition_id_hmac`, and canonical-decimal `requested_ttl_ms`.
+The graph form changes `domain` to `"GRAPH_COMMIT"` and adds canonical-decimal
+`committed_revision`, which is the resulting `GraphLease.base_revision`.
+`input_sha256` is SHA-256 over those exact canonical bytes. The two HMACs use
+domain-separated input labels, so acquisition IDs cannot collide with operation
+nonces or another lease domain.
+
+The acquisition script stores
+`schema:"shajra.lease-acquisition-result"`, `version:1`, `input_sha256`, `domain`,
+`scope_hmac`, `acquisition_id_hmac`, canonical-decimal `requested_ttl_ms`, the
+exact original canonical `Lease` or `GraphLease` payload, and canonical-decimal
+`receipt_expires_at_ms`. The graph receipt also repeats `committed_revision`.
+The receipt expiry is exactly the first successful script's Redis
+`server_time_ms + 60,000`, and the script applies that absolute time with
+`PEXPIREAT`. Receipt and lock, plus graph `INCR`, are one atomic mutation. Before
+reading the live lock, testing contention, or incrementing a graph fence, acquire
+strictly validates any retained receipt. Equal `input_sha256` returns
+`LEASE_REPLAYED` plus the exact stored original lease without mutation; a different
+digest returns `NONCE_REUSE_CONFLICT`. This ordering applies even when the original
+lock has expired or a newer acquisition owns the lock.
+
+Renew/release request JSON has the exact fields
+`schema:"shajra.lease-operation-request"`, `version:1`, method (`"renew"` or
+`"release"`), domain, `scope_hmac`, `acquisition_id_hmac`,
+`request_nonce_hmac`, canonical lock-envelope SHA-256, and, for renew only,
+canonical-decimal `requested_ttl_ms`. Its result receipt has
+`schema:"shajra.lease-operation-result"`, `version:1`, `input_sha256`, method,
+domain, all three HMAC fields, the exact original canonical `Lease` or
+`LeaseReleaseResult` payload, and canonical-decimal `receipt_expires_at_ms`.
+It is retained with `PEXPIREAT` until exactly first Redis server time plus 60,000
+ms. The script validates this receipt before live-lock checks: an exact retry
+returns `LEASE_RENEW_REPLAYED` or `LEASE_RELEASE_REPLAYED` and the original payload
+without mutation; changed canonical input returns `NONCE_REUSE_CONFLICT`.
 
 Every Lua result is a tagged array: success starts with `OK` and a stable result
 code; expected contention or precondition failure starts with `ERR` and a stable
@@ -394,10 +435,30 @@ head revision, fencing floor, and a `ReconciledHeadReceipt` as the one-slot proo
 exact `expected_state_sha256` from `CoordinationAdmin.inspect`. It may advance or
 retain the confirmed revision and fencing floor, but can never decrease either;
 the new floor must also strictly exceed every durable fencing token in the fresh
-evidence. The CAS rechecks every expected raw value and the request nonce before
-mutation. A response-loss retry with the same nonce and evidence returns the exact
-original admin result; changed evidence under that nonce is
-`NONCE_REUSE_CONFLICT`.
+evidence.
+
+Each initialize/reconcile call canonicalizes an admin request containing exactly
+`schema:"shajra.coordination-admin-request"`, `version:1`, method
+(`"initialize"` or `"reconcile"`), `scope_hmac`, `evidence_sha256`, and
+`expected_state_sha256`. Its `input_sha256` covers those exact bytes. The fixed
+graph-scope `admin-result:<request-nonce-hmac>` key stores
+`schema:"shajra.coordination-admin-result"`, `version:1`, `input_sha256`, method,
+`scope_hmac`, `request_nonce_hmac`, `evidence_sha256`, `expected_state_sha256`, the
+exact original canonical `CoordinationAdminResult`, and canonical-decimal
+`receipt_expires_at_ms`. The script writes the state transition and receipt
+atomically, using `PEXPIREAT` at exactly first Redis server time plus 60,000 ms.
+It strictly validates a retained receipt before inspecting current state or
+evaluating the CAS. Equal input returns the exact original result without mutation;
+different input returns `NONCE_REUSE_CONFLICT`. After receipt expiry, replaying an
+old request cannot mutate because its stale expected-state digest fails the CAS.
+
+Every successful initialize/reconcile writes the request's context-separated
+`request_nonce_hmac` into the canonical `ReconciledHeadReceipt`. Operator callers
+use a fresh random nonce for each logical admin transition, so this core
+`last-confirmation` value and the resulting post-state digest change even when a
+reconcile retains the same head revision, fence, and evidence. That required state
+change is what makes the original expected-state digest stale after the separate
+60,000-ms admin result receipt expires.
 
 Admin inspection computes `state_sha256` over the versioned ordered tuple of exact
 raw graph-key values, including explicit missing markers, before decoding. It can
@@ -409,6 +470,12 @@ a lower bound; if a scalar itself is absent or malformed, durable Airtable head 
 max-fence evidence are authoritative and the new floor still strictly exceeds all
 durable tokens. The script never writes a revision/fence below any valid current or
 proven durable value.
+
+The inspected graph state tuple contains only `lock`, `fence`,
+`confirmed-revision`, `commit-reservation`, and `last-confirmation`. Ephemeral
+lease-result and admin-result receipt keys are deliberately excluded from both
+`state_sha256` and runtime status invariants; creating or expiring a replay receipt
+therefore cannot perturb an expected-state CAS digest.
 
 Neither admin method accepts an API `If-Match`, guesses a head, skips contiguous
 history proof, or clears an active lock/reservation. An absent, corrupt, or drifted
@@ -428,20 +495,28 @@ protocol errors are never retried, and a second transport failure becomes
 `COORDINATION_UNAVAILABLE`.
 
 Lease scripts use Redis `TIME` and `PTTL`. The default requested TTL is exactly
-15,000 ms. Every acquire/renew/replay result returns server time, current PTTL,
-`expires_at_ms = server_time_ms + PTTL`, and
-`renew_deadline_ms = expires_at_ms - 5,000`. Callers must start renewal on or
-before that server-derived deadline; zero, negative, `-1`, `-2`, or a PTTL greater
-than the requested TTL is lease loss or corrupt state as appropriate. Renew and
-release compare the complete canonical lock envelope, including the random
-acquisition ID. Generic and graph lock schemas are distinct, and only `GraphLease`
-contains a fencing token and base revision.
+15,000 ms. On the first successful acquire or renew, the script reads current
+Redis time and current lock PTTL, then returns
+`expires_at_ms = server_time_ms + PTTL` and
+`renew_deadline_ms = expires_at_ms - 5,000` in the canonical lease payload. Callers
+must start renewal on or before that absolute server-derived deadline; zero,
+negative, `-1`, `-2`, or a PTTL greater than the requested TTL is lease loss or
+corrupt state as appropriate. Renew and release compare the complete canonical
+lock envelope, including the random acquisition ID. Generic and graph lock schemas
+are distinct, and only `GraphLease` contains a fencing token and base revision.
 
-Renew and release take a random request nonce. Their versioned result receipt is
-HMAC-keyed in the same hash slot and retained for 60,000 ms; a byte-identical
-response-loss retry returns the original server-derived result without extending
-or deleting twice. Reusing the nonce with a different lease, operation, or TTL is
-`NONCE_REUSE_CONFLICT`. Acquire uses its random acquisition ID as its replay nonce.
+Acquisition and renew receipt replays return the exact stored original lease
+payload, including its original PTTL-derived `ttl_ms`, absolute `expires_at_ms`,
+and `renew_deadline_ms`; they do not claim a current PTTL or recompute timing.
+Those absolute timestamps govern safety. Thus `LEASE_REPLAYED` may safely return
+an already-expired lease after the original lock expires or another acquisition
+succeeds: `assert_owned`, renew, authorization, and all other live-lock checks
+still fail for that old acquisition. The 60,000-ms receipt is an ambiguous-response
+retry window, not a lease extension. After it expires, reuse of the same acquisition
+ID is caller misuse and has no idempotency guarantee; every new logical acquisition
+must use a fresh cryptographically random ID. Renew and release likewise use a
+fresh random request nonce per logical operation and replay the exact original
+result for 60,000 ms without extending or deleting twice.
 
 ## Persisted Row Contract
 
@@ -930,10 +1005,26 @@ graph-state mutation and therefore requires both graph headers.
 - Acquire accepts only the actual committed Airtable revision, rejects mismatch,
   checks lock contention before `INCR`, and leaves the fence unchanged on every
   failed acquisition.
-- Acquisition-response loss with the same random acquisition ID returns the same
-  graph lease; a new ID contends, and a generic lease cannot authorize a commit.
-- Lease acquire and renew expose Redis-derived PTTL, expiry, and the exact
-  expiry-minus-5,000-ms renewal deadline for the 15,000-ms default.
+- Generic and graph acquire atomically persist an HMAC-keyed, versioned acquisition
+  receipt with the exact request digest, original lease, and absolute
+  Redis-time-plus-60,000-ms receipt expiry. A retained equal-input retry returns
+  `LEASE_REPLAYED` with that original lease before lock/contention/`INCR` checks;
+  changed TTL or graph committed revision under that retained scope/domain receipt
+  returns `NONCE_REUSE_CONFLICT`.
+- Acquisition-response loss followed by original-lock expiry and even a successful
+  fresh acquisition still replays the original lease and fencing token without
+  mutation or another `INCR`. Its unchanged expired absolute deadline makes it
+  unusable for assert, renew, or commit authorization. Acquisition IDs are fresh
+  per logical acquisition and are never intentionally reused after receipt expiry.
+- First acquire/renew success exposes Redis-derived PTTL, expiry, and the exact
+  expiry-minus-5,000-ms renewal deadline for the 15,000-ms default. Receipt replay
+  returns the exact original timing payload rather than claiming current PTTL.
+- Renew/release receipts contain the exact canonical operation input digest,
+  original result, and Redis-time-plus-60,000-ms expiry; receipt-first exact replay
+  returns the original result without extending/deleting twice, while changed
+  operation, lease, or TTL returns `NONCE_REUSE_CONFLICT`.
+- Generic and graph leases have distinct lock/receipt domains, and a generic lease
+  cannot authorize a commit.
 - Authorization rejects wrong lease kind, acquisition ID, fencing token, base
   revision, non-sequential revision, invalid nonce, or conflicting reservation.
 - Authorization validates and persists canonical Task 3 `StagedWriteReceipt`
@@ -953,7 +1044,8 @@ graph-state mutation and therefore requires both graph headers.
   torn, partial, malformed, non-canonical, or digest-invalid state returns exactly
   `COORDINATION_STATE_CORRUPT` without mutation.
 - Strict decoders reject duplicate keys and extra/missing fields for lock,
-  reservation, staged receipt, confirmation proof, and admin evidence envelopes.
+  acquisition/operation/admin result receipt, reservation, staged receipt,
+  confirmation proof, and admin evidence envelopes.
 - Script tables cover invalid ARGV/KEYS, canonical decimal grammar, signed-64
   minimum/maximum/overflow, no `tonumber` equality, validate-before-write, and no
   partial mutation on every error tag.
@@ -966,7 +1058,13 @@ graph-state mutation and therefore requires both graph headers.
 - Admin initialize/reconcile rejects an active lock or reservation, stale expected
   digest, non-contiguous or conflicting Airtable evidence, head checksum/digest
   mismatch, and a fencing floor not strictly above every durable token. It never
-  decreases revision/fence and exact nonce replay returns the original result.
+  decreases revision/fence. Its canonical request digest covers method, evidence
+  digest, expected-state digest, and scope HMAC; its fixed graph-scope nonce receipt
+  stores the exact original result for 60,000 ms and is checked before state/CAS.
+  Exact retry returns that result without mutation, changed input conflicts, and
+  post-expiry retry fails stale expected-state CAS. A fresh admin nonce HMAC in
+  every reconciled-head proof changes the core digest even for a retained head.
+  Lease/admin result keys never affect the inspected graph state digest.
 - The Upstash 1.7.0 adapter calls `eval(script, keys, args)` against a local
   autospecced/stub client, disables SDK retries, retries one ambiguous transport
   failure with identical nonce/input, and never retries tagged failures.

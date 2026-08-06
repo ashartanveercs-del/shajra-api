@@ -868,13 +868,27 @@ matrix must explicitly prove:
   runtime acquire never accepts or persists request `If-Match`;
 - acquire uses an already-initialized actual Airtable head, checks contention
   before `INCR`, uses a fresh random acquisition ID for each logical acquisition,
-  and replays only the same ambiguous acquisition;
+  and never intentionally reuses that ID after its result receipt expires;
+- graph and generic acquire atomically create HMAC-keyed canonical acquisition
+  receipts containing the exact request digest, original lease payload, and
+  absolute Redis-time-plus-60,000-ms receipt expiry. Receipt validation precedes
+  lock/contention/`INCR`; equal input returns `LEASE_REPLAYED`, while changed TTL
+  or graph committed revision under that retained scope/domain receipt returns
+  `NONCE_REUSE_CONFLICT`;
+- after the original lock expires and even after a fresh acquisition succeeds, an
+  equal-input replay returns the original lease and fence without mutation or
+  another `INCR`; its unchanged absolute expiry makes assert/renew/authorization
+  fail;
 - generic and graph leases have distinct lock envelopes and types, and a generic
   lease cannot authorize a graph commit;
-- lease results use Redis `TIME`/`PTTL`, exact 15,000-ms default TTL, and
-  `renew_deadline_ms = expires_at_ms - 5,000`;
-- renew/release use HMAC-keyed 60,000-ms request-nonce result receipts, so an
-  ambiguous retry returns the original result without extending/deleting twice;
+- first-success acquire/renew results use Redis `TIME`/`PTTL`, exact 15,000-ms
+  default TTL, and `renew_deadline_ms = expires_at_ms - 5,000`; acquisition and
+  renew replays return the original stored timing payload, never a claimed current
+  PTTL;
+- renew/release use HMAC-keyed canonical 60,000-ms request-nonce result receipts
+  with exact input digest, original result, and receipt expiry. Receipt-first
+  ambiguous retry returns the original result without extending/deleting twice,
+  and changed lease, method, or TTL conflicts;
 - authorization inspects a reservation before the live lock, returns the exact
   original permit on canonical match after lease expiry, and validates a live lock
   only when creating a new reservation;
@@ -908,7 +922,13 @@ matrix must explicitly prove:
   every durable GraphCommit/entity staged token; neither revision nor fence can
   decrease; corrupt-envelope repair uses the exact raw-state digest, requires raw
   lock/reservation keys absent, and preserves every valid current scalar lower
-  bound;
+  bound. A fixed graph-scope admin nonce receipt canonically binds method, evidence
+  digest, expected-state digest, and scope HMAC; it stores the exact result for
+  60,000 ms, is checked before state/CAS, conflicts on changed input, and leaves
+  lease/admin result keys outside the inspected state digest. After receipt expiry,
+  stale expected-state CAS prevents replay mutation; each successful admin call
+  puts its fresh nonce HMAC in the reconciled-head proof so even a retained head
+  changes the core digest;
 - `upstash-redis==1.7.0` is called as `eval(script, keys, args)` through a local
   autospecced/stub client, with `rest_retries=0`, one adapter retry only for an
   ambiguous transport failure, and byte-identical nonce/input on retry;
@@ -929,12 +949,13 @@ matrix must explicitly prove:
 In `serialization.py`, implement compact sorted-key ASCII JSON with exact
 versioned schemas for generic lock, graph lock, staged receipt, commit reservation,
 confirmed receipt, reconciled-head proof, coordination evidence, admin result, and
-lease, revocation, and rate request-nonce result receipts. Implement the exact
-revocation/rate canonical input and receipt fields, input SHA-256, and expiry rules
-from the design. Use duplicate-key rejecting decode, exact field/type/ID validation,
-canonical decimal strings for every integer stored in an envelope, canonical byte
-comparison, and SHA-256 recomputation. Map all malformed state to
-`COORDINATION_STATE_CORRUPT` without echoing raw values.
+lease acquisition, lease operation, admin, revocation, and rate request/result
+receipts. Implement every exact canonical input and receipt field, input SHA-256,
+original result payload, and expiry rule from the design. Use duplicate-key
+rejecting decode, exact field/type/ID validation, canonical decimal strings for
+every integer stored in an envelope, canonical byte comparison, and SHA-256
+recomputation. Map all malformed state to `COORDINATION_STATE_CORRUPT` without
+echoing raw values.
 
 Build keys only through one HMAC key builder using the exact versioned domains and
 cluster hash tags in the design. `REDIS_KEY_HMAC_SECRET` HMAC-digests all unbounded
@@ -943,7 +964,9 @@ server-owned policy ID, and canonical window start may appear raw.
 
 For graph/generic coordination, retain the existing scope-derived hash tags and
 state explicitly that nonce conflicts are only detectable inside that scope and
-domain. For revocation, use fixed hash tag
+domain. Use distinct `lease-result:acquire:<acquisition-id-hmac>` and
+`lease-result:operation:<request-nonce-hmac>` suffixes in each domain, with
+context-separated HMAC inputs. For revocation, use fixed hash tag
 `{sj:v1:<deployment>:revocation}` with suffixes `entry:<jti-hmac>` and
 `nonce:<nonce-hmac>`. For rate limiting, use separate fixed hash tag
 `{sj:v1:<deployment>:rate}` with suffixes
@@ -1010,6 +1033,7 @@ class ReconciledHeadReceipt:
     semantic_checksum: str
     head_commit_sha256: str | None
     evidence_sha256: str
+    admin_request_nonce_hmac: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1124,8 +1148,23 @@ absent and never creates them. It compares only the already-loaded actual Airtab
 head, never request `If-Match`. A fresh random acquisition ID replaces reusable
 owner identity. Scripts check malformed state and contention before `INCR`; all
 inputs use lexical canonical-decimal and signed-64 validation, never `tonumber`
-equality. Locks alone have TTL. Acquire/renew return Redis-derived PTTL, expiry,
-and exact renew deadline for the 15-second/5-second timing contract.
+equality. Locks alone have lease TTL. Generic and graph acquire atomically write a
+versioned acquisition result receipt with the lock and, for graph, the fence
+mutation. Its canonical input digest covers domain, scope HMAC, acquisition-ID
+HMAC, requested TTL, and graph committed/base revision when applicable. The
+receipt stores the exact original lease and expires with `PEXPIREAT` exactly 60,000
+ms after first Redis server time. Scripts validate it before lock/contention/`INCR`:
+exact retry returns `LEASE_REPLAYED`, and changed input returns
+`NONCE_REUSE_CONFLICT`. This remains true after lock expiry or a fresh acquisition;
+the original absolute expiry makes the replayed old lease unusable. Reusing an
+acquisition ID after receipt expiry is caller misuse; generate a fresh random ID.
+
+First-success acquire/renew derives PTTL, absolute expiry, and exact renew deadline
+from Redis for the 15-second/5-second timing contract. Acquisition and renew
+receipt replays return the exact original stored timing payload, not a current
+PTTL. Renew/release operation receipts likewise store exact canonical input digest,
+original result, and a Redis-absolute 60,000-ms expiry, are checked before live-lock
+state, and prevent extension/deletion twice.
 
 `get_status` uses one Lua operation with one `MGET` plus `PTTL`, then strict-decodes
 one coherent snapshot. `authorize_commit` checks an existing canonical reservation
@@ -1142,12 +1181,21 @@ CAS scripts. Evidence names scope, proven contiguous Airtable head revision,
 semantic checksum, head commit digest, maximum durable fencing token, a fencing
 floor strictly above that maximum, and canonical evidence digest. Initialize
 requires exact ABSENT state; reconcile requires exact current state digest. Both
-require no active lock/reservation, are nonce-idempotent, and never decrease
-revision or fence. Admin inspect hashes the ordered exact raw key tuple before
-decode, so a corrupt-envelope repair can CAS the observed raw state. Such repair
-requires raw lock/reservation keys absent, preserves every valid current scalar
-lower bound, and still requires fresh durable evidence; runtime methods never use
-this path.
+require no active lock/reservation and never decrease revision or fence. Their
+canonical admin request digest covers method, evidence digest, expected-state
+digest, and scope HMAC. A fixed graph-scope nonce key atomically stores the exact
+original `CoordinationAdminResult` with a Redis-absolute 60,000-ms expiry. The
+script validates this receipt before state inspection/CAS: exact retry returns the
+original result without mutation and changed input conflicts. Lease/admin result
+receipt keys are excluded from the inspected graph-state digest. Once the receipt
+expires, the old expected-state digest still prevents replay mutation. Every
+successful admin transition also writes its fresh context-separated request-nonce
+HMAC into the canonical `ReconciledHeadReceipt`, making the post-state digest
+different even when reconcile retains the same head, fence, and evidence. Admin
+inspect hashes the ordered exact raw core-state tuple before decode, so a
+corrupt-envelope repair can CAS the observed raw state. Such repair requires raw
+lock/reservation keys absent, preserves every valid current scalar lower bound, and
+still requires fresh durable evidence; runtime methods never use this path.
 
 - [ ] **Step 5: Implement revocation and rate-limit stores**
 
@@ -2079,7 +2127,12 @@ Require exact contiguous non-conflicting revisions, head semantic checksum and
 commit digest, maximum fencing token across every GraphCommit and staged entity
 row, a proposed fencing floor strictly greater than that maximum, and canonical
 evidence SHA-256. Admin initialize/reconcile tests require no lock/reservation,
-exact expected-state digest, nonce idempotency, and non-decreasing revision/fence.
+exact expected-state digest, non-decreasing revision/fence, and a canonical
+fixed-graph-scope nonce receipt binding method, evidence digest, expected-state
+digest, and scope HMAC. Prove receipt-first exact replay returns the original
+result for 60,000 ms, changed input conflicts, receipt keys do not change the
+inspected state digest, each successful proof binds the fresh admin nonce HMAC,
+and post-expiry replay fails stale CAS without mutation even for a retained head.
 Reject production without all apply/allow/plan-SHA confirmations. Assert
 `recover-operation` and every ordinary migrate/restore writer lacks access to
 `CoordinationAdmin` and cannot initialize/reconcile as a side effect.
@@ -2195,7 +2248,13 @@ never decrease revision/fence, and require `--apply`; production also requires
 `--allow-production`. A changed fresh evidence digest aborts without mutation.
 These commands are the only callers of `CoordinationAdmin`.
 Each apply command generates one random request nonce and retains it unchanged for
-the adapter's ambiguous-response retry.
+the adapter's ambiguous-response retry. The admin script checks the corresponding
+fixed graph-scope result receipt before current-state CAS and retains the exact
+original `CoordinationAdminResult` until exactly first Redis server time plus
+60,000 ms. An exact retained retry returns that result without mutation; changed
+canonical input conflicts. After expiry, the original expected-state digest is
+stale and prevents another mutation because the successful reconciled-head proof
+bound the request-nonce HMAC into the core state digest.
 
 - [ ] **Step 6: Implement migration semantics**
 
