@@ -4,7 +4,7 @@
 
 **Goal:** Persist the normalized graph atomically over Airtable, serialize mutations through Upstash, expose secure v2 APIs, add review-only AI enrichment, and provide a reversible, idempotent migration CLI.
 
-**Architecture:** Airtable rows are append-only versions; an append-only `GraphCommits` record is the visibility boundary and `GraphState` is only a cache. Readers authorize each staged row through the exact `(Revision, OperationId, FencingToken)` tuple of its logical commit. Upstash leases serialize proposal work, while an immutable, non-expiring `COMMITTING` reservation makes commit authorization atomic and recoverable. Services validate a complete proposed snapshot before staging and publish only the exact commit named by a `CommitPermit`. AI enrichment uses a separate append-only attempt pipeline whose validated suggestions can populate a draft but cannot publish graph state.
+**Architecture:** Airtable rows are append-only versions; an append-only `GraphCommits` record is the visibility boundary and `GraphState` is only a cache. Readers first partition rows by configured `GraphScope`, then authorize each staged row through the exact `(Revision, OperationId, FencingToken)` tuple of its logical commit. Upstash leases serialize proposal work, while an immutable, non-expiring `COMMITTING` reservation makes commit authorization atomic and recoverable. Services validate a complete proposed snapshot before staging and publish only the exact commit named by a `CommitPermit`. AI enrichment uses a separate append-only attempt pipeline whose validated suggestions can populate a draft but cannot publish graph state.
 
 The binding coordination and compensation design is
 `docs/superpowers/specs/2026-08-05-shajra-commit-coordination-design.md`.
@@ -343,9 +343,10 @@ git commit -m "feat: add append-only Shajra repository contracts"
 First assert the typed canonical schema manifest has exactly these table names.
 For each of `PersonVersions`, `FamilyUnits`, `ParentChildLinks`, and
 `UnresolvedRelationships`, assert integer fields `Revision` and `FencingToken`
-with precision `0`, text `OperationId`, and checkbox `IsTombstone` with the
+with precision `0`, text `GraphScope` and `OperationId`, and checkbox `IsTombstone` with the
 declared icon/color options. Assert `Archived` remains a separate checkbox on
 `PersonVersions`, `GraphCommits` has text `PermitId`, and `ChangeLog` has canonical
+`CommandsJson`, long text `BeforeSnapshotJson` and `AfterSnapshotJson`, canonical
 `InverseWriteSetJson`, text `CommitScope`, long text `GraphCommitJson`, and text
 `CommitSha256`. Add negative validator fixtures for a
 missing table, wrong primary field, `Revision` as `singleLineText`, and number
@@ -455,27 +456,27 @@ def checkbox(name: str) -> FieldSpec:
 
 NORMALIZED_SCHEMA = MappingProxyType({
     "PersonVersions": TableSpec("PersonVersions", "PersonId", (
-        text("PersonId"), text("FullName"), text("Gender"), text("Birth"),
+        text("PersonId"), text("GraphScope"), text("FullName"), text("Gender"), text("Birth"),
         text("Death"), text("IsAlive"), text("PrimaryFamilyUnitId"),
         checkbox("Archived"), integer("VersionRevision"), integer("Revision"),
         text("OperationId"), integer("FencingToken"), checkbox("IsTombstone"),
     )),
     "FamilyUnits": TableSpec("FamilyUnits", "FamilyUnitId", (
-        text("FamilyUnitId"), text("Kind"), text("AdultAId"), text("AdultBId"),
+        text("FamilyUnitId"), text("GraphScope"), text("Kind"), text("AdultAId"), text("AdultBId"),
         text("Status"), text("Start"), text("End"),
         checkbox("DistinctUnionConfirmed"), integer("CreatedRevision"),
         integer("Revision"), text("OperationId"), integer("FencingToken"),
         checkbox("IsTombstone"),
     )),
     "ParentChildLinks": TableSpec("ParentChildLinks", "LinkId", (
-        text("LinkId"), text("ParentId"), text("ChildId"), text("Role"),
+        text("LinkId"), text("GraphScope"), text("ParentId"), text("ChildId"), text("Role"),
         text("RelationshipType"), text("FamilyUnitId"),
         integer("CreatedRevision"), integer("Revision"), text("OperationId"),
         integer("FencingToken"), checkbox("IsTombstone"),
     )),
     "UnresolvedRelationships": TableSpec(
         "UnresolvedRelationships", "UnresolvedId", (
-            text("UnresolvedId"), text("SubjectPersonId"), text("Kind"),
+            text("UnresolvedId"), text("GraphScope"), text("SubjectPersonId"), text("Kind"),
             text("UnresolvedName"), integer("CreatedRevision"),
             integer("Revision"), text("OperationId"), integer("FencingToken"),
             checkbox("IsTombstone"),
@@ -486,12 +487,13 @@ NORMALIZED_SCHEMA = MappingProxyType({
         text("ActorId"), text("RequestId"), text("SourceReference"),
         integer("ExpectedRevision"), integer("ResultRevision"),
         integer("FencingToken"), long_text("CommandsJson"),
+        long_text("BeforeSnapshotJson"), long_text("AfterSnapshotJson"),
         long_text("InverseWriteSetJson"), text("CommitScope"),
         long_text("GraphCommitJson"), text("CommitSha256"),
         text("CreatedAt"), text("UpdatedAt"),
     )),
     "GraphCommits": TableSpec("GraphCommits", "OperationId", (
-        text("OperationId"), integer("Revision"), integer("FencingToken"),
+        text("OperationId"), text("GraphScope"), integer("Revision"), integer("FencingToken"),
         text("PermitId"), text("SemanticChecksum"), text("CommittedAt"),
     )),
     "GraphState": TableSpec("GraphState", "StateKey", (
@@ -661,7 +663,7 @@ git commit -m "fix: isolate and escape Shajra Airtable access"
 - [ ] **Step 1: Write mocked Airtable commit-boundary tests**
 
 Use fake tables recording `batch_create` calls. Assert stage writes rows with the
-same `OperationId`, `Revision`, and `FencingToken` and an explicit
+configured `GraphScope`, the same `OperationId`, `Revision`, and `FencingToken`, and an explicit
 `IsTombstone`. Assert all staged entity tables are written and verified before
 `GraphCommits`, and `GraphState` is attempted only after `GraphCommits`. Assert a
 missing commit causes staged rows to be ignored. Reproduce the Task 1 regression
@@ -686,8 +688,9 @@ assert fake_tables.write_order == [
 
 - [ ] **Step 2: Implement append-only row shapes**
 
-Every normalized row contains its stable logical ID, `Revision`, `OperationId`,
-`FencingToken`, `IsTombstone`, and semantic fields for an upsert. `Archived` is a
+Every normalized row contains its stable logical ID, configured `GraphScope`,
+`Revision`, `OperationId`, `FencingToken`, `IsTombstone`, and semantic fields for
+an upsert. `Archived` is a
 separate semantic person field and never substitutes for `IsTombstone`. Family
 units persist `DistinctUnionConfirmed`; unresolved upserts persist kind, subject
 ID, and normalized name. Never update an existing version row. `GraphCommits`
@@ -695,6 +698,7 @@ contains:
 
 ```python
 {
+    "GraphScope": repository.scope,
     "Revision": commit.revision,
     "OperationId": str(commit.operation_id),
     "FencingToken": commit.fencing_token,
@@ -712,17 +716,24 @@ It has no coordination or Redis dependency.
 Append the commit after staged-row verification. Resolve an ambiguous create by
 reading the revision back. Treat canonical-identical physical `GraphCommits` rows
 as one logical commit; any canonical difference within a revision is
-`COMMIT_LOG_CORRUPTION`. Update the single `GraphState` cache row with primary
-field `StateKey="graph"` only after the commit and tolerate cache-update failure.
+`COMMIT_LOG_CORRUPTION`. Existing identical-commit retries materialize and verify
+the committed semantic checksum before returning and best-effort repair the
+cache. Update the `GraphState` cache row with primary field
+`StateKey=repository.scope` only after verified success and tolerate cache-update
+failure.
 
 - [ ] **Step 3: Implement committed snapshot loading**
 
-Read and canonicalize `GraphCommits` in revision order. Identical physical rows are
-one logical commit; conflicting rows for a revision fail closed. For each logical
-entity ID, discard every row whose `(Revision, OperationId, FencingToken)` does not
-exactly match the logical commit for that row's revision, then select the highest
-authorized row at or below the requested revision. An authorized `IsTombstone`
-omits the entity. Deduplicate identical physical entity rows and raise
+Filter every entity and commit row by exact `GraphScope` before parsing. Read and
+canonicalize `GraphCommits` in revision order and require the exact positive
+contiguous sequence `1..head`. Identical physical rows are one logical commit;
+conflicting rows for a revision fail closed. `load_committed()` selects head,
+while `load_committed(N)` requires that exact committed revision; revision `0`
+is valid only for an empty log. For each logical entity ID, discard every row
+whose `(Revision, OperationId, FencingToken)` does not exactly match the logical
+commit for that row's revision, then select the highest authorized row at or
+below the selected revision. An authorized `IsTombstone` omits the entity.
+Deduplicate identical physical entity rows and raise
 `ENTITY_VERSION_CORRUPTION` for conflicting payloads under one logical version.
 Recompute the semantic checksum and fail closed with `COMMIT_CHECKSUM_MISMATCH` if
 it differs.
@@ -733,12 +744,17 @@ Audit records are append-only state transitions keyed by `OperationId` and
 idempotency key. States are `PENDING`, `COMMITTING`, `COMMITTED`, and `FAILED`;
 resolve current state from the latest transition. Before/after snapshots contain
 application IDs and semantic graph data but redact contact fields and credentials.
-Persist the typed inverse write set as canonical `InverseWriteSetJson`. The JSON
-uses the eight `GraphWriteSet` fields from Task 1, stable logical-ID order, sorted
-object keys, compact separators, and ASCII output. From `PENDING` onward, each
-audit transition also persists `CommitScope`, Task 1 canonical `GraphCommitJson`,
-and `CommitSha256`, so an interrupted post-confirmation audit transition can be
-repaired without inferring permit ID or commit time.
+Persist commands, before snapshots, and after snapshots in independent canonical
+JSON fields. Persist the typed inverse write set as canonical
+`InverseWriteSetJson`. A strict shared parser requires exactly the eight
+`GraphWriteSet` fields, exact entity fields/types/enums/dates, valid logical-ID
+prefixes, and no duplicate IDs, private fields, credentials, or Airtable record
+IDs; serialization then uses Task 1 stable order, compact separators, and ASCII
+output. Scope the audit repository by `CommitScope`. From `PENDING` onward, each
+audit transition also persists Task 1 canonical `GraphCommitJson` and
+`CommitSha256`, so an interrupted post-confirmation audit transition can be
+repaired without inferring permit ID or commit time. Reads validate denormalized
+revision/fencing fields and immutable transition timestamps against that commit.
 
 - [ ] **Step 5: Run and commit**
 

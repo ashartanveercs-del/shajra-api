@@ -75,7 +75,9 @@ class InMemoryGraphRepository:
         commits = self._logical_commits()
         existing = commits.get(commit.revision)
         if existing is not None:
-            if canonical_graph_commit_json(existing) == canonical_graph_commit_json(commit):
+            if canonical_graph_commit_json(existing) == canonical_graph_commit_json(
+                commit
+            ):
                 return self._state_for_commit(existing)
             raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION")
 
@@ -86,14 +88,16 @@ class InMemoryGraphRepository:
         return self._state_for_commit(commit)
 
     def load_committed(self, revision: int | None = None) -> GraphSnapshot:
-        commits = self._logical_commits()
-        requested_revision = max(commits, default=0) if revision is None else revision
-        if requested_revision < 0:
+        if revision is not None and revision < 0:
             raise ValueError("revision must not be negative")
-        committed_revisions = [item for item in commits if item <= requested_revision]
-        if not committed_revisions:
+        commits = self._logical_commits()
+        if not commits:
+            if revision not in (None, 0):
+                raise ValueError("committed revision does not exist")
             return GraphSnapshot(self._initial_state(), {}, {}, {}, {})
-        head_commit = commits[max(committed_revisions)]
+        if revision is not None and revision not in commits:
+            raise ValueError("committed revision does not exist")
+        head_commit = commits[max(commits) if revision is None else revision]
         authorized_rows = self._authorized_rows(commits, head_commit.revision)
         people, family_units, links, unresolved = self._materialize(authorized_rows)
         return GraphSnapshot(
@@ -117,12 +121,16 @@ class InMemoryGraphRepository:
     def _logical_commits(self) -> dict[int, GraphCommit]:
         commits_by_revision: dict[int, dict[str, GraphCommit]] = defaultdict(dict)
         for commit in self._commits:
-            commits_by_revision[commit.revision][canonical_graph_commit_json(commit)] = commit
+            commits_by_revision[commit.revision][
+                canonical_graph_commit_json(commit)
+            ] = commit
         logical: dict[int, GraphCommit] = {}
         for revision, candidates in commits_by_revision.items():
             if len(candidates) != 1:
                 raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION")
             logical[revision] = next(iter(candidates.values()))
+        if sorted(logical) != list(range(1, len(logical) + 1)):
+            raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION")
         return logical
 
     def _authorized_rows(
@@ -188,7 +196,12 @@ class InMemoryGraphRepository:
     ) -> list[_EntityRow]:
         rows: list[_EntityRow] = []
         for kind, upserts, tombstones, attribute in (
-            ("person", write_set.person_upserts, write_set.person_tombstones, "person_id"),
+            (
+                "person",
+                write_set.person_upserts,
+                write_set.person_tombstones,
+                "person_id",
+            ),
             (
                 "family_unit",
                 write_set.family_unit_upserts,

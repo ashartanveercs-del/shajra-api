@@ -185,6 +185,7 @@ remains a semantic person property and is not a persistence tombstone.
 Every staged entity row contains:
 
 - its logical entity ID;
+- `GraphScope` equal to the configured repository namespace;
 - `Revision`;
 - `OperationId`;
 - `FencingToken`;
@@ -194,11 +195,18 @@ Every staged entity row contains:
 The four tables use the same marker name: `PersonVersions`, `FamilyUnits`,
 `ParentChildLinks`, and `UnresolvedRelationships` all use `IsTombstone`.
 
-`GraphCommits` stores `OperationId`, `Revision`, `FencingToken`, `PermitId`,
-`SemanticChecksum`, and `CommittedAt`. `ChangeLog` stores canonical
-`InverseWriteSetJson`, `GraphCommitJson`, and `CommitSha256`. The planned canonical
-commit identity is present from `PENDING` onward so audit repair never has to infer
-`permit_id` or `committed_at`.
+`GraphCommits` stores `GraphScope`, `OperationId`, `Revision`, `FencingToken`,
+`PermitId`, `SemanticChecksum`, and `CommittedAt`. `ChangeLog` stores canonical
+`CommandsJson`, `BeforeSnapshotJson`, `AfterSnapshotJson`,
+`InverseWriteSetJson`, `CommitScope`, `GraphCommitJson`, and `CommitSha256` in
+independent fields. The canonical commit identity is present from `PENDING`
+onward so audit repair never has to infer `permit_id` or `committed_at`.
+
+`GraphScope` partitions every entity and commit read before row parsing,
+deduplication, or authorization. `GraphState.StateKey` equals that configured
+scope. Audit repositories are configured with the same scope, require
+`AuditOperation.commit_scope` to match it, and ignore other scopes before
+resolving idempotency or transition state.
 
 ## Operation-Bound Visibility
 
@@ -208,10 +216,14 @@ A committed revision authorizes rows by the exact tuple:
 (Revision, OperationId, FencingToken)
 ```
 
-For each logical entity ID, a reader considers only rows whose tuple exactly
-matches a valid logical `GraphCommit` at that revision. It then chooses the
-highest authorized revision at or below the requested committed revision. An
-authorized tombstone removes that logical ID from the materialized snapshot.
+Within one `GraphScope`, a reader considers only rows whose tuple exactly matches
+a valid logical `GraphCommit` at that revision. It then chooses the highest
+authorized revision at or below the selected committed revision. The logical
+commit history must be exactly the positive contiguous sequence `1..head`.
+`load_committed()` selects `head`; `load_committed(N)` requires an exact commit
+at `N`. Revision `0` returns the initial snapshot only when the scope has no
+commits. An authorized tombstone removes that logical ID from the materialized
+snapshot.
 
 Rows with a revision but a different operation ID or fencing token are ignored.
 Therefore, if operations A and B both stage revision 7 and only B commits, no row
@@ -348,8 +360,11 @@ canonical inverse write set from the committed before-image:
 
 `ChangeLog.InverseWriteSetJson` stores that typed structure using sorted keys,
 compact separators, ASCII JSON, stable entity-kind order, and stable logical-ID
-order. Before and after semantic snapshots remain available for conflict checks
-and audit display.
+order. Deserialization requires exactly the eight `GraphWriteSet` fields and the
+exact typed domain payload for each entity kind; it rejects duplicate logical
+IDs, invalid ID prefixes, extra/private fields, and malformed enums or dates.
+Before and after semantic snapshots remain available for conflict checks and
+audit display in their dedicated fields.
 
 Compensation loads the current committed snapshot and requires every touched
 entity to still equal the target operation's after-image. A mismatch returns

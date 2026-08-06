@@ -136,7 +136,7 @@ def _graph_repository(fake: FakeAirtable):
 def _audit_repository(fake: FakeAirtable, *, now: datetime = COMMITTED_AT):
     module = importlib.import_module("repositories.airtable.audit")
     ticks = iter(now + timedelta(microseconds=index) for index in range(100))
-    return module.AirtableAuditRepository(fake, clock=lambda: next(ticks))
+    return module.AirtableAuditRepository(fake, scope=SCOPE, clock=lambda: next(ticks))
 
 
 def _context(operation_id: str, revision: int, fencing_token: int) -> WriteContext:
@@ -246,6 +246,7 @@ def test_stage_writes_all_entity_tables_append_only_with_exact_authorization() -
         assert all(row["Revision"] == 7 for row in fields)  # type: ignore[index]
         assert all(row["OperationId"] == "op_stage" for row in fields)  # type: ignore[index]
         assert all(row["FencingToken"] == 23 for row in fields)  # type: ignore[index]
+        assert all(row["GraphScope"] == SCOPE for row in fields)  # type: ignore[index]
         assert all(isinstance(row["IsTombstone"], bool) for row in fields)  # type: ignore[index]
     person_rows = [record["fields"] for record in fake.tables["PersonVersions"].records]
     archived = next(row for row in person_rows if row["PersonId"] == "per_parent")  # type: ignore[index]
@@ -254,6 +255,7 @@ def test_stage_writes_all_entity_tables_append_only_with_exact_authorization() -
     assert archived["IsTombstone"] is False  # type: ignore[index]
     assert removed == {
         "PersonId": "per_removed",
+        "GraphScope": SCOPE,
         "Revision": 7,
         "OperationId": "op_stage",
         "FencingToken": 23,
@@ -302,6 +304,7 @@ def test_commit_is_written_only_after_receipt_verification_and_cache_is_best_eff
     assert fake.tables["GraphCommits"].records[0]["fields"] == {
         "Revision": 1,
         "OperationId": "op_one",
+        "GraphScope": SCOPE,
         "FencingToken": 11,
         "PermitId": "cpr_op_one",
         "SemanticChecksum": semantic_checksum(snapshot),
@@ -317,6 +320,7 @@ def test_append_reverifies_the_exact_receipt_before_publishing() -> None:
     fake.tables["PersonVersions"].seed(
         {
             "PersonId": "per_unexpected",
+            "GraphScope": SCOPE,
             "Revision": 1,
             "OperationId": "op_one",
             "FencingToken": 11,
@@ -329,6 +333,36 @@ def test_append_reverifies_the_exact_receipt_before_publishing() -> None:
         repository.append_commit(commit, permit)
 
     assert fake.tables["GraphCommits"].records == []
+
+
+def test_graph_scope_filters_verification_commits_entities_and_cache() -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    person = Person(PersonId("per_one"), "Main")
+    receipt = repository.stage(
+        GraphWriteSet(person_upserts=(person,)), _context("op_main", 1, 7)
+    )
+    other_entity = copy.deepcopy(fake.tables["PersonVersions"].records[0]["fields"])
+    other_entity["GraphScope"] = "graph:other"  # type: ignore[index]
+    other_entity["FullName"] = "Other"  # type: ignore[index]
+    fake.tables["PersonVersions"].seed(other_entity)  # type: ignore[arg-type]
+
+    repository.verify_staged(receipt)
+    snapshot = _snapshot(1, "op_main", 7, people=(person,))
+    commit, permit = _commit_and_permit(receipt, snapshot)
+    repository.append_commit(commit, permit)
+    main_commit_row = fake.tables["GraphCommits"].records[0]["fields"]
+    fake.tables["GraphCommits"].seed(
+        {
+            **main_commit_row,  # type: ignore[dict-item]
+            "GraphScope": "graph:other",
+            "OperationId": "op_other",
+            "PermitId": "cpr_other",
+        }
+    )
+
+    assert repository.load_committed().people == {person.person_id: person}
+    assert fake.tables["GraphState"].records[0]["fields"]["StateKey"] == SCOPE  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -379,6 +413,63 @@ def test_ambiguous_commit_create_is_resolved_by_canonical_readback() -> None:
     assert state.revision == 1
     assert len(fake.tables["GraphCommits"].records) == 1
     assert fake.write_order[-2:] == ["GraphCommits", "GraphState"]
+
+
+@pytest.mark.parametrize("damage", ("missing", "conflicting"))
+def test_identical_commit_retry_revalidates_the_materialized_snapshot(
+    damage: str,
+) -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    person = Person(PersonId("per_one"), "One")
+    first_receipt = repository.stage(
+        GraphWriteSet(person_upserts=(person,)), _context("op_one", 1, 1)
+    )
+    repository.verify_staged(first_receipt)
+    first_snapshot = _snapshot(1, "op_one", 1, people=(person,))
+    first_commit, first_permit = _commit_and_permit(first_receipt, first_snapshot)
+    repository.append_commit(first_commit, first_permit)
+
+    second_receipt = repository.stage(GraphWriteSet(), _context("op_two", 2, 2))
+    repository.verify_staged(second_receipt)
+    second_snapshot = _snapshot(2, "op_two", 2, people=(person,))
+    second_commit, second_permit = _commit_and_permit(second_receipt, second_snapshot)
+    repository.append_commit(second_commit, second_permit)
+
+    if damage == "missing":
+        fake.tables["PersonVersions"].records.clear()
+        error = "COMMIT_CHECKSUM_MISMATCH"
+    else:
+        conflicting = copy.deepcopy(fake.tables["PersonVersions"].records[0]["fields"])
+        conflicting["FullName"] = "Conflicting"  # type: ignore[index]
+        fake.tables["PersonVersions"].seed(conflicting)  # type: ignore[arg-type]
+        error = "ENTITY_VERSION_CORRUPTION"
+
+    with pytest.raises(RuntimeError, match=error):
+        repository.append_commit(second_commit, second_permit)
+
+
+def test_identical_commit_retry_repairs_the_graph_state_cache() -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    receipt = repository.stage(GraphWriteSet(), _context("op_one", 1, 5))
+    repository.verify_staged(receipt)
+    snapshot = _snapshot(1, "op_one", 5)
+    commit, permit = _commit_and_permit(receipt, snapshot)
+    expected_state = repository.append_commit(commit, permit)
+    fake.tables["GraphState"].records.clear()
+
+    retried_state = repository.append_commit(commit, permit)
+
+    assert retried_state == expected_state
+    assert fake.tables["GraphState"].records[0]["fields"] == {
+        "StateKey": SCOPE,
+        "Revision": 1,
+        "HeadOperationId": "op_one",
+        "FencingToken": 5,
+        "SemanticChecksum": semantic_checksum(snapshot),
+        "UpdatedAt": COMMITTED_AT.isoformat(),
+    }
 
 
 def test_uncommitted_rows_are_invisible_and_exact_commit_tuple_authorizes_rows() -> (
@@ -490,6 +581,7 @@ def test_conflicting_commit_rows_and_semantic_checksum_mismatch_fail_closed() ->
     fake = FakeAirtable()
     repository = _graph_repository(fake)
     commit_row = {
+        "GraphScope": SCOPE,
         "Revision": 1,
         "OperationId": "op_one",
         "FencingToken": 1,
@@ -509,6 +601,55 @@ def test_conflicting_commit_rows_and_semantic_checksum_mismatch_fail_closed() ->
     fake.tables["GraphCommits"].seed({**commit_row, "SemanticChecksum": "0" * 64})
     with pytest.raises(RuntimeError, match="COMMIT_CHECKSUM_MISMATCH"):
         repository.load_committed()
+
+
+@pytest.mark.parametrize(
+    "revisions",
+    ((0,), (-1,), (1, 3)),
+    ids=("zero", "negative", "gap"),
+)
+def test_commit_history_requires_positive_contiguous_revisions(revisions) -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+    for revision in revisions:
+        fake.tables["GraphCommits"].seed(
+            {
+                "GraphScope": SCOPE,
+                "Revision": revision,
+                "OperationId": f"op_{revision}",
+                "FencingToken": revision,
+                "PermitId": f"cpr_{revision}",
+                "SemanticChecksum": semantic_checksum(
+                    _snapshot(revision, f"op_{revision}", revision)
+                ),
+                "CommittedAt": COMMITTED_AT.isoformat(),
+            }
+        )
+
+    with pytest.raises(RuntimeError, match="COMMIT_LOG_CORRUPTION"):
+        repository.load_committed()
+
+
+def test_explicit_revision_must_name_an_exact_commit() -> None:
+    fake = FakeAirtable()
+    repository = _graph_repository(fake)
+
+    assert repository.load_committed(0).state == GraphState(0, None, 0, "")
+    with pytest.raises(ValueError, match="committed revision"):
+        repository.load_committed(1)
+    with pytest.raises(ValueError, match="negative"):
+        repository.load_committed(-1)
+
+    receipt = repository.stage(GraphWriteSet(), _context("op_one", 1, 1))
+    repository.verify_staged(receipt)
+    commit, permit = _commit_and_permit(receipt, _snapshot(1, "op_one", 1))
+    repository.append_commit(commit, permit)
+
+    assert repository.load_committed(1).state.revision == 1
+    with pytest.raises(ValueError, match="committed revision"):
+        repository.load_committed(0)
+    with pytest.raises(ValueError, match="committed revision"):
+        repository.load_committed(2)
 
 
 def _audit_operation(
@@ -531,7 +672,7 @@ def _audit_operation(
         "parent_child_link_upserts": [],
         "family_unit_tombstones": [],
         "family_unit_upserts": [],
-        "person_tombstones": ["per_z", "per_a"],
+        "person_tombstones": ["per_removed_z", "per_removed_a"],
         "person_upserts": [
             {
                 "version_revision": 2,
@@ -617,6 +758,9 @@ def test_audit_pending_is_append_only_canonical_redacted_and_record_id_free() ->
     assert "rec_ChangeLog" not in repr(found)
     row = fake.tables["ChangeLog"].records[0]["fields"]
     assert row["CommitScope"] == SCOPE  # type: ignore[index]
+    assert row["CommandsJson"] == found.commands_json  # type: ignore[index]
+    assert row["BeforeSnapshotJson"] == found.before_snapshot_json  # type: ignore[index]
+    assert row["AfterSnapshotJson"] == found.after_snapshot_json  # type: ignore[index]
     assert row["GraphCommitJson"] == found.graph_commit_json  # type: ignore[index]
     assert row["CommitSha256"] == found.commit_sha256  # type: ignore[index]
     assert row["InverseWriteSetJson"] == canonical_graph_write_set_json(  # type: ignore[index]
@@ -625,13 +769,49 @@ def test_audit_pending_is_append_only_canonical_redacted_and_record_id_free() ->
                 Person(PersonId("per_a"), "Ada", version_revision=1),
                 Person(PersonId("per_z"), "Zed", version_revision=2),
             ),
-            person_tombstones=(PersonId("per_a"), PersonId("per_z")),
+            person_tombstones=(
+                PersonId("per_removed_a"),
+                PersonId("per_removed_z"),
+            ),
             unresolved_tombstones=(
                 UnresolvedRelationshipId("unr_a"),
                 UnresolvedRelationshipId("unr_z"),
             ),
         )
     )
+
+
+def test_audit_scope_rejects_cross_scope_create_and_filters_reads() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    wrong_scope = replace(_audit_operation(), commit_scope="graph:other")
+
+    with pytest.raises(ValueError, match="scope"):
+        repository.create_pending(wrong_scope)
+    assert fake.calls == []
+
+    module = importlib.import_module("repositories.airtable.audit")
+    other_repository = module.AirtableAuditRepository(
+        fake, scope="graph:other", clock=lambda: COMMITTED_AT
+    )
+    other_repository.create_pending(wrong_scope)
+
+    assert repository.find_by_idempotency_key(wrong_scope.idempotency_key) is None
+
+
+def test_audit_rejects_private_or_untyped_inverse_write_sets() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    inverse = json.loads(operation.inverse_write_set_json)
+    inverse["person_upserts"][0]["contact_email"] = "private@example.test"
+
+    with pytest.raises(ValueError):
+        repository.create_pending(
+            replace(operation, inverse_write_set_json=json.dumps(inverse))
+        )
+
+    assert fake.tables["ChangeLog"].records == []
 
 
 def test_audit_transitions_repeat_recovery_metadata_and_resolve_latest_state() -> None:
@@ -672,3 +852,51 @@ def test_audit_pending_retry_is_idempotent_and_conflicting_key_fails_closed() ->
             )
         )
     assert len(fake.tables["ChangeLog"].records) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("ExpectedRevision", 99),
+        ("ResultRevision", 99),
+        ("FencingToken", 99),
+    ),
+)
+def test_audit_rows_validate_denormalized_commit_metadata(
+    field: str, value: int
+) -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    repository.create_pending(operation)
+    fake.tables["ChangeLog"].records[0]["fields"][field] = value  # type: ignore[index]
+
+    with pytest.raises(RuntimeError, match="AUDIT_LOG_CORRUPTION"):
+        repository.find_by_idempotency_key(operation.idempotency_key)
+
+
+def test_audit_rows_reject_updated_at_before_created_at() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    repository.create_pending(operation)
+    fake.tables["ChangeLog"].records[0]["fields"]["UpdatedAt"] = (  # type: ignore[index]
+        COMMITTED_AT - timedelta(seconds=1)
+    ).isoformat()
+
+    with pytest.raises(RuntimeError, match="AUDIT_LOG_CORRUPTION"):
+        repository.find_by_idempotency_key(operation.idempotency_key)
+
+
+def test_audit_transitions_require_one_immutable_created_at() -> None:
+    fake = FakeAirtable()
+    repository = _audit_repository(fake)
+    operation = _audit_operation()
+    repository.create_pending(operation)
+    repository.transition(operation.operation_id, AuditOperationState.COMMITTING)
+    fake.tables["ChangeLog"].records[1]["fields"]["CreatedAt"] = (  # type: ignore[index]
+        COMMITTED_AT + timedelta(microseconds=1)
+    ).isoformat()
+
+    with pytest.raises(RuntimeError, match="AUDIT_LOG_CORRUPTION"):
+        repository.find_by_idempotency_key(operation.idempotency_key)

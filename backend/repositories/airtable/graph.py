@@ -75,6 +75,8 @@ class AirtableGraphRepository:
         }
         rows = self._rows_for_write_set(write_set, context)
         for table_name in self._entity_table_names():
+            for row in rows[table_name]:
+                row["GraphScope"] = self.scope
             self._client.table(table_name).batch_create(rows[table_name])
         return StagedWriteReceipt(
             operation_id=context.operation_id,
@@ -120,7 +122,14 @@ class AirtableGraphRepository:
                 commit
             ):
                 raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION")
-            return self._state_for_commit(existing)
+            snapshot = self._snapshot_for(commits, existing.revision)
+            if not hmac.compare_digest(
+                semantic_checksum(snapshot), existing.semantic_checksum
+            ):
+                raise RepositoryCorruptionError("COMMIT_CHECKSUM_MISMATCH")
+            state = self._state_for_commit(existing)
+            self._update_state_cache(state, existing.committed_at)
+            return state
 
         head_revision = max(commits, default=0)
         if commit.revision != head_revision + 1:
@@ -158,12 +167,14 @@ class AirtableGraphRepository:
         if revision is not None and revision < 0:
             raise ValueError("revision must not be negative")
         commits = self._logical_commits()
-        requested = max(commits, default=0) if revision is None else revision
-        eligible = [item for item in commits if item <= requested]
-        if not eligible:
+        if not commits:
+            if revision not in (None, 0):
+                raise ValueError("committed revision does not exist")
             return GraphSnapshot(GraphState(0, None, 0, ""), {}, {}, {}, {})
+        if revision is not None and revision not in commits:
+            raise ValueError("committed revision does not exist")
 
-        head_revision = max(eligible)
+        head_revision = max(commits) if revision is None else revision
         snapshot = self._snapshot_for(commits, head_revision)
         expected = commits[head_revision].semantic_checksum
         if not hmac.compare_digest(semantic_checksum(snapshot), expected):
@@ -186,7 +197,10 @@ class AirtableGraphRepository:
     def _logical_commits(self) -> dict[int, GraphCommit]:
         candidates: dict[int, dict[str, GraphCommit]] = defaultdict(dict)
         for record in self._client.table("GraphCommits").all():
-            commit = self._commit_from_row(self._fields(record))
+            fields = self._fields(record)
+            if fields.get("GraphScope") != self.scope:
+                continue
+            commit = self._commit_from_row(fields)
             candidates[commit.revision][canonical_graph_commit_json(commit)] = commit
 
         logical: dict[int, GraphCommit] = {}
@@ -194,6 +208,8 @@ class AirtableGraphRepository:
             if len(candidates[revision]) != 1:
                 raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION")
             logical[revision] = next(iter(candidates[revision].values()))
+        if sorted(logical) != list(range(1, len(logical) + 1)):
+            raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION")
         return logical
 
     def _snapshot_for(
@@ -236,7 +252,10 @@ class AirtableGraphRepository:
     ) -> dict[str, Version]:
         logical_versions: dict[tuple[str, int, str, int], Version] = {}
         for record in self._client.table(table_name).all():
-            version = mapper(self._fields(record))
+            fields = self._fields(record)
+            if fields.get("GraphScope") != self.scope:
+                continue
+            version = mapper(fields)
             commit = commits.get(version.revision)
             if (
                 commit is None
@@ -269,7 +288,10 @@ class AirtableGraphRepository:
         for table_name, id_attribute, mapper in self._entity_specs():
             versions: dict[str, Version] = {}
             for record in self._client.table(table_name).all():
-                version = mapper(self._fields(record))
+                fields = self._fields(record)
+                if fields.get("GraphScope") != self.scope:
+                    continue
+                version = mapper(fields)
                 if (
                     version.revision != receipt.revision
                     or version.operation_id != receipt.operation_id
@@ -359,9 +381,9 @@ class AirtableGraphRepository:
         except (TypeError, ValueError) as error:
             raise RepositoryCorruptionError("COMMIT_LOG_CORRUPTION") from error
 
-    @staticmethod
-    def _commit_row(commit: GraphCommit) -> dict[str, object]:
+    def _commit_row(self, commit: GraphCommit) -> dict[str, object]:
         return {
+            "GraphScope": self.scope,
             "Revision": commit.revision,
             "OperationId": str(commit.operation_id),
             "FencingToken": commit.fencing_token,
@@ -372,7 +394,7 @@ class AirtableGraphRepository:
 
     def _update_state_cache(self, state: GraphState, committed_at: datetime) -> None:
         row = {
-            "StateKey": "graph",
+            "StateKey": self.scope,
             "Revision": state.revision,
             "HeadOperationId": str(state.head_operation_id),
             "FencingToken": state.fencing_token,

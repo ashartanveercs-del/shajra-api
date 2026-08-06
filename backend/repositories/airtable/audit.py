@@ -15,25 +15,11 @@ from repositories.protocols import (
     AuditOperationState,
     GraphCommit,
     canonical_graph_commit_json,
+    canonical_graph_write_set_json,
+    graph_write_set_from_json,
 )
 
 
-_WRITE_SET_FIELDS = (
-    "person_upserts",
-    "person_tombstones",
-    "family_unit_upserts",
-    "family_unit_tombstones",
-    "parent_child_link_upserts",
-    "parent_child_link_tombstones",
-    "unresolved_upserts",
-    "unresolved_tombstones",
-)
-_UPSERT_ID_FIELDS = {
-    "person_upserts": "person_id",
-    "family_unit_upserts": "family_unit_id",
-    "parent_child_link_upserts": "link_id",
-    "unresolved_upserts": "unresolved_id",
-}
 _ALLOWED_TRANSITIONS = {
     AuditOperationState.PENDING: frozenset(
         {
@@ -78,8 +64,11 @@ class _AuditTransition:
 
 
 class AirtableAuditRepository:
-    def __init__(self, client: Any, *, clock=None) -> None:
+    def __init__(self, client: Any, *, scope: str, clock=None) -> None:
+        if not scope:
+            raise ValueError("audit repository scope must not be empty")
         self._client = client
+        self.scope = scope
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def find_by_idempotency_key(self, key: str) -> AuditOperation | None:
@@ -98,6 +87,8 @@ class AirtableAuditRepository:
     def create_pending(self, operation: AuditOperation) -> None:
         if operation.state is not AuditOperationState.PENDING:
             raise ValueError("audit operation must start in PENDING")
+        if operation.commit_scope != self.scope:
+            raise ValueError("audit operation scope does not match repository scope")
         canonical = self._canonical_operation(operation)
         transitions = self._transitions()
 
@@ -148,16 +139,21 @@ class AirtableAuditRepository:
         )
 
     def _transitions(self) -> list[_AuditTransition]:
-        return [
-            self._transition_from_row(self._fields(record))
-            for record in self._client.table("ChangeLog").all()
-        ]
+        transitions: list[_AuditTransition] = []
+        for record in self._client.table("ChangeLog").all():
+            fields = self._fields(record)
+            if fields.get("CommitScope") != self.scope:
+                continue
+            transitions.append(self._transition_from_row(fields))
+        return transitions
 
     def _latest(self, transitions: list[_AuditTransition]) -> _AuditTransition:
         immutable_values = {
             self._immutable_value(transition.operation) for transition in transitions
         }
         if len(immutable_values) != 1:
+            raise RepositoryCorruptionError("AUDIT_LOG_CORRUPTION")
+        if len({transition.created_at for transition in transitions}) != 1:
             raise RepositoryCorruptionError("AUDIT_LOG_CORRUPTION")
 
         by_time: dict[datetime, dict[str, _AuditTransition]] = {}
@@ -193,16 +189,6 @@ class AirtableAuditRepository:
     def _row_for_transition(self, transition: _AuditTransition) -> dict[str, object]:
         operation = transition.operation
         commit = self._commit_from_json(operation.graph_commit_json)
-        envelope = json.dumps(
-            {
-                "after_snapshot_json": operation.after_snapshot_json,
-                "before_snapshot_json": operation.before_snapshot_json,
-                "commands_json": operation.commands_json,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
         return {
             "OperationId": str(operation.operation_id),
             "IdempotencyKey": operation.idempotency_key,
@@ -213,7 +199,9 @@ class AirtableAuditRepository:
             "ExpectedRevision": commit.revision - 1,
             "ResultRevision": commit.revision,
             "FencingToken": commit.fencing_token,
-            "CommandsJson": envelope,
+            "CommandsJson": operation.commands_json,
+            "BeforeSnapshotJson": operation.before_snapshot_json,
+            "AfterSnapshotJson": operation.after_snapshot_json,
             "InverseWriteSetJson": operation.inverse_write_set_json,
             "CommitScope": operation.commit_scope,
             "GraphCommitJson": operation.graph_commit_json,
@@ -224,14 +212,6 @@ class AirtableAuditRepository:
 
     def _transition_from_row(self, row: Mapping[str, object]) -> _AuditTransition:
         try:
-            envelope_value = json.loads(self._required_text(row, "CommandsJson"))
-            if not isinstance(envelope_value, dict) or set(envelope_value) != {
-                "after_snapshot_json",
-                "before_snapshot_json",
-                "commands_json",
-            }:
-                raise ValueError("CommandsJson audit envelope is malformed")
-            envelope = cast(dict[str, object], envelope_value)
             operation = AuditOperation(
                 operation_id=OperationId(self._required_text(row, "OperationId")),
                 idempotency_key=self._required_text(row, "IdempotencyKey"),
@@ -239,13 +219,9 @@ class AirtableAuditRepository:
                 actor_id=self._required_text(row, "ActorId"),
                 request_id=self._required_text(row, "RequestId"),
                 source_reference=self._optional_text(row, "SourceReference"),
-                commands_json=self._envelope_text(envelope, "commands_json"),
-                before_snapshot_json=self._envelope_text(
-                    envelope, "before_snapshot_json"
-                ),
-                after_snapshot_json=self._envelope_text(
-                    envelope, "after_snapshot_json"
-                ),
+                commands_json=self._required_text(row, "CommandsJson"),
+                before_snapshot_json=self._required_text(row, "BeforeSnapshotJson"),
+                after_snapshot_json=self._required_text(row, "AfterSnapshotJson"),
                 inverse_write_set_json=self._canonical_inverse_write_set(
                     self._required_text(row, "InverseWriteSetJson")
                 ),
@@ -256,10 +232,21 @@ class AirtableAuditRepository:
                 commit_sha256=self._required_text(row, "CommitSha256"),
             )
             canonical = self._canonical_operation(operation)
+            commit = self._commit_from_json(canonical.graph_commit_json)
+            if (
+                self._integer(row, "ExpectedRevision") != commit.revision - 1
+                or self._integer(row, "ResultRevision") != commit.revision
+                or self._integer(row, "FencingToken") != commit.fencing_token
+            ):
+                raise ValueError("audit commit metadata does not match GraphCommitJson")
+            created_at = self._timestamp(row, "CreatedAt")
+            updated_at = self._timestamp(row, "UpdatedAt")
+            if created_at > updated_at:
+                raise ValueError("audit CreatedAt must not follow UpdatedAt")
             return _AuditTransition(
                 canonical,
-                self._timestamp(row, "CreatedAt"),
-                self._timestamp(row, "UpdatedAt"),
+                created_at,
+                updated_at,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise RepositoryCorruptionError("AUDIT_LOG_CORRUPTION") from error
@@ -267,8 +254,8 @@ class AirtableAuditRepository:
     def _canonical_operation(self, operation: AuditOperation) -> AuditOperation:
         if not operation.idempotency_key:
             raise ValueError("idempotency key must not be empty")
-        if not operation.commit_scope:
-            raise ValueError("commit scope must not be empty")
+        if operation.commit_scope != self.scope:
+            raise ValueError("audit operation scope does not match repository scope")
 
         graph_commit_json = self._canonical_commit_json(operation.graph_commit_json)
         commit = self._commit_from_json(graph_commit_json)
@@ -343,54 +330,7 @@ class AirtableAuditRepository:
 
     @staticmethod
     def _canonical_inverse_write_set(value: str) -> str:
-        parsed = json.loads(value)
-        if not isinstance(parsed, dict) or set(parsed) != set(_WRITE_SET_FIELDS):
-            raise ValueError(
-                "InverseWriteSetJson must contain all GraphWriteSet fields"
-            )
-        canonical: dict[str, object] = {}
-        for field in _WRITE_SET_FIELDS:
-            items = parsed[field]
-            if not isinstance(items, list):
-                raise ValueError(f"{field} must be a list")
-            id_field = _UPSERT_ID_FIELDS.get(field)
-            if id_field is None:
-                if not all(isinstance(item, str) for item in items):
-                    raise ValueError(f"{field} must contain logical IDs")
-                canonical[field] = sorted(items)
-                continue
-            normalized: list[dict[str, object]] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    raise ValueError(f"{field} must contain objects")
-                logical_id = item.get(id_field)
-                if not isinstance(logical_id, str) or not logical_id:
-                    raise ValueError(f"{field} values require {id_field}")
-                normalized.append(AirtableAuditRepository._sorted_object(item))
-            canonical[field] = sorted(normalized, key=lambda item: str(item[id_field]))
-        return json.dumps(canonical, separators=(",", ":"), ensure_ascii=True)
-
-    @staticmethod
-    def _sorted_object(value: Mapping[str, object]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key in sorted(value):
-            item = value[key]
-            if isinstance(item, Mapping):
-                result[key] = AirtableAuditRepository._sorted_object(
-                    cast(Mapping[str, object], item)
-                )
-            elif isinstance(item, list):
-                result[key] = [
-                    AirtableAuditRepository._sorted_object(
-                        cast(Mapping[str, object], child)
-                    )
-                    if isinstance(child, Mapping)
-                    else child
-                    for child in item
-                ]
-            else:
-                result[key] = item
-        return result
+        return canonical_graph_write_set_json(graph_write_set_from_json(value))
 
     @staticmethod
     def _canonical_redacted_json(value: str) -> str:
@@ -445,10 +385,10 @@ class AirtableAuditRepository:
         return value
 
     @staticmethod
-    def _envelope_text(envelope: Mapping[str, object], field: str) -> str:
-        value = envelope.get(field)
-        if not isinstance(value, str):
-            raise ValueError(f"{field} must be text")
+    def _integer(row: Mapping[str, object], field: str) -> int:
+        value = row.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer")
         return value
 
     @staticmethod

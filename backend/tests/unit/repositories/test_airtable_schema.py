@@ -6,7 +6,9 @@ from repositories.airtable.schema import NORMALIZED_SCHEMA, validate_normalized_
 
 
 class FakeField:
-    def __init__(self, name: str, field_id: str, field_type: str, **options: object) -> None:
+    def __init__(
+        self, name: str, field_id: str, field_type: str, **options: object
+    ) -> None:
         self.name = name
         self.id = field_id
         self.type = field_type
@@ -14,7 +16,9 @@ class FakeField:
 
 
 class FakeTable:
-    def __init__(self, name: str, primary_field_id: str, fields: list[FakeField]) -> None:
+    def __init__(
+        self, name: str, primary_field_id: str, fields: list[FakeField]
+    ) -> None:
         self.name = name
         self.primary_field_id = primary_field_id
         self.fields = fields
@@ -58,7 +62,9 @@ def test_normalized_schema_has_exactly_the_nine_canonical_tables() -> None:
     "table_name",
     ("PersonVersions", "FamilyUnits", "ParentChildLinks", "UnresolvedRelationships"),
 )
-def test_entity_tables_require_authorization_and_tombstone_fields(table_name: str) -> None:
+def test_entity_tables_require_authorization_and_tombstone_fields(
+    table_name: str,
+) -> None:
     fields = {field.name: field for field in NORMALIZED_SCHEMA[table_name].fields}
 
     assert fields["Revision"].airtable_type == "number"
@@ -66,6 +72,7 @@ def test_entity_tables_require_authorization_and_tombstone_fields(table_name: st
     assert fields["FencingToken"].airtable_type == "number"
     assert fields["FencingToken"].required_options == {"precision": 0}
     assert fields["OperationId"].airtable_type == "singleLineText"
+    assert fields["GraphScope"].airtable_type == "singleLineText"
     assert fields["IsTombstone"].airtable_type == "checkbox"
     assert fields["IsTombstone"].required_options == {
         "icon": "check",
@@ -74,8 +81,12 @@ def test_entity_tables_require_authorization_and_tombstone_fields(table_name: st
 
 
 def test_schema_retains_required_compatibility_fields() -> None:
-    person_fields = {field.name: field for field in NORMALIZED_SCHEMA["PersonVersions"].fields}
-    change_log_fields = {field.name: field for field in NORMALIZED_SCHEMA["ChangeLog"].fields}
+    person_fields = {
+        field.name: field for field in NORMALIZED_SCHEMA["PersonVersions"].fields
+    }
+    change_log_fields = {
+        field.name: field for field in NORMALIZED_SCHEMA["ChangeLog"].fields
+    }
     graph_commit_fields = {
         field.name: field for field in NORMALIZED_SCHEMA["GraphCommits"].fields
     }
@@ -83,9 +94,12 @@ def test_schema_retains_required_compatibility_fields() -> None:
     assert person_fields["Archived"].airtable_type == "checkbox"
     assert graph_commit_fields["PermitId"].airtable_type == "singleLineText"
     assert change_log_fields["InverseWriteSetJson"].airtable_type == "multilineText"
+    assert change_log_fields["BeforeSnapshotJson"].airtable_type == "multilineText"
+    assert change_log_fields["AfterSnapshotJson"].airtable_type == "multilineText"
     assert change_log_fields["CommitScope"].airtable_type == "singleLineText"
     assert change_log_fields["GraphCommitJson"].airtable_type == "multilineText"
     assert change_log_fields["CommitSha256"].airtable_type == "singleLineText"
+    assert graph_commit_fields["GraphScope"].airtable_type == "singleLineText"
 
 
 def test_schema_validator_accepts_the_canonical_schema() -> None:
@@ -105,7 +119,9 @@ def test_schema_validator_reports_stable_issues(
     mutation: str, expected_code: str
 ) -> None:
     actual = _schema_from_manifest()
-    person_versions = next(table for table in actual.tables if table.name == "PersonVersions")
+    person_versions = next(
+        table for table in actual.tables if table.name == "PersonVersions"
+    )
 
     if mutation == "missing_table":
         actual.tables = [table for table in actual.tables if table.name != "GraphState"]

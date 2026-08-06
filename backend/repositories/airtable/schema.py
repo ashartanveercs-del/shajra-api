@@ -33,7 +33,9 @@ class TableSpec:
     def __post_init__(self) -> None:
         names = tuple(field.name for field in self.fields)
         if not names or names[0] != self.primary_field or len(names) != len(set(names)):
-            raise ValueError("Primary field must be first and field names must be unique")
+            raise ValueError(
+                "Primary field must be first and field names must be unique"
+            )
 
     def create_fields(self) -> list[dict[str, object]]:
         return [field.create_payload() for field in self.fields]
@@ -84,20 +86,39 @@ NORMALIZED_SCHEMA = MappingProxyType(
             "PersonVersions",
             "PersonId",
             (
-                text("PersonId"), text("FullName"), text("Gender"), text("Birth"),
-                text("Death"), text("IsAlive"), text("PrimaryFamilyUnitId"),
-                checkbox("Archived"), integer("VersionRevision"), integer("Revision"),
-                text("OperationId"), integer("FencingToken"), checkbox("IsTombstone"),
+                text("PersonId"),
+                text("GraphScope"),
+                text("FullName"),
+                text("Gender"),
+                text("Birth"),
+                text("Death"),
+                text("IsAlive"),
+                text("PrimaryFamilyUnitId"),
+                checkbox("Archived"),
+                integer("VersionRevision"),
+                integer("Revision"),
+                text("OperationId"),
+                integer("FencingToken"),
+                checkbox("IsTombstone"),
             ),
         ),
         "FamilyUnits": TableSpec(
             "FamilyUnits",
             "FamilyUnitId",
             (
-                text("FamilyUnitId"), text("Kind"), text("AdultAId"), text("AdultBId"),
-                text("Status"), text("Start"), text("End"),
-                checkbox("DistinctUnionConfirmed"), integer("CreatedRevision"),
-                integer("Revision"), text("OperationId"), integer("FencingToken"),
+                text("FamilyUnitId"),
+                text("GraphScope"),
+                text("Kind"),
+                text("AdultAId"),
+                text("AdultBId"),
+                text("Status"),
+                text("Start"),
+                text("End"),
+                checkbox("DistinctUnionConfirmed"),
+                integer("CreatedRevision"),
+                integer("Revision"),
+                text("OperationId"),
+                integer("FencingToken"),
                 checkbox("IsTombstone"),
             ),
         ),
@@ -105,58 +126,101 @@ NORMALIZED_SCHEMA = MappingProxyType(
             "ParentChildLinks",
             "LinkId",
             (
-                text("LinkId"), text("ParentId"), text("ChildId"), text("Role"),
-                text("RelationshipType"), text("FamilyUnitId"),
-                integer("CreatedRevision"), integer("Revision"), text("OperationId"),
-                integer("FencingToken"), checkbox("IsTombstone"),
+                text("LinkId"),
+                text("GraphScope"),
+                text("ParentId"),
+                text("ChildId"),
+                text("Role"),
+                text("RelationshipType"),
+                text("FamilyUnitId"),
+                integer("CreatedRevision"),
+                integer("Revision"),
+                text("OperationId"),
+                integer("FencingToken"),
+                checkbox("IsTombstone"),
             ),
         ),
         "UnresolvedRelationships": TableSpec(
             "UnresolvedRelationships",
             "UnresolvedId",
             (
-                text("UnresolvedId"), text("SubjectPersonId"), text("Kind"),
-                text("UnresolvedName"), integer("CreatedRevision"), integer("Revision"),
-                text("OperationId"), integer("FencingToken"), checkbox("IsTombstone"),
+                text("UnresolvedId"),
+                text("GraphScope"),
+                text("SubjectPersonId"),
+                text("Kind"),
+                text("UnresolvedName"),
+                integer("CreatedRevision"),
+                integer("Revision"),
+                text("OperationId"),
+                integer("FencingToken"),
+                checkbox("IsTombstone"),
             ),
         ),
         "ChangeLog": TableSpec(
             "ChangeLog",
             "OperationId",
             (
-                text("OperationId"), text("IdempotencyKey"), text("State"),
-                text("ActorId"), text("RequestId"), text("SourceReference"),
-                integer("ExpectedRevision"), integer("ResultRevision"),
-                integer("FencingToken"), long_text("CommandsJson"),
-                long_text("InverseWriteSetJson"), text("CommitScope"),
-                long_text("GraphCommitJson"), text("CommitSha256"),
-                text("CreatedAt"), text("UpdatedAt"),
+                text("OperationId"),
+                text("IdempotencyKey"),
+                text("State"),
+                text("ActorId"),
+                text("RequestId"),
+                text("SourceReference"),
+                integer("ExpectedRevision"),
+                integer("ResultRevision"),
+                integer("FencingToken"),
+                long_text("CommandsJson"),
+                long_text("BeforeSnapshotJson"),
+                long_text("AfterSnapshotJson"),
+                long_text("InverseWriteSetJson"),
+                text("CommitScope"),
+                long_text("GraphCommitJson"),
+                text("CommitSha256"),
+                text("CreatedAt"),
+                text("UpdatedAt"),
             ),
         ),
         "GraphCommits": TableSpec(
             "GraphCommits",
             "OperationId",
             (
-                text("OperationId"), integer("Revision"), integer("FencingToken"),
-                text("PermitId"), text("SemanticChecksum"), text("CommittedAt"),
+                text("OperationId"),
+                text("GraphScope"),
+                integer("Revision"),
+                integer("FencingToken"),
+                text("PermitId"),
+                text("SemanticChecksum"),
+                text("CommittedAt"),
             ),
         ),
         "GraphState": TableSpec(
             "GraphState",
             "StateKey",
             (
-                text("StateKey"), integer("Revision"), text("HeadOperationId"),
-                integer("FencingToken"), text("SemanticChecksum"), text("UpdatedAt"),
+                text("StateKey"),
+                integer("Revision"),
+                text("HeadOperationId"),
+                integer("FencingToken"),
+                text("SemanticChecksum"),
+                text("UpdatedAt"),
             ),
         ),
         "EnrichmentAttempts": TableSpec(
             "EnrichmentAttempts",
             "AttemptId",
             (
-                text("AttemptId"), integer("Sequence"), text("Status"),
-                text("SubmissionId"), text("InputSha256"), text("RequestSha256"),
-                text("PromptVersion"), text("Model"), long_text("CandidateIdsJson"),
-                long_text("SuggestionJson"), text("SuggestionSha256"), text("ErrorCode"),
+                text("AttemptId"),
+                integer("Sequence"),
+                text("Status"),
+                text("SubmissionId"),
+                text("InputSha256"),
+                text("RequestSha256"),
+                text("PromptVersion"),
+                text("Model"),
+                long_text("CandidateIdsJson"),
+                long_text("SuggestionJson"),
+                text("SuggestionSha256"),
+                text("ErrorCode"),
                 text("CreatedAt"),
             ),
         ),
@@ -164,9 +228,15 @@ NORMALIZED_SCHEMA = MappingProxyType(
             "SubmissionReviews",
             "ReviewId",
             (
-                text("ReviewId"), text("DecisionId"), text("AttemptId"),
-                text("SuggestionKey"), text("Decision"), text("ReplacementPersonId"),
-                long_text("ReplacementValue"), text("ActorId"), text("Status"),
+                text("ReviewId"),
+                text("DecisionId"),
+                text("AttemptId"),
+                text("SuggestionKey"),
+                text("Decision"),
+                text("ReplacementPersonId"),
+                long_text("ReplacementValue"),
+                text("ActorId"),
+                text("Status"),
                 text("CreatedAt"),
             ),
         ),
@@ -189,7 +259,9 @@ def validate_normalized_schema(actual: BaseSchema) -> tuple[SchemaIssue, ...]:
     for table_name, expected_table in NORMALIZED_SCHEMA.items():
         actual_table = actual_tables.get(table_name)
         if actual_table is None:
-            issues.append(SchemaIssue("MISSING_TABLE", table_name, None, table_name, None))
+            issues.append(
+                SchemaIssue("MISSING_TABLE", table_name, None, table_name, None)
+            )
             continue
 
         actual_fields = {field.name: field for field in actual_table.fields}
@@ -214,9 +286,13 @@ def validate_normalized_schema(actual: BaseSchema) -> tuple[SchemaIssue, ...]:
 
         expected_names = {field.name for field in expected_table.fields}
         for missing in sorted(expected_names - actual_fields.keys()):
-            issues.append(SchemaIssue("MISSING_FIELD", table_name, missing, missing, None))
+            issues.append(
+                SchemaIssue("MISSING_FIELD", table_name, missing, missing, None)
+            )
         for extra in sorted(actual_fields.keys() - expected_names):
-            issues.append(SchemaIssue("UNEXPECTED_FIELD", table_name, extra, None, extra))
+            issues.append(
+                SchemaIssue("UNEXPECTED_FIELD", table_name, extra, None, extra)
+            )
 
         for expected_field in expected_table.fields:
             actual_field = actual_fields.get(expected_field.name)

@@ -1,18 +1,28 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+import json
 
 import pytest
 
-from domain.ids import FamilyUnitId, LinkId, OperationId, PersonId, UnresolvedRelationshipId
+from domain.dates import PartialDate
+from domain.ids import (
+    FamilyUnitId,
+    LinkId,
+    OperationId,
+    PersonId,
+    UnresolvedRelationshipId,
+)
 from domain.models import (
     FamilyUnit,
     FamilyUnitKind,
+    Gender,
     ParentChildLink,
     ParentRole,
     Person,
     RelationshipType,
     UnresolvedRelationship,
     UnresolvedRelationshipKind,
+    UnionStatus,
 )
 from repositories.memory import InMemoryGraphRepository, RepositoryCorruptionError
 from repositories.protocols import (
@@ -22,6 +32,7 @@ from repositories.protocols import (
     WriteContext,
     canonical_graph_commit_json,
     canonical_graph_write_set_json,
+    graph_write_set_from_json,
     graph_commit_sha256,
 )
 
@@ -110,7 +121,9 @@ def test_rows_with_only_operation_or_fencing_mismatches_stay_invisible(
     fencing_mismatch_id = PersonId("per_fencing_mismatch")
     committed_id = PersonId("per_committed")
     memory_repository.stage(
-        GraphWriteSet(person_upserts=(Person(operation_mismatch_id, "Wrong operation"),)),
+        GraphWriteSet(
+            person_upserts=(Person(operation_mismatch_id, "Wrong operation"),)
+        ),
         context_for("op_other", 1, 10),
     )
     memory_repository.stage(
@@ -242,7 +255,9 @@ def test_permit_mismatches_reject_before_adding_a_commit(
     "mutate_commit",
     [
         lambda commit: replace(commit, semantic_checksum="altered"),
-        lambda commit: replace(commit, committed_at=commit.committed_at + timedelta(seconds=1)),
+        lambda commit: replace(
+            commit, committed_at=commit.committed_at + timedelta(seconds=1)
+        ),
     ],
     ids=("semantic_checksum", "committed_at"),
 )
@@ -325,10 +340,57 @@ def test_requested_revision_loads_the_matching_committed_snapshot(
     assert memory_repository.load_committed(2).people[person_id].full_name == "Second"
 
 
+def test_explicit_memory_revision_must_name_an_exact_commit(
+    memory_repository: InMemoryGraphRepository,
+) -> None:
+    assert memory_repository.load_committed(0).state.revision == 0
+    with pytest.raises(ValueError, match="committed revision"):
+        memory_repository.load_committed(1)
+    with pytest.raises(ValueError, match="negative"):
+        memory_repository.load_committed(-1)
+
+    receipt = memory_repository.stage(GraphWriteSet(), context_for("op_one", 1, 1))
+    commit, permit = commit_and_permit_for(receipt)
+    memory_repository.append_commit(commit, permit)
+
+    assert memory_repository.load_committed(1).state.revision == 1
+    with pytest.raises(ValueError, match="committed revision"):
+        memory_repository.load_committed(0)
+    with pytest.raises(ValueError, match="committed revision"):
+        memory_repository.load_committed(2)
+
+
+@pytest.mark.parametrize(
+    "revisions",
+    ((0,), (-1,), (1, 3)),
+    ids=("zero", "negative", "gap"),
+)
+def test_memory_commit_history_requires_positive_contiguous_revisions(
+    memory_repository: InMemoryGraphRepository,
+    revisions: tuple[int, ...],
+) -> None:
+    memory_repository._commits.extend(  # type: ignore[attr-defined]
+        GraphCommit(
+            operation_id=OperationId(f"op_{revision}"),
+            revision=revision,
+            fencing_token=revision,
+            permit_id=f"cpr_{revision}",
+            semantic_checksum="checksum",
+            committed_at=COMMITTED_AT,
+        )
+        for revision in revisions
+    )
+
+    with pytest.raises(RepositoryCorruptionError, match="COMMIT_LOG_CORRUPTION"):
+        memory_repository.load_committed()
+
+
 def test_commits_must_be_sequential(
     memory_repository: InMemoryGraphRepository,
 ) -> None:
-    later_receipt = memory_repository.stage(GraphWriteSet(), context_for("op_two", 2, 2))
+    later_receipt = memory_repository.stage(
+        GraphWriteSet(), context_for("op_two", 2, 2)
+    )
     later_commit, later_permit = commit_and_permit_for(later_receipt)
 
     with pytest.raises(ValueError, match="sequential"):
@@ -342,7 +404,9 @@ def test_commit_hash_uses_canonical_utc_timestamp_and_rejects_naive_time() -> No
         fencing_token=1,
         permit_id="cpr_one",
         semantic_checksum="checksum",
-        committed_at=datetime(2026, 8, 5, 17, 30, 45, 123456, tzinfo=timezone(timedelta(hours=5))),
+        committed_at=datetime(
+            2026, 8, 5, 17, 30, 45, 123456, tzinfo=timezone(timedelta(hours=5))
+        ),
     )
 
     assert canonical_graph_commit_json(commit) == (
@@ -375,3 +439,136 @@ def test_write_set_json_is_ascii_and_sorted_by_logical_id() -> None:
         '"parent_child_link_tombstones":[],"unresolved_upserts":[],'
         '"unresolved_tombstones":[]}'
     )
+
+
+def test_graph_write_set_json_parser_round_trips_all_typed_entity_kinds() -> None:
+    write_set = GraphWriteSet(
+        person_upserts=(
+            Person(
+                PersonId("per_one"),
+                "Ada",
+                Gender.FEMALE,
+                PartialDate.parse("1980-04"),
+                None,
+                True,
+                FamilyUnitId("fam_one"),
+                False,
+                7,
+            ),
+        ),
+        person_tombstones=(PersonId("per_removed"),),
+        family_unit_upserts=(
+            FamilyUnit(
+                FamilyUnitId("fam_one"),
+                FamilyUnitKind.UNION,
+                PersonId("per_one"),
+                PersonId("per_two"),
+                UnionStatus.MARRIED,
+                PartialDate.parse("2001"),
+                None,
+                True,
+                4,
+            ),
+        ),
+        family_unit_tombstones=(FamilyUnitId("fam_removed"),),
+        parent_child_link_upserts=(
+            ParentChildLink(
+                LinkId("lnk_one"),
+                PersonId("per_one"),
+                PersonId("per_child"),
+                ParentRole.MOTHER,
+                RelationshipType.BIOLOGICAL,
+                FamilyUnitId("fam_one"),
+                5,
+            ),
+        ),
+        parent_child_link_tombstones=(LinkId("lnk_removed"),),
+        unresolved_upserts=(
+            UnresolvedRelationship(
+                UnresolvedRelationshipId("unr_one"),
+                PersonId("per_child"),
+                UnresolvedRelationshipKind.FATHER,
+                "Unknown Father",
+                6,
+            ),
+        ),
+        unresolved_tombstones=(UnresolvedRelationshipId("unr_removed"),),
+    )
+
+    parsed = graph_write_set_from_json(canonical_graph_write_set_json(write_set))
+
+    assert parsed == write_set
+
+
+def _valid_graph_write_set_json_value() -> dict[str, object]:
+    return {
+        "person_upserts": [
+            {
+                "archived": False,
+                "birth": {"precision": "day", "value": "1980-04-03"},
+                "death": None,
+                "full_name": "Ada",
+                "gender": "female",
+                "is_alive": True,
+                "person_id": "per_one",
+                "primary_family_unit_id": None,
+                "version_revision": 1,
+            }
+        ],
+        "person_tombstones": [],
+        "family_unit_upserts": [],
+        "family_unit_tombstones": [],
+        "parent_child_link_upserts": [],
+        "parent_child_link_tombstones": [],
+        "unresolved_upserts": [],
+        "unresolved_tombstones": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.pop("unresolved_tombstones"),
+        lambda value: value.__setitem__("extra", []),
+        lambda value: value["person_upserts"][0].__setitem__(  # type: ignore[index,union-attr]
+            "contact_email", "private@example.test"
+        ),
+        lambda value: value["person_upserts"][0].__setitem__(  # type: ignore[index,union-attr]
+            "gender", "invalid"
+        ),
+        lambda value: value["person_upserts"][0].__setitem__(  # type: ignore[index,union-attr]
+            "is_alive", 1
+        ),
+        lambda value: value["person_upserts"][0].__setitem__(  # type: ignore[index,union-attr]
+            "person_id", "rec_airtable"
+        ),
+        lambda value: value["person_upserts"][0]["birth"].__setitem__(  # type: ignore[index,union-attr]
+            "precision", "year"
+        ),
+        lambda value: value["person_upserts"].append(  # type: ignore[union-attr]
+            value["person_upserts"][0]  # type: ignore[index]
+        ),
+        lambda value: value["person_tombstones"].extend(  # type: ignore[union-attr]
+            ["per_one", "per_one"]
+        ),
+    ),
+    ids=(
+        "missing-top-level-field",
+        "extra-top-level-field",
+        "contact-field",
+        "invalid-enum",
+        "bool-as-int",
+        "airtable-record-id",
+        "date-precision-mismatch",
+        "duplicate-upsert",
+        "duplicate-upsert-and-tombstones",
+    ),
+)
+def test_graph_write_set_json_parser_rejects_noncanonical_or_unsafe_values(
+    mutate,
+) -> None:
+    value = _valid_graph_write_set_json_value()
+    mutate(value)
+
+    with pytest.raises(ValueError):
+        graph_write_set_from_json(json.dumps(value))
