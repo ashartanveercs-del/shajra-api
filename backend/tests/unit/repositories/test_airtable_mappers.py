@@ -399,3 +399,27 @@ def test_legacy_facade_exports_a_lazy_api_proxy(monkeypatch) -> None:
     assert legacy_api.table("app-test", "ApprovedMembers") is api.tables["ApprovedMembers"]
     assert api_calls == ["test-token"]
     assert legacy_api.marker == "delegated"
+
+
+def test_legacy_api_proxy_allows_an_external_base_without_a_default(monkeypatch) -> None:
+    api = FakeFacadeApi()
+    api_calls: list[str] = []
+
+    def api_factory(token: str) -> FakeFacadeApi:
+        api_calls.append(token)
+        return api
+
+    facade = importlib.import_module("airtable_client")
+    monkeypatch.setattr(
+        facade,
+        "_client",
+        AirtableClient("test-token", None, api_factory=api_factory),
+    )
+
+    assert facade.api.table("app-external", "ApprovedMembers") is api.tables[
+        "ApprovedMembers"
+    ]
+    assert api_calls == ["test-token"]
+
+    with pytest.raises(RuntimeError, match="Airtable credentials are not configured"):
+        _ = AirtableClient(None, None, api_factory=api_factory).api
