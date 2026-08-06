@@ -277,8 +277,13 @@ Every new logical acquisition uses a cryptographically random UUID acquisition
 ID. It is not an actor, process, username, or other reusable owner identity. The
 same ID is retained only while retrying an ambiguously answered acquisition; a
 later logical acquisition must use a fresh ID. Authorization, confirmation,
-admin CAS, revocation, and rate-limit calls likewise retain one random request
-nonce across transport retries and reject reuse for a different canonical input.
+and admin CAS calls likewise retain one random request nonce across transport
+retries. Graph acquisition/request nonces are conflict-detectable only within that
+graph scope's graph key domain; generic lease nonces are conflict-detectable only
+within that generic scope's key domain. They do not claim global uniqueness across
+scopes or coordination domains. Revocation and rate-limit nonces use the separate
+deployment-wide domain registries defined below, where changed canonical input is
+atomically detectable while a receipt remains retained.
 
 Runtime `CommitCoordinator.acquire` never creates `confirmed-revision` or `fence`.
 It requires both to have been initialized by `CoordinationAdmin`, requires the
@@ -308,15 +313,22 @@ The versioned, collision-separated key domains are:
 {sj:v1:<deployment>:graph:<scope-hmac>}:admin-result:<nonce-hmac>
 {sj:v1:<deployment>:generic:<scope-hmac>}:lock
 {sj:v1:<deployment>:generic:<scope-hmac>}:lease-result:<nonce-hmac>
-{sj:v1:<deployment>:revocation:<jti-hmac>}:entry
-{sj:v1:<deployment>:rate:<policy-id>:<subject-hmac>:<window-start>}:counter
-{sj:v1:<deployment>:rate:<policy-id>:<subject-hmac>:<window-start>}:nonce:<nonce-hmac>
+{sj:v1:<deployment>:revocation}:entry:<jti-hmac>
+{sj:v1:<deployment>:revocation}:nonce:<nonce-hmac>
+{sj:v1:<deployment>:rate}:counter:<policy-id>:<subject-hmac>:<window-start>
+{sj:v1:<deployment>:rate}:nonce:<nonce-hmac>
 ```
 
 The braces are Redis Cluster hash tags. Every key used by one script shares the
 same tag; graph, generic lease, revocation, and rate-limit domains cannot collide.
-Only fixed server-owned policy IDs and canonical decimal window timestamps appear
-undigested.
+All revocation entries and revocation nonce receipts for one deployment
+intentionally occupy one revocation slot. All rate counters and rate nonce receipts
+for one deployment intentionally occupy one separate rate slot. This concentrates
+each subsystem in one slot, a deliberate correctness-over-horizontal-throughput
+tradeoff that makes changed-input nonce detection atomic. Current policy volume is
+expected to fit that constraint; sharding would require a new nonce-registry
+protocol rather than silently restoring subject-derived hash tags. Only fixed
+server-owned policy IDs and canonical decimal window timestamps appear undigested.
 
 Locks, reservations, staged-write receipts, confirmation proofs, admin evidence,
 and nonce receipts use compact sorted-key ASCII JSON envelopes with exact key sets,
@@ -586,9 +598,11 @@ duplicates fail closed.
 Only after read-back succeeds does `CommitCoordinator.confirm_commit` route through
 `permit.scope`, recompute the commit digest, and run the CAS script. The script
 first checks whether the one-slot last-confirmation proof is the exact requested
-`ConfirmedCommitReceipt`; if so it returns the original `CONFIRMED` result even if
-a newer reservation exists. For a new confirmation it then requires the exact
-active reservation and enforces
+`ConfirmedCommitReceipt`; if so it returns code `CONFIRMATION_REPLAYED` with the
+exact original `requested_permit` and `confirmed_revision` payload, performs no
+mutation, and does so even if a newer reservation exists. Code `CONFIRMED` is
+reserved for the first successful state transition. For a new confirmation it
+then requires the exact active reservation and enforces
 `confirmed_revision == commit.revision - 1` before any write. It advances the
 revision, writes the full confirmed receipt including the staged receipt, and
 deletes the reservation.
@@ -618,6 +632,7 @@ Recovery is deterministic and never aborts an authorized commit.
 | After reservation, before Airtable append | Recovery verifies the reservation's persisted staged receipt, rows, and checksum, then appends the reserved commit. |
 | Airtable response lost | Read by revision and canonical commit identity; accept identical duplicates. |
 | After Airtable append, before confirmation | Recovery confirms the existing matching commit in Upstash. |
+| Confirmation response lost | Exact proof retry returns `CONFIRMATION_REPLAYED` with the original permit/revision payload and no mutation. |
 | After confirmation, before audit transition | Repair `PENDING` or `COMMITTING` audit from coordinator status and the exact logical `GraphCommit`; do not repeat a graph write. |
 | Upstash unavailable | Reads may continue from Airtable; graph writes and coordination recovery fail closed. |
 | Conflicting commit or staged payload | Report corruption, perform no further mutation, and require operator investigation. |
@@ -724,10 +739,33 @@ integer used by JWT claim validation. Its default is exactly 30 seconds and vali
 range is `0..300`; API callers cannot choose it.
 Both revocation operations validate canonical JTI, expiry, and leeway, obtain time
 from Redis `TIME`, and retain a revocation through
-`expires_at_ms = token_expires_at_s * 1000 + leeway_s * 1000`. `revoke` is
-idempotent by request nonce. If an existing valid revocation has no TTL or a TTL
-shorter than the required remaining lifetime, the same script repairs it with
-`PEXPIREAT` before returning. An impossible value or overlong TTL is corrupt.
+`expires_at_ms = token_expires_at_s * 1000 + leeway_s * 1000`.
+
+`revoke` derives `jti_hmac = HMAC(secret, "revocation-jti\0" + canonical_jti)` and
+`nonce_hmac = HMAC(secret, "revocation-nonce\0" + request_nonce)`. Its canonical
+request input is compact sorted-key ASCII JSON with exactly `schema` equal to
+`shajra.revocation-request`, `version` equal to `1`, `jti_hmac`, canonical decimal
+`token_expires_at_s`, and canonical decimal `leeway_s`; `input_sha256` hashes those
+bytes. The versioned nonce receipt contains exactly `schema`, `version`,
+`input_sha256`, `jti_hmac`, `token_expires_at_s`, `leeway_s`, `code`, `revoked`,
+`server_time_ms`, `expires_at_ms`, and `receipt_expires_at_ms`. Stored integers are
+canonical decimal strings except the envelope's numeric `version:1`.
+
+The revoke script computes Redis time and inspects the fixed-domain nonce key
+before the JTI entry. A matching `input_sha256` returns the receipt's exact original
+`RevocationResult` without changing revocation state; a missing or short receipt
+TTL is repaired to its stored exact expiry, while an overlong TTL is corrupt. A
+different JTI, token expiry, or leeway under the same nonce returns
+`NONCE_REUSE_CONFLICT` before touching either entry. A new receipt uses
+`receipt_expires_at_ms = max(expires_at_ms, server_time_ms + 60_000)` and
+`PEXPIREAT` at that exact instant, including a 60-second receipt for an already
+expired token. The revocation entry itself expires exactly at `expires_at_ms`. If
+an existing valid entry has no TTL or a TTL shorter than the required remaining
+lifetime, the same script repairs it with `PEXPIREAT` before returning. An
+impossible value or overlong entry/receipt TTL is corrupt. When Redis time is
+already at or beyond `expires_at_ms`, `revoke` writes only the retained nonce
+receipt with `TOKEN_ALREADY_EXPIRED` and does not create or extend a JTI entry.
+
 `is_revoked` returns `REVOKED` for a valid entry, `NOT_REVOKED` for an absent entry,
 and `TOKEN_ALREADY_EXPIRED` once server time reaches expiry; JWT claim validation
 still rejects the token. Redis/transport/malformed-state failure is never
@@ -754,13 +792,35 @@ exact `reset_at_ms = window_start + window_ms` belongs to the new window. Calls
 `1..N` are allowed, call `N+1` and later are denied, `remaining` never goes below
 zero, and denied calls report the actual observed count.
 
-Each logical request has a random nonce whose HMAC-keyed receipt stores the exact
-canonical result until window end. A retry returns that result without increment;
-nonce reuse for a changed policy or subject is `NONCE_REUSE_CONFLICT`. Counter and
-nonce TTLs are atomically set or repaired to the exact reset boundary with
-`PEXPIREAT`; a missing TTL, stale TTL, malformed count, or count outside signed
-64-bit bounds is handled before increment. Redis or adapter failure denies the
-request with a stable unavailable result; it never grants extra capacity.
+For each logical request, the script derives
+`subject_hmac = HMAC(secret, "rate-subject\0" + kind + "\0" + canonical_subject)`
+and `nonce_hmac = HMAC(secret, "rate-nonce\0" + request_nonce)`. After Redis `TIME`
+selects the current window, the canonical request input is compact sorted-key ASCII
+JSON with exactly `schema` equal to `shajra.rate-request`, `version` equal to `1`,
+`policy_id`, `subject_kind`, `subject_hmac`, canonical decimal `window_start_ms`,
+`window_ms`, and `limit`. `input_sha256` hashes those bytes.
+
+The versioned rate nonce receipt contains exactly `schema`, `version`,
+`input_sha256`, `policy_id`, `subject_kind`, `subject_hmac`, `window_start_ms`,
+`window_ms`, `limit`, `allowed`, `observed_count`, `remaining`, `server_time_ms`,
+`reset_at_ms`, `retry_after_ms`, and `receipt_expires_at_ms`. Stored integers are
+canonical decimal strings except the envelope's numeric `version:1`. Its
+fixed-domain nonce key expires exactly at
+`receipt_expires_at_ms = reset_at_ms + 60_000`; the counter expires exactly at
+`reset_at_ms`. Thus the receipt remains for one minute after the window boundary.
+
+The script computes the current canonical input, then inspects the fixed-domain
+nonce key before reading or incrementing the counter. A matching digest returns the
+exact stored `RateLimitResult` without increment; a missing or short receipt TTL is
+repaired to its stored exact expiry, while an overlong TTL is corrupt. Reusing that
+nonce with a changed policy, subject kind/value, server-owned policy parameters,
+or current window returns `NONCE_REUSE_CONFLICT` while the receipt is retained. In
+particular, a retry that crosses the reset boundary conflicts rather than charging
+the new window; the caller uses a fresh nonce for a new logical request. Counter
+and receipt TTLs are atomically set or repaired to their exact expiry instants with
+`PEXPIREAT`; a missing TTL, stale TTL, malformed count/receipt, or count outside
+signed 64-bit bounds is handled before increment. Redis or adapter failure denies
+the request with a stable unavailable result; it never grants extra capacity.
 
 ## Exact Compensation
 
@@ -884,10 +944,11 @@ graph-state mutation and therefore requires both graph headers.
   creation requires a live lock.
 - Reservation has no expiry, contains complete recovery data, and blocks new graph
   acquisitions after process and lease loss.
-- Confirmation checks the exact last-confirmation proof retry before active reservation,
-  requires `confirmed_revision == commit.revision - 1` for a new confirmation,
-  advances once, and returns `CONFIRMATION_PROOF_EVICTED` after its proof is
-  replaced.
+- Confirmation checks the exact last-confirmation proof retry before active
+  reservation, returns `CONFIRMATION_REPLAYED` with the original permit/revision
+  payload and no mutation, requires `confirmed_revision == commit.revision - 1`
+  for a new `CONFIRMED` transition, advances once, and returns
+  `CONFIRMATION_PROOF_EVICTED` after its proof is replaced.
 - One `get_status` Lua/MGET snapshot validates READY and COMMITTING invariants;
   torn, partial, malformed, non-canonical, or digest-invalid state returns exactly
   `COORDINATION_STATE_CORRUPT` without mutation.
@@ -898,7 +959,10 @@ graph-state mutation and therefore requires both graph headers.
   partial mutation on every error tag.
 - Versioned HMAC key tests prove domain separation, cluster hash-tag co-location,
   and absence of raw scope, actor/owner, IP, email/identity, JTI, token, and secret
-  material from keys and errors.
+  material from keys and errors. Every revocation entry and nonce key shares the
+  fixed deployment revocation tag; every rate counter and nonce key shares the
+  separate fixed deployment rate tag, across different JTIs, policies, subjects,
+  and windows. Graph/generic nonce tests assert only scope/domain-local guarantees.
 - Admin initialize/reconcile rejects an active lock or reservation, stale expected
   digest, non-contiguous or conflicting Airtable evidence, head checksum/digest
   mismatch, and a fencing floor not strictly above every durable token. It never
@@ -906,12 +970,17 @@ graph-state mutation and therefore requires both graph headers.
 - The Upstash 1.7.0 adapter calls `eval(script, keys, args)` against a local
   autospecced/stub client, disables SDK retries, retries one ambiguous transport
   failure with identical nonce/input, and never retries tagged failures.
-- Revocation tests cover `revoke`/`is_revoked`, expiry plus leeway, Redis `TIME`,
-  replay, atomic short/missing-TTL repair, malformed state, and fail-closed outage.
+- Revocation tests cover `revoke`/`is_revoked`, exact canonical input/receipt digest,
+  expiry plus leeway, Redis `TIME`, matching nonce replay with the exact original
+  result, changed JTI/expiry/leeway `NONCE_REUSE_CONFLICT`, exact receipt retention
+  through `max(expires_at_ms, server_time_ms + 60_000)`, atomic short/missing-TTL
+  repair, malformed state, and fail-closed outage.
 - Rate-limit tests cover every typed policy/subject pairing, separate comment and
-  story buckets, exact fixed-window boundary, N/N+1, replay without double-charge,
-  nonce conflict, atomic TTL repair, malformed counter/overflow, and fail-closed
-  outage.
+  story buckets, exact canonical input/receipt digest, exact fixed-window boundary,
+  N/N+1, matching replay without double-charge, changed policy/subject/window
+  `NONCE_REUSE_CONFLICT` while the nonce receipt remains through reset plus 60,000
+  ms, atomic counter/receipt TTL repair, malformed counter/receipt or overflow, and
+  fail-closed outage.
 
 ### Task 5 Service Tests
 

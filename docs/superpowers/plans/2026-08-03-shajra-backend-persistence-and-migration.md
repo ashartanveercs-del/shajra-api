@@ -881,9 +881,11 @@ matrix must explicitly prove:
 - the immutable reservation persists versioned canonical `StagedWriteReceipt`
   JSON, write-set JSON/digest, and exact operation/revision/fence; changed receipt
   content conflicts, and process-loss recovery needs no request memory;
-- confirmation checks exact one-slot retry before an active reservation, requires
-  `confirmed_revision == commit.revision - 1` for a new confirmation, and returns
-  `CONFIRMATION_PROOF_EVICTED` after replacement;
+- confirmation checks exact one-slot retry before an active reservation, returns
+  `CONFIRMATION_REPLAYED` with the exact original permit/revision payload and no
+  mutation, requires `confirmed_revision == commit.revision - 1` for a new
+  `CONFIRMED` transition, and returns `CONFIRMATION_PROOF_EVICTED` after
+  replacement;
 - `get_status` obtains one coherent Lua/MGET snapshot and strictly validates READY
   and COMMITTING invariants;
 - every lock/reservation/receipt/proof/evidence decoder rejects duplicate keys,
@@ -892,11 +894,15 @@ matrix must explicitly prove:
 - every Lua script validates KEYS/ARGV and signed-64 bounds before mutation, avoids
   `tonumber` equality, produces tagged stable results, never partially writes, and
   never increments fence on contention or malformed state;
-- response-loss retries are idempotent by acquisition/request nonce and changed
-  input under a nonce is `NONCE_REUSE_CONFLICT`;
-- versioned HMAC key domains are collision-separated and cluster-co-located, with
-  no raw scope, owner/actor, IP, email/identity, JTI, token, or secret in keys or
-  errors;
+- graph and generic lease response-loss retries are idempotent within their own
+  scope/domain nonce namespaces, without claiming cross-scope or cross-domain
+  nonce uniqueness;
+- versioned HMAC key domains are collision-separated and cluster-co-located. All
+  revocation entry/nonce keys share one fixed per-deployment revocation hash tag;
+  all rate counter/nonce keys share one separate fixed per-deployment rate hash
+  tag. Tests acknowledge the intentional one-slot-per-subsystem throughput tradeoff
+  and assert no raw scope, owner/actor, IP, email/identity, JTI, token, or secret in
+  keys or errors;
 - admin initialize/reconcile requires idle exact-state CAS, fresh contiguous
   Airtable head/checksum/digest proof, and a fencing floor strictly greater than
   every durable GraphCommit/entity staged token; neither revision nor fence can
@@ -906,27 +912,45 @@ matrix must explicitly prove:
 - `upstash-redis==1.7.0` is called as `eval(script, keys, args)` through a local
   autospecced/stub client, with `rest_retries=0`, one adapter retry only for an
   ambiguous transport failure, and byte-identical nonce/input on retry;
-- revocation covers `revoke`/`is_revoked`, expiry plus server-owned leeway, Redis
-  `TIME`, replay, atomic TTL repair, malformed state, and fail-closed outage; and
+- revocation covers `revoke`/`is_revoked`, exact canonical nonce input/receipt,
+  expiry plus server-owned leeway, Redis `TIME`, exact original replay, changed
+  JTI/expiry/leeway `NONCE_REUSE_CONFLICT`, receipt retention through the later of
+  expiry-plus-leeway or `server_time_ms + 60_000`, atomic TTL repair, malformed
+  state, and fail-closed outage; and
 - rate limiting covers typed server-owned policies, distinct comments/stories
-  buckets, exact fixed-window boundaries, N/N+1, Redis `TIME`, replay without
-  double-charge, nonce conflict, atomic TTL repair, signed-64 overflow, and
-  fail-closed outage.
+  buckets, exact canonical nonce input/receipt, exact fixed-window boundaries,
+  N/N+1, Redis `TIME`, replay without double-charge, changed
+  policy/subject/window `NONCE_REUSE_CONFLICT` while the receipt remains through
+  reset plus 60 seconds, atomic TTL repair, signed-64 overflow, and fail-closed
+  outage.
 
 - [ ] **Step 3: Implement strict serialization and the SDK adapter**
 
 In `serialization.py`, implement compact sorted-key ASCII JSON with exact
 versioned schemas for generic lock, graph lock, staged receipt, commit reservation,
 confirmed receipt, reconciled-head proof, coordination evidence, admin result, and
-lease/request-nonce result receipts. Use duplicate-key rejecting decode, exact field/type/ID
-validation, canonical decimal strings for every integer stored in an envelope,
-canonical byte comparison, and SHA-256 recomputation. Map all malformed state to
+lease, revocation, and rate request-nonce result receipts. Implement the exact
+revocation/rate canonical input and receipt fields, input SHA-256, and expiry rules
+from the design. Use duplicate-key rejecting decode, exact field/type/ID validation,
+canonical decimal strings for every integer stored in an envelope, canonical byte
+comparison, and SHA-256 recomputation. Map all malformed state to
 `COORDINATION_STATE_CORRUPT` without echoing raw values.
 
 Build keys only through one HMAC key builder using the exact versioned domains and
 cluster hash tags in the design. `REDIS_KEY_HMAC_SECRET` HMAC-digests all unbounded
 or sensitive components; only the validated deployment label, fixed domain,
 server-owned policy ID, and canonical window start may appear raw.
+
+For graph/generic coordination, retain the existing scope-derived hash tags and
+state explicitly that nonce conflicts are only detectable inside that scope and
+domain. For revocation, use fixed hash tag
+`{sj:v1:<deployment>:revocation}` with suffixes `entry:<jti-hmac>` and
+`nonce:<nonce-hmac>`. For rate limiting, use separate fixed hash tag
+`{sj:v1:<deployment>:rate}` with suffixes
+`counter:<policy-id>:<subject-hmac>:<window-start>` and
+`nonce:<nonce-hmac>`. Do not restore JTI-, subject-, policy-, or window-derived
+hash tags; the fixed one-slot-per-subsystem layout is required for atomic changed
+input detection.
 
 In `sdk.py`, wrap only `upstash_redis.Redis.eval(script, keys, args)`. Construct
 the SDK client with `rest_retries=0`. Retry at most once, only for an ambiguous
@@ -1107,9 +1131,11 @@ and exact renew deadline for the 15-second/5-second timing contract.
 one coherent snapshot. `authorize_commit` checks an existing canonical reservation
 first and returns its stored permit even after lease expiry. New authorization
 requires the live graph lock and persists the complete canonical staged receipt.
-`confirm_commit` checks exact one-slot replay first, then enforces
-`confirmed_revision == commit.revision - 1`; an evicted proof is the distinct
-`CONFIRMATION_PROOF_EVICTED` result.
+`confirm_commit` checks exact one-slot replay first and returns
+`CONFIRMATION_REPLAYED` with the original permit/revision payload and no mutation.
+Only a new confirmation enforces
+`confirmed_revision == commit.revision - 1` and returns `CONFIRMED`; an evicted
+proof is the distinct `CONFIRMATION_PROOF_EVICTED` result.
 
 Implement `CoordinationAdmin.initialize` and `reconcile` as separate operator-only
 CAS scripts. Evidence names scope, proven contiguous Airtable head revision,
@@ -1128,11 +1154,17 @@ this path.
 Implement the exact protocols/result types and policy table in the binding design.
 Revocation exposes `revoke` and `is_revoked`, uses Redis `TIME`, retains entries
 through JWT expiry plus server-owned leeway, atomically repairs missing/short TTL,
-and fails closed. Rate limiting accepts only a typed server-owned policy and typed
-subject. Use exact fixed-window boundaries from Redis `TIME`; calls 1..N pass and
-N+1 is denied. Keep comments and stories in distinct buckets. Store a nonce result
-until reset so retries never double-charge, repair counter/nonce TTL atomically,
-and fail closed on transport or malformed state.
+and fails closed. Its canonical nonce receipt stores the exact design fields and
+input digest, expires at the later of token expiry-plus-leeway or Redis time plus
+60,000 ms, returns the exact original result on match, and rejects changed
+JTI/expiry/leeway while retained. Rate limiting accepts only a typed server-owned
+policy and typed subject. Use exact fixed-window boundaries from Redis `TIME`;
+calls 1..N pass and N+1 is denied. Keep comments and stories in distinct buckets.
+Its canonical nonce receipt stores the exact design fields/result, expires at
+window reset plus 60,000 ms, returns the exact result without double-charge only
+for the same policy/subject/window input, and rejects changed input while retained.
+Repair counter/nonce TTL atomically and fail closed on transport or malformed
+state.
 
 - [ ] **Step 6: Run and commit**
 
@@ -1283,7 +1315,9 @@ expired previews, and compares a fresh value in constant time before staging.
      the logical Airtable commit and its best-effort `GraphState` update.
 14. Call `CommitCoordinator.confirm_commit(permit, commit, confirmation_nonce)`
     with one random nonce retained across transport retries to advance coordination
-    revision and clear the reservation.
+    revision and clear the reservation. Accept `CONFIRMED` for the first transition
+    or `CONFIRMATION_REPLAYED` only when its permit/revision payload exactly matches
+    the original result; replay performs no mutation.
 15. Append the `COMMITTED` audit transition and release the lease with one random
     request nonce retained across transport retries if it is still owned.
 
@@ -2228,6 +2262,9 @@ recovery, never `FAILED`; audit-only repair performs no graph append or confirma
 Add fresh-process recovery from only the persisted staged receipt, corruption of
 each receipt identity/digest field, explicit `CONFIRMATION_PROOF_EVICTED`, and
 proof that recovery cannot call `initialize` or `reconcile`.
+For confirmation-response loss, require `CONFIRMATION_REPLAYED` with the exact
+original permit/revision payload and assert the coordinator state is not mutated a
+second time.
 
 - [ ] **Step 8: Run CLI tests and commit**
 
@@ -2265,9 +2302,10 @@ verify it, and exercise lease acquire/renew, commit authorization, Airtable appe
 and read-back, confirmation, release, and rate limits. Stage a second synthetic
 operation at the same revision before committing the selected operation and prove
 the unselected rows remain invisible. Exercise an exact authorization retry and
-an exact confirmation retry. Then append semantic archive/tombstone versions for
-the synthetic staging entities through another authorized revision. Tests never
-use family names or production snapshots.
+an exact confirmation retry; require `CONFIRMATION_REPLAYED`, the exact original
+permit/revision payload, and no state mutation. Then append semantic
+archive/tombstone versions for the synthetic staging entities through another
+authorized revision. Tests never use family names or production snapshots.
 
 The Groq contract test is additionally skipped unless
 `RUN_AI_PROVIDER_TEST=true`, `GROQ_API_KEY`, and `GROQ_MODEL` are set. Send only the
