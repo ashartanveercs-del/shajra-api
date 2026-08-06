@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-05
 
-**Status:** Approved design correction for the backend persistence and migration plan
+**Status:** Task 4 preflight design correction; implementation remains blocked pending review
 
 **Scope:** Resolve commit visibility, compensation, repository/coordination ownership,
 atomic commit authorization, and HTTP precondition consistency. This design does not
@@ -100,17 +100,29 @@ namespace. Scope is coordination routing metadata and is not persisted as an
 Airtable record ID. Repository protocols do not import or mention `Lease`,
 `LeaseManager`, Upstash, or Redis.
 
-`backend/coordination/protocols.py`, introduced in Task 4, owns `Lease`,
-`CommitReservation`, `ConfirmedCommitReceipt`, `CommitCoordinatorStatus`, and
-`CommitCoordinator`:
+`backend/coordination/protocols.py`, introduced in Task 4, owns separate generic,
+runtime graph, and operator-only contracts. A generic lease and a graph lease are
+different types; a generic lease can never satisfy `authorize_commit`:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class Lease:
     scope: str
-    owner: str
+    acquisition_id: str
+    expires_at_ms: int
+    ttl_ms: int
+    renew_deadline_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class GraphLease:
+    scope: str
+    acquisition_id: str
     fencing_token: int
-    base_revision: int | None = None
+    base_revision: int
+    expires_at_ms: int
+    ttl_ms: int
+    renew_deadline_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +132,7 @@ class CommitReservation:
     permit: CommitPermit
     commit: GraphCommit
     commit_sha256: str
+    staged_write_receipt: StagedWriteReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,54 +141,295 @@ class ConfirmedCommitReceipt:
     permit: CommitPermit
     commit: GraphCommit
     commit_sha256: str
+    staged_write_receipt: StagedWriteReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledHeadReceipt:
+    scope: str
+    revision: int
+    semantic_checksum: str
+    head_commit_sha256: str | None
+    evidence_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
 class CommitCoordinatorStatus:
     scope: str
+    mode: Literal["READY", "COMMITTING"]
     confirmed_revision: int
+    fencing_floor: int
     active_reservation: CommitReservation | None
-    last_confirmed_receipt: ConfirmedCommitReceipt | None
+    last_confirmation_proof: ConfirmedCommitReceipt | ReconciledHeadReceipt
+    state_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinationEvidence:
+    scope: str
+    committed_head_revision: int
+    committed_head_semantic_checksum: str
+    committed_head_commit_sha256: str | None
+    max_durable_fencing_token: int
+    fencing_floor: int
+    evidence_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseReleaseResult:
+    code: Literal["LEASE_RELEASED", "LEASE_RELEASE_REPLAYED"]
+    acquisition_id: str
+    released_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationResult:
+    code: Literal[
+        "CONFIRMED", "CONFIRMATION_REPLAYED", "CONFIRMATION_PROOF_EVICTED"
+    ]
+    requested_permit: CommitPermit
+    confirmed_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinationInspection:
+    scope: str
+    mode: Literal["UNINITIALIZED", "READY", "COMMITTING", "CORRUPT"]
+    confirmed_revision: int | None
+    fencing_floor: int | None
+    lock_present: bool
+    active_reservation: CommitReservation | None
+    last_confirmation_proof: ConfirmedCommitReceipt | ReconciledHeadReceipt | None
+    state_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinationAdminResult:
+    code: Literal["ADMIN_INITIALIZED", "ADMIN_RECONCILED"]
+    previous_state_sha256: str
+    state_sha256: str
+    confirmed_revision: int
+    fencing_floor: int
 
 
 class LeaseManager(Protocol):
-    def acquire(self, scope: str, owner: str, ttl_ms: int) -> Lease: ...
-    def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
+    def acquire(
+        self, scope: str, acquisition_id: str, ttl_ms: int = 15_000
+    ) -> Lease: ...
+    def renew(
+        self, lease: Lease, request_nonce: str, ttl_ms: int = 15_000
+    ) -> Lease: ...
     def assert_owned(self, lease: Lease) -> None: ...
-    def release(self, lease: Lease) -> None: ...
+    def release(self, lease: Lease, request_nonce: str) -> LeaseReleaseResult: ...
 
 
 class CommitCoordinator(Protocol):
     def acquire(
         self,
         scope: str,
-        owner: str,
         committed_revision: int,
-        ttl_ms: int,
-    ) -> Lease: ...
-    def renew(self, lease: Lease, ttl_ms: int) -> Lease: ...
-    def assert_owned(self, lease: Lease) -> None: ...
+        acquisition_id: str,
+        ttl_ms: int = 15_000,
+    ) -> GraphLease: ...
+    def renew(
+        self, lease: GraphLease, request_nonce: str, ttl_ms: int = 15_000
+    ) -> GraphLease: ...
+    def assert_owned(self, lease: GraphLease) -> None: ...
     def authorize_commit(
-        self, lease: Lease, commit: GraphCommit
+        self,
+        lease: GraphLease,
+        commit: GraphCommit,
+        staged_write_receipt: StagedWriteReceipt,
+        request_nonce: str,
     ) -> CommitPermit: ...
     def get_status(self, scope: str) -> CommitCoordinatorStatus: ...
     def confirm_commit(
-        self, permit: CommitPermit, commit: GraphCommit
-    ) -> None: ...
-    def release(self, lease: Lease) -> None: ...
+        self, permit: CommitPermit, commit: GraphCommit, request_nonce: str
+    ) -> ConfirmationResult: ...
+    def release(
+        self, lease: GraphLease, request_nonce: str
+    ) -> LeaseReleaseResult: ...
+
+
+class CoordinationAdmin(Protocol):
+    def inspect(self, scope: str) -> CoordinationInspection: ...
+    def initialize(
+        self,
+        evidence: CoordinationEvidence,
+        expected_state_sha256: str,
+        request_nonce: str,
+    ) -> CoordinationAdminResult: ...
+    def reconcile(
+        self,
+        evidence: CoordinationEvidence,
+        expected_state_sha256: str,
+        request_nonce: str,
+    ) -> CoordinationAdminResult: ...
 ```
 
-`LeaseManager` is the generic TTL lease used by enrichment. Its leases have
-`base_revision=None` and cannot authorize graph commits. `CommitCoordinator` is
-the graph-specific coordination contract; its `acquire` always returns a lease
-whose `base_revision` equals the supplied committed revision. `get_status` is
-read-only and routes by its explicit scope. `confirm_commit` routes by
-`permit.scope`; callers do not supply a second, potentially inconsistent scope.
+`LeaseManager` is the generic TTL lease used by enrichment. `CommitCoordinator`
+is the graph-specific runtime contract. `CoordinationAdmin` is constructed only
+by authenticated operator CLI dependencies and is never injected into FastAPI
+routes or ordinary service code. `get_status` routes by explicit scope and
+`confirm_commit` routes only by `permit.scope`.
 
-`acquire` initializes an absent coordination revision from the committed Airtable
-head supplied by the caller. Otherwise it requires an exact revision match. A
-missing or mismatched coordination state after initialization is a recovery
-condition, not permission to reset state during an API request.
+Every new logical acquisition uses a cryptographically random UUID acquisition
+ID. It is not an actor, process, username, or other reusable owner identity. The
+same ID is retained only while retrying an ambiguously answered acquisition; a
+later logical acquisition must use a fresh ID. Authorization, confirmation,
+admin CAS, revocation, and rate-limit calls likewise retain one random request
+nonce across transport retries and reject reuse for a different canonical input.
+
+Runtime `CommitCoordinator.acquire` never creates `confirmed-revision` or `fence`.
+It requires both to have been initialized by `CoordinationAdmin`, requires the
+stored confirmed revision to equal the actual committed Airtable head supplied by
+the service, and otherwise returns `COORDINATION_UNINITIALIZED` or
+`COORDINATION_REVISION_MISMATCH`. A request's untrusted `If-Match` value is never
+an acquire argument and cannot initialize or reconcile coordination.
+
+## Canonical Coordination Storage
+
+`REDIS_NAMESPACE` is a non-secret deployment label validated as lowercase ASCII
+letters, digits, and internal hyphens, with length `1..32`. `REDIS_KEY_HMAC_SECRET`
+and `UPSTASH_REDIS_REST_TOKEN` are secret settings. Scope, acquisition nonce,
+request nonce, JTI, IP, email, user identity, and other sensitive or unbounded
+values are HMAC-SHA-256 digested before use in a key. Raw scope, owner identity,
+IP, email, JTI, tokens, and secrets never appear in Redis keys or error details.
+
+The versioned, collision-separated key domains are:
+
+```text
+{sj:v1:<deployment>:graph:<scope-hmac>}:lock
+{sj:v1:<deployment>:graph:<scope-hmac>}:fence
+{sj:v1:<deployment>:graph:<scope-hmac>}:confirmed-revision
+{sj:v1:<deployment>:graph:<scope-hmac>}:commit-reservation
+{sj:v1:<deployment>:graph:<scope-hmac>}:last-confirmation
+{sj:v1:<deployment>:graph:<scope-hmac>}:lease-result:<nonce-hmac>
+{sj:v1:<deployment>:graph:<scope-hmac>}:admin-result:<nonce-hmac>
+{sj:v1:<deployment>:generic:<scope-hmac>}:lock
+{sj:v1:<deployment>:generic:<scope-hmac>}:lease-result:<nonce-hmac>
+{sj:v1:<deployment>:revocation:<jti-hmac>}:entry
+{sj:v1:<deployment>:rate:<policy-id>:<subject-hmac>:<window-start>}:counter
+{sj:v1:<deployment>:rate:<policy-id>:<subject-hmac>:<window-start>}:nonce:<nonce-hmac>
+```
+
+The braces are Redis Cluster hash tags. Every key used by one script shares the
+same tag; graph, generic lease, revocation, and rate-limit domains cannot collide.
+Only fixed server-owned policy IDs and canonical decimal window timestamps appear
+undigested.
+
+Locks, reservations, staged-write receipts, confirmation proofs, admin evidence,
+and nonce receipts use compact sorted-key ASCII JSON envelopes with exact key sets,
+a fixed `schema` tag, and integer `version:1`. Revision, fence, TTL, and epoch
+values inside envelopes are canonical decimal strings so Lua never compares
+precision-losing doubles. A staged receipt envelope contains exactly its
+`operation_id`, `revision`, `fencing_token`, Task 3 `write_set_json`, and
+`write_set_sha256`. Its decoder rejects duplicate JSON keys, unknown or missing
+fields, non-canonical nested write-set JSON, invalid IDs, non-canonical decimal
+strings, and any recomputed write-set or envelope digest mismatch.
+
+Python serialization uses a duplicate-detecting `object_pairs_hook`, then
+re-encodes and byte-compares the canonical form. Mutating adapters first obtain a
+coherent raw state read, strictly decode and recompute every digest, and pass that
+exact state as a CAS input to the Lua mutation. The script byte-compares the CAS
+inputs before writing, so malformed state is detected before mutation and a race
+returns a retry tag rather than accepting unchecked state. Any malformed,
+partially missing, non-canonical, digest-invalid, or invariant-breaking state maps
+to the single stable `COORDINATION_STATE_CORRUPT` result. It is repairable only by
+the evidence-gated operator CAS below.
+
+Every Lua result is a tagged array: success starts with `OK` and a stable result
+code; expected contention or precondition failure starts with `ERR` and a stable
+code. Success codes are `LEASE_ACQUIRED`, `LEASE_REPLAYED`, `LEASE_RENEWED`,
+`LEASE_RENEW_REPLAYED`, `LEASE_RELEASED`, `LEASE_RELEASE_REPLAYED`,
+`RESERVATION_CREATED`, `RESERVATION_REPLAYED`, `CONFIRMED`,
+`CONFIRMATION_REPLAYED`, `ADMIN_INITIALIZED`, `ADMIN_RECONCILED`, `REVOKED`,
+`ALREADY_REVOKED`, `NOT_REVOKED`, `TOKEN_ALREADY_EXPIRED`,
+`RATE_LIMIT_ALLOWED`, and `RATE_LIMIT_DENIED`. Error codes are
+`COORDINATION_UNINITIALIZED`,
+`COORDINATION_REVISION_MISMATCH`, `COORDINATION_STATE_CORRUPT`,
+`LOCK_UNAVAILABLE`, `LEASE_LOST`, `COMMIT_RECOVERY_REQUIRED`,
+`RESERVATION_CONFLICT`, `CONFIRMATION_CONFLICT`,
+`CONFIRMATION_PROOF_EVICTED`, `ADMIN_STATE_CHANGED`, `ADMIN_BUSY`,
+`ADMIN_EVIDENCE_INVALID`, `NONCE_REUSE_CONFLICT`, and
+`COORDINATION_UNAVAILABLE`. Errors disclose no key material or supplied identity.
+
+All scripts validate the exact key count, argument count, ASCII/prefix/length
+rules, canonical positive or non-negative decimals, and signed 64-bit bounds
+before mutation. Decimal equality is lexical after canonicalization; scripts do
+not use `tonumber` for revision, fence, epoch, or equality decisions. Every
+existing key is validated before the first write, and all contention checks occur
+before `INCR`, so a failed acquire never consumes a fencing token. Multi-key
+scripts complete validation before any `SET`, `INCR`, `PEXPIRE`, or `DEL` and have
+no remaining error-producing operation after their first mutation.
+
+## Operator Initialization And Reconciliation
+
+The operator CLI builds `CoordinationEvidence` from a fresh Airtable scan. It
+proves one non-conflicting logical commit for every revision `1..head`, materializes
+that head, verifies its semantic checksum, recomputes the head `GraphCommit`
+SHA-256, and scans all scoped `GraphCommits` and every staged entity row for the
+maximum durable fencing token. At revision zero, the commit digest is `None` and
+the semantic checksum is the canonical initial-snapshot checksum. The proposed
+`fencing_floor` must be strictly greater than every observed durable token. The
+`evidence_sha256` covers version, scope, committed head revision, semantic checksum,
+head commit digest, maximum durable fencing token, and proposed fencing floor.
+
+`initialize` requires the exact canonical ABSENT-state digest, no lock, no
+reservation, no confirmed key, and no fence key. In one CAS it writes the proven
+head revision, fencing floor, and a `ReconciledHeadReceipt` as the one-slot proof.
+`reconcile` requires an initialized but idle state, no lock or reservation, and an
+exact `expected_state_sha256` from `CoordinationAdmin.inspect`. It may advance or
+retain the confirmed revision and fencing floor, but can never decrease either;
+the new floor must also strictly exceed every durable fencing token in the fresh
+evidence. The CAS rechecks every expected raw value and the request nonce before
+mutation. A response-loss retry with the same nonce and evidence returns the exact
+original admin result; changed evidence under that nonce is
+`NONCE_REUSE_CONFLICT`.
+
+Admin inspection computes `state_sha256` over the versioned ordered tuple of exact
+raw graph-key values, including explicit missing markers, before decoding. It can
+therefore return mode `CORRUPT` plus a CAS digest while runtime `get_status` returns
+only `COORDINATION_STATE_CORRUPT`. Reconcile may repair corrupt envelopes only when
+the raw lock and reservation keys are both absent, the expected raw-state digest
+matches, and fresh evidence passes. Any valid current revision/fence scalar remains
+a lower bound; if a scalar itself is absent or malformed, durable Airtable head and
+max-fence evidence are authoritative and the new floor still strictly exceeds all
+durable tokens. The script never writes a revision/fence below any valid current or
+proven durable value.
+
+Neither admin method accepts an API `If-Match`, guesses a head, skips contiguous
+history proof, or clears an active lock/reservation. An absent, corrupt, or drifted
+runtime state therefore fails closed until an operator presents fresh evidence
+and the exact expected-state digest.
+
+## Upstash Adapter And Lease Timing
+
+`backend/coordination/sdk.py` is a thin `upstash-redis==1.7.0` adapter. Its only
+script call is the real SDK shape `client.eval(script, keys, args)`; it never passes
+redis-py's `numkeys`. A local autospecced/stub client test asserts those three
+positional arguments and makes no network call. The SDK client's built-in REST
+retries are disabled with `rest_retries=0`. The adapter performs at most one
+additional attempt only for an ambiguous transport failure and only by replaying
+the byte-identical idempotent EVAL with the same acquisition/request nonce. Tagged
+protocol errors are never retried, and a second transport failure becomes
+`COORDINATION_UNAVAILABLE`.
+
+Lease scripts use Redis `TIME` and `PTTL`. The default requested TTL is exactly
+15,000 ms. Every acquire/renew/replay result returns server time, current PTTL,
+`expires_at_ms = server_time_ms + PTTL`, and
+`renew_deadline_ms = expires_at_ms - 5,000`. Callers must start renewal on or
+before that server-derived deadline; zero, negative, `-1`, `-2`, or a PTTL greater
+than the requested TTL is lease loss or corrupt state as appropriate. Renew and
+release compare the complete canonical lock envelope, including the random
+acquisition ID. Generic and graph lock schemas are distinct, and only `GraphLease`
+contains a fencing token and base revision.
+
+Renew and release take a random request nonce. Their versioned result receipt is
+HMAC-keyed in the same hash slot and retained for 60,000 ms; a byte-identical
+response-loss retry returns the original server-derived result without extending
+or deleting twice. Reusing the nonce with a different lease, operation, or TTL is
+`NONCE_REUSE_CONFLICT`. Acquire uses its random acquisition ID as its replay nonce.
 
 ## Persisted Row Contract
 
@@ -253,7 +507,7 @@ Airtable record IDs never participate in either identity.
 
 ## Commit State Machine
 
-The coordinator has one graph commit state per namespace:
+The coordinator has one initialized graph commit state per namespace:
 
 ```text
 READY(revision=N)
@@ -264,27 +518,53 @@ READY(revision=N)
 ```
 
 The lease itself remains TTL-bound. The `COMMITTING` reservation has no TTL and
-cannot be aborted, replaced, or expired. While it exists, ordinary graph lease
-acquisition and commit authorization fail with `COMMIT_RECOVERY_REQUIRED`.
+cannot be aborted, replaced, or expired. While it exists, a new graph lease
+acquisition fails with `COMMIT_RECOVERY_REQUIRED`.
+
+`get_status(scope)` performs one Lua call whose first operation is one `MGET` of
+confirmed revision, fence, lock, reservation, and last-confirmation proof, followed
+by `PTTL` for a present lock. The adapter strictly decodes that one coherent
+snapshot and accepts only these invariants:
+
+- `READY`: confirmed revision and fence exist, no reservation exists, and the
+  one-slot proof names the confirmed revision; a valid unexpired lock may exist;
+- `COMMITTING`: the same initialized fields exist, the immutable reservation's
+  revision is exactly `confirmed_revision + 1`, its fence is at most the stored
+  fence, and the one-slot proof still names `confirmed_revision`; the lock may
+  exist or have expired.
+
+Revision zero has an initialization proof with no head commit digest. Any missing
+half of initialized state, unexpected proof revision, malformed lock, impossible
+PTTL, reservation gap, or inconsistent fence is `COORDINATION_STATE_CORRUPT`.
+`get_status` never assembles state from separate client reads and never mutates it.
 
 ### Authorization
 
-After staging and verification, `authorize_commit` computes Task 1 canonical JSON
-and `graph_commit_sha256(commit)`, then passes both to one Upstash Lua operation.
-The script atomically:
+After staging and verification, `authorize_commit` accepts the exact Task 3
+`StagedWriteReceipt`, strictly validates its canonical write-set JSON and digest,
+and requires its operation, revision, and fencing token to equal the commit and
+graph lease. It computes Task 1 canonical commit JSON and
+`graph_commit_sha256(commit)`, then executes the CAS script. The script atomically:
 
-1. verifies the lock value still matches the lease owner and fencing token;
-2. verifies the coordination revision equals `commit.revision - 1` and the
+1. inspects a present reservation before consulting the lock; if its canonical
+   scope, commit, commit digest, staged receipt, and receipt digest all match, it
+   returns the exact originally stored permit even after lease expiry;
+2. if no reservation exists, verifies the complete graph lock envelope still
+   matches the graph lease and has positive PTTL;
+3. verifies the coordination revision equals `commit.revision - 1` and the
    lease's `base_revision`;
-3. verifies that no conflicting reservation exists;
-4. stores canonical `GraphCommit` JSON, that exact digest, and a caller-generated
+4. stores canonical `GraphCommit` JSON, exact commit digest, canonical staged
+   receipt envelope and digest, request-nonce digest, and a caller-generated
    `cpr_<uuid4 hex>` permit ID in an immutable `COMMITTING` reservation without
    expiry; and
-5. returns `CommitPermit(scope=lease.scope, ..., commit_sha256=digest)`.
+5. returns `CommitPermit(scope=lease.scope, ..., commit_sha256=digest)` with a
+   tagged `RESERVATION_CREATED` or `RESERVATION_REPLAYED` result.
 
-An exact retry after an ambiguous Upstash response returns the existing permit.
-Any different operation, revision, fencing token, permit ID, or commit digest is a
-conflict and cannot replace the reservation.
+An exact canonical retry after an ambiguous Upstash response returns the original
+permit regardless of current lease state. Any different operation, revision,
+fencing token, permit ID, commit digest, staged write-set JSON, or staged receipt
+digest is a conflict and cannot replace the reservation. Persisting the receipt
+makes recovery after process loss independent of request memory or the audit write.
 
 Before authorization, lease loss leaves only invisible staged rows and the audit
 operation may transition to `FAILED`. After authorization, lease expiry does not
@@ -304,20 +584,27 @@ resolved by read-back. Identical physical duplicates are accepted; conflicting
 duplicates fail closed.
 
 Only after read-back succeeds does `CommitCoordinator.confirm_commit` route through
-`permit.scope` and run an atomic Lua operation that verifies the immutable
-reservation, recomputes and verifies the commit digest, advances the confirmed
-coordination revision, records a `ConfirmedCommitReceipt`, and clears the active
-reservation. Audit state normally transitions from `COMMITTING` to `COMMITTED`;
-if the intermediate audit write failed, repair transitions the durable `PENDING`
-record directly to `COMMITTED` after proof.
+`permit.scope`, recompute the commit digest, and run the CAS script. The script
+first checks whether the one-slot last-confirmation proof is the exact requested
+`ConfirmedCommitReceipt`; if so it returns the original `CONFIRMED` result even if
+a newer reservation exists. For a new confirmation it then requires the exact
+active reservation and enforces
+`confirmed_revision == commit.revision - 1` before any write. It advances the
+revision, writes the full confirmed receipt including the staged receipt, and
+deletes the reservation.
 
-`get_status(scope)` returns `CommitCoordinatorStatus` containing the confirmed
-revision, active reservation, and one-slot last-confirmed receipt. The receipt is
-read-only evidence, not graph visibility authority.
+If the request revision is at or below the confirmed revision but the one-slot
+proof is no longer the exact requested receipt, confirm returns
+`CONFIRMATION_PROOF_EVICTED`, not generic conflict or success. The caller may use
+the independent contiguous Airtable proof described under recovery for audit-only
+repair, but must not repeat confirmation or a graph write. Other mismatches return
+`CONFIRMATION_CONFLICT`. Audit normally transitions from `COMMITTING` to
+`COMMITTED`; if the intermediate audit write failed, repair may transition the
+durable `PENDING` record directly to `COMMITTED` after proof.
 
 `GraphCommits` remains the graph visibility authority. Redis contains only
 coordination state: leases, fencing counters, the confirmed coordination revision,
-the active reservation, and the last-confirmed retry receipt. It contains no graph
+the active reservation, and the one-slot last-confirmation proof. It contains no graph
 entities or snapshots.
 
 ## Crash Recovery
@@ -328,7 +615,7 @@ Recovery is deterministic and never aborts an authorized commit.
 |---|---|
 | Before reservation | Mark the audit operation failed when possible; staged rows remain invisible. |
 | Authorization response lost | Retry identical authorization and recover the same permit. |
-| After reservation, before Airtable append | Recovery verifies staged rows and checksum, then appends the reserved commit. |
+| After reservation, before Airtable append | Recovery verifies the reservation's persisted staged receipt, rows, and checksum, then appends the reserved commit. |
 | Airtable response lost | Read by revision and canonical commit identity; accept identical duplicates. |
 | After Airtable append, before confirmation | Recovery confirms the existing matching commit in Upstash. |
 | After confirmation, before audit transition | Repair `PENDING` or `COMMITTING` audit from coordinator status and the exact logical `GraphCommit`; do not repeat a graph write. |
@@ -337,26 +624,143 @@ Recovery is deterministic and never aborts an authorized commit.
 
 Active-reservation recovery remains exact and irrevocable. `recover-operation`
 loads `get_status(scope)`, requires the requested operation ID to match the active
-reservation, validates the reserved canonical commit and matching staged row set,
-reconstructs the proposed snapshot, validates graph invariants and checksum, then
-either confirms an already-present identical commit or appends and confirms the
-reserved commit. It never marks that operation failed and never creates a
-replacement permit.
+reservation, validates the reserved canonical commit and persisted
+`StagedWriteReceipt`, calls `verify_staged` with that receipt, reconstructs the
+proposed snapshot, validates graph invariants and checksum, then either confirms
+an already-present identical commit or appends and confirms the reserved commit.
+No request-process memory is required. Recovery never marks that operation failed
+and never creates a replacement permit.
 
 When no matching active reservation exists, recovery performs audit repair only.
 The audit record supplies canonical `GraphCommitJson` and `CommitSha256`. A matching
-logical `GraphCommit` plus an exact `last_confirmed_receipt` directly proves
+logical `GraphCommit` plus an exact `ConfirmedCommitReceipt` in
+`last_confirmation_proof` directly proves
 confirmation. If the one-slot receipt has advanced, then
 `status.confirmed_revision >= target.revision`, a contiguous non-conflicting
 logical commit sequence through that revision, and the exact target
 `GraphCommit`/digest prove the earlier sequential confirmation. The service or CLI
 appends the missing `COMMITTED` audit transition and performs no repository append
-or coordinator confirmation.
+or coordinator confirmation. A direct call to `confirm_commit` after the one-slot
+proof advances returns `CONFIRMATION_PROOF_EVICTED`; this distinct result triggers
+the same independent Airtable proof path rather than being treated as success.
 
 An absent or incompatible Redis coordination state is not silently rebuilt by an
-API writer. Operator recovery may reconcile an idle coordination revision to the
-highest contiguous, non-conflicting Airtable commit only when no active
-reservation exists.
+API writer or by `recover-operation`. The separate operator-only evidence command
+and `CoordinationAdmin.initialize` or `reconcile` CAS are the only repair paths.
+
+## Revocation And Rate-Limit Contracts
+
+Task 4 defines complete fail-closed protocols rather than boolean or untyped
+dictionary adapters:
+
+```python
+@dataclass(frozen=True, slots=True)
+class RevocationResult:
+    code: Literal[
+        "REVOKED", "ALREADY_REVOKED", "NOT_REVOKED", "TOKEN_ALREADY_EXPIRED"
+    ]
+    revoked: bool
+    server_time_ms: int
+    expires_at_ms: int
+
+
+class RevocationStore(Protocol):
+    def revoke(
+        self, jti: str, token_expires_at_s: int, request_nonce: str
+    ) -> RevocationResult: ...
+    def is_revoked(
+        self, jti: str, token_expires_at_s: int
+    ) -> RevocationResult: ...
+
+
+class RateLimitPolicyId(StrEnum):
+    LOGIN = "login"
+    SUBMIT = "submit"
+    UPLOAD = "upload"
+    COMMENT = "comment"
+    STORY = "story"
+    SEARCH = "search"
+    EMAIL_VERIFICATION = "email-verification"
+
+
+@dataclass(frozen=True, slots=True)
+class IpRateLimitSubject:
+    kind: Literal["IP"]
+    normalized_ip: str
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityRateLimitSubject:
+    kind: Literal["IDENTITY"]
+    identity_id: str
+
+
+RateLimitSubject = IpRateLimitSubject | IdentityRateLimitSubject
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimitResult:
+    policy: RateLimitPolicyId
+    allowed: bool
+    limit: int
+    observed_count: int
+    remaining: int
+    server_time_ms: int
+    reset_at_ms: int
+    retry_after_ms: int
+
+
+class RateLimiter(Protocol):
+    def consume(
+        self,
+        policy: RateLimitPolicyId,
+        subject: RateLimitSubject,
+        request_nonce: str,
+    ) -> RateLimitResult: ...
+```
+
+The store is constructed with `JWT_LEEWAY_SECONDS`, the same server-configured
+integer used by JWT claim validation. Its default is exactly 30 seconds and valid
+range is `0..300`; API callers cannot choose it.
+Both revocation operations validate canonical JTI, expiry, and leeway, obtain time
+from Redis `TIME`, and retain a revocation through
+`expires_at_ms = token_expires_at_s * 1000 + leeway_s * 1000`. `revoke` is
+idempotent by request nonce. If an existing valid revocation has no TTL or a TTL
+shorter than the required remaining lifetime, the same script repairs it with
+`PEXPIREAT` before returning. An impossible value or overlong TTL is corrupt.
+`is_revoked` returns `REVOKED` for a valid entry, `NOT_REVOKED` for an absent entry,
+and `TOKEN_ALREADY_EXPIRED` once server time reaches expiry; JWT claim validation
+still rejects the token. Redis/transport/malformed-state failure is never
+interpreted as `NOT_REVOKED`.
+
+Rate-limit policies and subject kinds are immutable server-owned data:
+
+| Policy | Limit and exact window | Subject kind |
+|---|---|---|
+| `LOGIN` | 5 per 900,000 ms | normalized IP |
+| `SUBMIT` | 5 per 3,600,000 ms | normalized IP |
+| `UPLOAD` | 10 per 3,600,000 ms | authenticated identity |
+| `COMMENT` | 20 per 3,600,000 ms | authenticated identity |
+| `STORY` | 20 per 3,600,000 ms | authenticated identity |
+| `SEARCH` | 60 per 60,000 ms | normalized IP |
+| `EMAIL_VERIFICATION` | 10 per 3,600,000 ms | normalized IP |
+
+The caller chooses only a policy enum and a typed subject of the policy's required
+kind; it cannot supply a limit, window, or reset time. Comments and stories have
+distinct counters even though their numeric limits match. The script uses Redis
+`TIME` and computes
+`window_start = floor(server_time_ms / window_ms) * window_ms`; a request at the
+exact `reset_at_ms = window_start + window_ms` belongs to the new window. Calls
+`1..N` are allowed, call `N+1` and later are denied, `remaining` never goes below
+zero, and denied calls report the actual observed count.
+
+Each logical request has a random nonce whose HMAC-keyed receipt stores the exact
+canonical result until window end. A retry returns that result without increment;
+nonce reuse for a changed policy or subject is `NONCE_REUSE_CONFLICT`. Counter and
+nonce TTLs are atomically set or repaired to the exact reset boundary with
+`PEXPIREAT`; a missing TTL, stale TTL, malformed count, or count outside signed
+64-bit bounds is handled before increment. Redis or adapter failure denies the
+request with a stable unavailable result; it never grants extra capacity.
 
 ## Exact Compensation
 
@@ -406,6 +810,10 @@ graph-state mutation and therefore requires both graph headers.
 
 ## Failure Semantics
 
+- Missing initialized coordination: ordinary writes return
+  `COORDINATION_UNINITIALIZED`; only the operator admin CAS may initialize it.
+- Airtable/coordinator head mismatch: ordinary writes fail before staging; only an
+  idle evidence-gated reconcile may advance coordination.
 - Lease loss before authorization: fail closed; no commit may be appended.
 - Lease loss after authorization: continue or recover the exact reserved commit.
 - Upstash outage before authorization: return unavailable and leave staged rows
@@ -419,6 +827,10 @@ graph-state mutation and therefore requires both graph headers.
 - Audit failure after authorization: commit completion takes precedence; audit is
   repaired from an active reservation or, after confirmation, from coordinator
   status plus the exact logical `GraphCommit`; no graph write is repeated.
+- Replaced one-slot confirmation proof: return `CONFIRMATION_PROOF_EVICTED` and
+  require independent contiguous Airtable proof for audit-only repair.
+- Malformed or invariant-breaking Redis state: return
+  `COORDINATION_STATE_CORRUPT`; no runtime method mutates or repairs it.
 - `GraphState` update failure: tolerate it because the table remains a cache.
 
 ## Required Tests
@@ -452,24 +864,65 @@ graph-state mutation and therefore requires both graph headers.
 
 ### Task 4 Coordinator Tests
 
-- Authorization is one atomic script and rejects wrong owner, fencing token,
-  revision, or conflicting reservation.
-- Authorization returns permit scope from the lease and the exact Task 1 commit
-  digest stored in the reservation.
-- Exact authorization retry returns the same permit.
-- Reservation has no expiry and blocks new writers after lease expiry.
-- Confirmation requires the exact permit and commit digest.
-- Confirmation advances revision once and is idempotent.
-- `get_status(scope)` returns confirmed revision, active reservation, and the
-  last-confirmed receipt without mutation.
-- Upstash failure at each coordinator call fails closed.
+- Runtime acquire on absent confirmed/fence keys returns
+  `COORDINATION_UNINITIALIZED`, creates no key, and never consumes a request
+  `If-Match` value.
+- Acquire accepts only the actual committed Airtable revision, rejects mismatch,
+  checks lock contention before `INCR`, and leaves the fence unchanged on every
+  failed acquisition.
+- Acquisition-response loss with the same random acquisition ID returns the same
+  graph lease; a new ID contends, and a generic lease cannot authorize a commit.
+- Lease acquire and renew expose Redis-derived PTTL, expiry, and the exact
+  expiry-minus-5,000-ms renewal deadline for the 15,000-ms default.
+- Authorization rejects wrong lease kind, acquisition ID, fencing token, base
+  revision, non-sequential revision, invalid nonce, or conflicting reservation.
+- Authorization validates and persists canonical Task 3 `StagedWriteReceipt`
+  JSON/digest and rejects changed write-set JSON, digest, operation, revision, or
+  fence.
+- Authorization inspects an existing reservation first and returns its exact
+  original permit on a canonical match after lease expiry; only new reservation
+  creation requires a live lock.
+- Reservation has no expiry, contains complete recovery data, and blocks new graph
+  acquisitions after process and lease loss.
+- Confirmation checks the exact last-confirmation proof retry before active reservation,
+  requires `confirmed_revision == commit.revision - 1` for a new confirmation,
+  advances once, and returns `CONFIRMATION_PROOF_EVICTED` after its proof is
+  replaced.
+- One `get_status` Lua/MGET snapshot validates READY and COMMITTING invariants;
+  torn, partial, malformed, non-canonical, or digest-invalid state returns exactly
+  `COORDINATION_STATE_CORRUPT` without mutation.
+- Strict decoders reject duplicate keys and extra/missing fields for lock,
+  reservation, staged receipt, confirmation proof, and admin evidence envelopes.
+- Script tables cover invalid ARGV/KEYS, canonical decimal grammar, signed-64
+  minimum/maximum/overflow, no `tonumber` equality, validate-before-write, and no
+  partial mutation on every error tag.
+- Versioned HMAC key tests prove domain separation, cluster hash-tag co-location,
+  and absence of raw scope, actor/owner, IP, email/identity, JTI, token, and secret
+  material from keys and errors.
+- Admin initialize/reconcile rejects an active lock or reservation, stale expected
+  digest, non-contiguous or conflicting Airtable evidence, head checksum/digest
+  mismatch, and a fencing floor not strictly above every durable token. It never
+  decreases revision/fence and exact nonce replay returns the original result.
+- The Upstash 1.7.0 adapter calls `eval(script, keys, args)` against a local
+  autospecced/stub client, disables SDK retries, retries one ambiguous transport
+  failure with identical nonce/input, and never retries tagged failures.
+- Revocation tests cover `revoke`/`is_revoked`, expiry plus leeway, Redis `TIME`,
+  replay, atomic short/missing-TTL repair, malformed state, and fail-closed outage.
+- Rate-limit tests cover every typed policy/subject pairing, separate comment and
+  story buckets, exact fixed-window boundary, N/N+1, replay without double-charge,
+  nonce conflict, atomic TTL repair, malformed counter/overflow, and fail-closed
+  outage.
 
 ### Task 5 Service Tests
 
 - Failures before authorization produce no visible commit.
+- Service order is load actual Airtable head, acquire against initialized
+  coordination, reload under lease, then compare the request `If-Match`; an absent
+  coordinator never bootstraps from the request.
 - Every failure after authorization leaves recoverable `PENDING` or `COMMITTING`
   audit and never transitions it to `FAILED`.
-- Recovery completes a reserved commit after lease expiry.
+- Recovery completes a reserved commit after process and lease loss using only the
+  reservation's persisted canonical staged receipt and commit identity.
 - Idempotent retry repairs `PENDING` or `COMMITTING` audit after reservation
   clearance using direct last-receipt proof or later-revision sequential proof,
   without repeating a graph write.
@@ -487,6 +940,9 @@ graph-state mutation and therefore requires both graph headers.
 - `recover-operation` repairs audit only after confirmation when coordinator status
   and the exact logical commit prove success; it does not append the graph commit
   again.
+- `recover-operation` never initializes or reconciles coordination. Separate admin
+  CLI tests require reviewed evidence, exact expected-state CAS, idle state, and
+  production confirmation guards.
 
 ## Operational Constraints
 
