@@ -1,7 +1,7 @@
 """Pure mappings between Airtable rows, legacy rows, and graph-domain values."""
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Generic, Literal, Mapping, Sequence, TypeVar
 
 from domain.dates import PartialDate
 from domain.ids import (
@@ -32,6 +32,16 @@ from domain.models import (
 from repositories.protocols import WriteContext
 
 Row = Mapping[str, object]
+EntityT = TypeVar("EntityT")
+
+
+@dataclass(frozen=True, slots=True)
+class LiveEntityVersion(Generic[EntityT]):
+    entity: EntityT
+    revision: int
+    operation_id: OperationId
+    fencing_token: int
+    is_tombstone: Literal[False] = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +50,7 @@ class RepositoryTombstone:
     revision: int
     operation_id: OperationId
     fencing_token: int
+    is_tombstone: Literal[True] = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +158,15 @@ def _tombstone(row: Row, id_field: str) -> RepositoryTombstone:
     )
 
 
+def _live_version(entity: EntityT, row: Row) -> LiveEntityVersion[EntityT]:
+    return LiveEntityVersion(
+        entity,
+        _integer(row, "Revision"),
+        OperationId(_required_text(row, "OperationId")),
+        _integer(row, "FencingToken"),
+    )
+
+
 def person_to_row(
     person: Person, context: WriteContext, *, tombstone: bool = False
 ) -> dict[str, object]:
@@ -169,20 +189,23 @@ def person_to_row(
     }
 
 
-def person_from_row(row: Row) -> Person | RepositoryTombstone:
+def person_from_row(row: Row) -> LiveEntityVersion[Person] | RepositoryTombstone:
     if _bool(row.get("IsTombstone")):
         return _tombstone(row, "PersonId")
     primary_family_unit_id = _optional_text(row, "PrimaryFamilyUnitId")
-    return Person(
-        PersonId(_required_text(row, "PersonId")),
-        _required_text(row, "FullName"),
-        Gender(_required_text(row, "Gender")),
-        _parse_date(row.get("Birth")),
-        _parse_date(row.get("Death")),
-        _parse_is_alive(row.get("IsAlive")),
-        FamilyUnitId(primary_family_unit_id) if primary_family_unit_id else None,
-        _bool(row.get("Archived")),
-        _integer(row, "VersionRevision"),
+    return _live_version(
+        Person(
+            PersonId(_required_text(row, "PersonId")),
+            _required_text(row, "FullName"),
+            Gender(_required_text(row, "Gender")),
+            _parse_date(row.get("Birth")),
+            _parse_date(row.get("Death")),
+            _parse_is_alive(row.get("IsAlive")),
+            FamilyUnitId(primary_family_unit_id) if primary_family_unit_id else None,
+            _bool(row.get("Archived")),
+            _integer(row, "VersionRevision"),
+        ),
+        row,
     )
 
 
@@ -206,20 +229,25 @@ def family_unit_to_row(
     }
 
 
-def family_unit_from_row(row: Row) -> FamilyUnit | RepositoryTombstone:
+def family_unit_from_row(
+    row: Row,
+) -> LiveEntityVersion[FamilyUnit] | RepositoryTombstone:
     if _bool(row.get("IsTombstone")):
         return _tombstone(row, "FamilyUnitId")
     adult_b_id = _optional_text(row, "AdultBId")
-    return FamilyUnit(
-        FamilyUnitId(_required_text(row, "FamilyUnitId")),
-        FamilyUnitKind(_required_text(row, "Kind")),
-        PersonId(_required_text(row, "AdultAId")),
-        PersonId(adult_b_id) if adult_b_id else None,
-        UnionStatus(_required_text(row, "Status")),
-        _parse_date(row.get("Start")),
-        _parse_date(row.get("End")),
-        _bool(row.get("DistinctUnionConfirmed")),
-        _integer(row, "CreatedRevision"),
+    return _live_version(
+        FamilyUnit(
+            FamilyUnitId(_required_text(row, "FamilyUnitId")),
+            FamilyUnitKind(_required_text(row, "Kind")),
+            PersonId(_required_text(row, "AdultAId")),
+            PersonId(adult_b_id) if adult_b_id else None,
+            UnionStatus(_required_text(row, "Status")),
+            _parse_date(row.get("Start")),
+            _parse_date(row.get("End")),
+            _bool(row.get("DistinctUnionConfirmed")),
+            _integer(row, "CreatedRevision"),
+        ),
+        row,
     )
 
 
@@ -241,18 +269,23 @@ def parent_child_link_to_row(
     }
 
 
-def parent_child_link_from_row(row: Row) -> ParentChildLink | RepositoryTombstone:
+def parent_child_link_from_row(
+    row: Row,
+) -> LiveEntityVersion[ParentChildLink] | RepositoryTombstone:
     if _bool(row.get("IsTombstone")):
         return _tombstone(row, "LinkId")
     family_unit_id = _optional_text(row, "FamilyUnitId")
-    return ParentChildLink(
-        LinkId(_required_text(row, "LinkId")),
-        PersonId(_required_text(row, "ParentId")),
-        PersonId(_required_text(row, "ChildId")),
-        ParentRole(_required_text(row, "Role")),
-        RelationshipType(_required_text(row, "RelationshipType")),
-        FamilyUnitId(family_unit_id) if family_unit_id else None,
-        _integer(row, "CreatedRevision"),
+    return _live_version(
+        ParentChildLink(
+            LinkId(_required_text(row, "LinkId")),
+            PersonId(_required_text(row, "ParentId")),
+            PersonId(_required_text(row, "ChildId")),
+            ParentRole(_required_text(row, "Role")),
+            RelationshipType(_required_text(row, "RelationshipType")),
+            FamilyUnitId(family_unit_id) if family_unit_id else None,
+            _integer(row, "CreatedRevision"),
+        ),
+        row,
     )
 
 
@@ -272,15 +305,20 @@ def unresolved_to_row(
     }
 
 
-def unresolved_from_row(row: Row) -> UnresolvedRelationship | RepositoryTombstone:
+def unresolved_from_row(
+    row: Row,
+) -> LiveEntityVersion[UnresolvedRelationship] | RepositoryTombstone:
     if _bool(row.get("IsTombstone")):
         return _tombstone(row, "UnresolvedId")
-    return UnresolvedRelationship(
-        UnresolvedRelationshipId(_required_text(row, "UnresolvedId")),
-        PersonId(_required_text(row, "SubjectPersonId")),
-        UnresolvedRelationshipKind(_required_text(row, "Kind")),
-        _required_text(row, "UnresolvedName"),
-        _integer(row, "CreatedRevision"),
+    return _live_version(
+        UnresolvedRelationship(
+            UnresolvedRelationshipId(_required_text(row, "UnresolvedId")),
+            PersonId(_required_text(row, "SubjectPersonId")),
+            UnresolvedRelationshipKind(_required_text(row, "Kind")),
+            _required_text(row, "UnresolvedName"),
+            _integer(row, "CreatedRevision"),
+        ),
+        row,
     )
 
 
@@ -311,9 +349,11 @@ def _domain_values(rows: Sequence[Row], mapper, expected_type):
         value = mapper(row)
         if isinstance(value, RepositoryTombstone):
             continue
-        if not isinstance(value, expected_type):
+        if not isinstance(value, LiveEntityVersion) or not isinstance(
+            value.entity, expected_type
+        ):
             raise TypeError("Unexpected repository row value")
-        values.append(value)
+        values.append(value.entity)
     return values
 
 

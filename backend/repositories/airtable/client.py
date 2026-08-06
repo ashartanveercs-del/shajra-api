@@ -20,8 +20,17 @@ class AirtableClient:
         self._api: Any | None = None
 
     def table(self, table_name: str) -> Any:
+        _, base_id = self._credentials()
+        return self.api.table(base_id, table_name)
+
+    @property
+    def api(self) -> Any:
+        personal_access_token, _ = self._credentials()
+        if self._api is None:
+            self._api = self._api_factory(personal_access_token)
+        return self._api
+
+    def _credentials(self) -> tuple[str, str]:
         if not self._personal_access_token or not self._base_id:
             raise RuntimeError("Airtable credentials are not configured")
-        if self._api is None:
-            self._api = self._api_factory(self._personal_access_token)
-        return self._api.table(self._base_id, table_name)
+        return self._personal_access_token, self._base_id

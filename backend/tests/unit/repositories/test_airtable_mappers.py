@@ -28,7 +28,9 @@ from domain.models import (
     UnresolvedRelationshipKind,
 )
 from repositories.airtable.legacy import LegacySnapshotRepository
+from repositories.airtable.client import AirtableClient
 from repositories.airtable.mappers import (
+    LiveEntityVersion,
     RepositoryTombstone,
     family_unit_from_row,
     family_unit_to_row,
@@ -218,6 +220,57 @@ def test_entity_mappers_persist_authorization_tuple_and_tombstones(
     assert tombstone.fencing_token == 23
 
 
+@pytest.mark.parametrize(
+    ("to_row", "from_row", "entity"),
+    (
+        (person_to_row, person_from_row, Person(PersonId("per_live"), "Ada")),
+        (
+            family_unit_to_row,
+            family_unit_from_row,
+            FamilyUnit(FamilyUnitId("fam_live"), FamilyUnitKind.SINGLE_PARENT, PersonId("per_live")),
+        ),
+        (
+            parent_child_link_to_row,
+            parent_child_link_from_row,
+            ParentChildLink(
+                LinkId("lnk_live"),
+                PersonId("per_parent"),
+                PersonId("per_child"),
+                ParentRole.FATHER,
+                RelationshipType.BIOLOGICAL,
+                None,
+            ),
+        ),
+        (
+            unresolved_to_row,
+            unresolved_from_row,
+            UnresolvedRelationship(
+                UnresolvedRelationshipId("unr_live"),
+                PersonId("per_live"),
+                UnresolvedRelationshipKind.FATHER,
+                "Unknown Father",
+            ),
+        ),
+    ),
+)
+def test_live_entity_versions_preserve_full_authorization_metadata(
+    to_row, from_row, entity
+) -> None:
+    row = to_row(entity, _context())
+    live_version = from_row(row)
+    tombstone = from_row({**row, "IsTombstone": True})
+
+    assert isinstance(live_version, LiveEntityVersion)
+    assert live_version.entity == entity
+    assert live_version.revision == 7
+    assert live_version.operation_id == OperationId("op_write")
+    assert live_version.fencing_token == 23
+    assert live_version.is_tombstone is False
+    assert isinstance(tombstone, RepositoryTombstone)
+    assert tombstone.is_tombstone is True
+    assert not isinstance(tombstone, LiveEntityVersion)
+
+
 class FakeRateLimitError(Exception):
     def __init__(self, retry_after: str | None = None) -> None:
         self.response = type(
@@ -285,6 +338,7 @@ class FakeFacadeTable:
 class FakeFacadeApi:
     def __init__(self) -> None:
         self.tables: dict[str, FakeFacadeTable] = {}
+        self.marker = "delegated"
 
     def table(self, _base_id: str, name: str) -> FakeFacadeTable:
         return self.tables.setdefault(name, FakeFacadeTable())
@@ -322,3 +376,26 @@ def test_legacy_facade_is_lazy_uses_safe_formulas_and_gates_mutations(monkeypatc
     with pytest.raises(RuntimeError, match="Legacy Airtable mutations are disabled"):
         facade.create_member({"FullName": "Blocked"})
     assert api.tables["ApprovedMembers"].creates == []
+
+
+def test_legacy_facade_exports_a_lazy_api_proxy(monkeypatch) -> None:
+    api = FakeFacadeApi()
+    api_calls: list[str] = []
+
+    def api_factory(token: str) -> FakeFacadeApi:
+        api_calls.append(token)
+        return api
+
+    facade = importlib.import_module("airtable_client")
+    monkeypatch.setattr(
+        facade,
+        "_client",
+        AirtableClient("test-token", "app-test", api_factory=api_factory),
+    )
+
+    legacy_api = facade.api
+
+    assert api_calls == []
+    assert legacy_api.table("app-test", "ApprovedMembers") is api.tables["ApprovedMembers"]
+    assert api_calls == ["test-token"]
+    assert legacy_api.marker == "delegated"

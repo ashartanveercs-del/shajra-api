@@ -34,12 +34,21 @@ class _LazyTable:
         return getattr(_client.table(self._name), attribute)
 
 
+class _LazyApi:
+    def table(self, *args: object, **kwargs: object) -> Any:
+        return _client.api.table(*args, **kwargs)
+
+    def __getattr__(self, attribute: str) -> Any:
+        return getattr(_client.api, attribute)
+
+
 members_table = _LazyTable(APPROVED_MEMBERS_TABLE)
 pending_table = _LazyTable(PENDING_SUBMISSIONS_TABLE)
 comments_table = _LazyTable("Comments")
 stories_table = _LazyTable("Stories")
 albums_table = _LazyTable("PhotoAlbums")
 approved_emails_table = _LazyTable(APPROVED_EMAILS_TABLE)
+api = _LazyApi()
 
 
 def _flatten(record: dict[str, object]) -> dict[str, object]:
