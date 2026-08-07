@@ -2,9 +2,10 @@
 
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_env: Literal["development", "test", "preview", "production"] = "development"
@@ -36,6 +38,11 @@ class Settings(BaseSettings):
     admin_password_hash: SecretStr | None = None
     jwt_secret: SecretStr | None = None
     mutation_preview_secret: SecretStr | None = None
+    upstash_redis_rest_url: str | None = None
+    upstash_redis_rest_token: SecretStr | None = None
+    redis_namespace: str | None = None
+    redis_key_hmac_secret: SecretStr | None = None
+    jwt_leeway_seconds: int = Field(default=30, ge=0, le=300)
     jwt_issuer: str = "shajra"
     jwt_audience: str = "shajra-admin"
     cors_allowed_origins: str = "http://localhost:3000"
@@ -53,10 +60,18 @@ class Settings(BaseSettings):
                 "ADMIN_PASSWORD_HASH": self.admin_password_hash,
                 "JWT_SECRET": self.jwt_secret,
                 "MUTATION_PREVIEW_SECRET": self.mutation_preview_secret,
+                "UPSTASH_REDIS_REST_URL": self.upstash_redis_rest_url,
+                "UPSTASH_REDIS_REST_TOKEN": self.upstash_redis_rest_token,
+                "REDIS_NAMESPACE": self.redis_namespace,
+                "REDIS_KEY_HMAC_SECRET": self.redis_key_hmac_secret,
             }
             missing = [name for name, value in required.items() if _is_missing(value)]
             if missing:
                 raise ValueError("Missing required settings: " + ", ".join(sorted(missing)))
+            if not re.fullmatch(
+                r"[a-z0-9]+(?:-[a-z0-9]+)*", self.redis_namespace or ""
+            ) or not 1 <= len(self.redis_namespace or "") <= 32:
+                raise ValueError("Invalid REDIS_NAMESPACE")
         return self
 
     @property

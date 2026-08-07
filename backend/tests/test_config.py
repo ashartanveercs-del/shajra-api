@@ -23,6 +23,10 @@ VALID_RUNTIME_SETTINGS = {
     "admin_password_hash": "test-password-hash",
     "jwt_secret": "x" * 32,
     "mutation_preview_secret": "test-mutation-preview-secret",
+    "upstash_redis_rest_url": "https://example.upstash.io",
+    "upstash_redis_rest_token": "test-upstash-token",
+    "redis_namespace": "preview-1",
+    "redis_key_hmac_secret": "test-hmac-secret",
 }
 
 REQUIRED_SETTINGS = (
@@ -32,6 +36,10 @@ REQUIRED_SETTINGS = (
     "admin_password_hash",
     "jwt_secret",
     "mutation_preview_secret",
+    "upstash_redis_rest_url",
+    "upstash_redis_rest_token",
+    "redis_namespace",
+    "redis_key_hmac_secret",
 )
 
 COMPATIBILITY_ENV = {
@@ -95,6 +103,8 @@ def test_runtime_settings_keep_secrets_typed():
     assert isinstance(settings.admin_password_hash, SecretStr)
     assert isinstance(settings.jwt_secret, SecretStr)
     assert isinstance(settings.mutation_preview_secret, SecretStr)
+    assert isinstance(settings.upstash_redis_rest_token, SecretStr)
+    assert isinstance(settings.redis_key_hmac_secret, SecretStr)
 
 
 def test_allowed_origins_trims_and_drops_empty_values():
