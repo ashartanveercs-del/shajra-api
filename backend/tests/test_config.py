@@ -107,6 +107,33 @@ def test_runtime_settings_keep_secrets_typed():
     assert isinstance(settings.redis_key_hmac_secret, SecretStr)
 
 
+@pytest.mark.parametrize("app_env", ["preview", "production"])
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "http://plaintext-secret.invalid",
+        "https://user:plaintext-secret@example.upstash.io",
+        "https://example.upstash.io/#plaintext-secret",
+        "https://example.upstash.io?plaintext-secret=true",
+        "https://example.upstash.io/",
+        "https://EXAMPLE.upstash.io",
+        "https://bad..upstash.io",
+        "https://-bad.upstash.io",
+        "not-a-url-plaintext-secret",
+    ],
+)
+def test_runtime_rejects_noncanonical_or_unsafe_upstash_urls_without_echoing(
+    app_env, unsafe_url
+):
+    values = {**VALID_RUNTIME_SETTINGS, "upstash_redis_rest_url": unsafe_url}
+
+    with pytest.raises(ValidationError) as raised:
+        Settings(app_env=app_env, **values, _env_file=None)
+
+    assert "Invalid UPSTASH_REDIS_REST_URL" in str(raised.value)
+    assert "plaintext-secret" not in str(raised.value)
+
+
 def test_allowed_origins_trims_and_drops_empty_values():
     settings = Settings(
         cors_allowed_origins=" https://one.example , ,http://two.example,   ",
@@ -172,6 +199,7 @@ print(json.dumps({
         "string_exports": True,
         "expiration_is_int": True,
     }
+
 
 def test_test_environment_defaults_all_writes_off():
     settings = Settings(

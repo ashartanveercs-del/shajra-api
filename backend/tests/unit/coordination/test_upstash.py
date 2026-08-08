@@ -151,18 +151,27 @@ class LeaseEvalStub:
     def _acquire(
         self, domain: str, script_keys: list[str], args: list[str]
     ) -> list[object]:
-        expected_key_count = 2 if domain == "GENERIC" else 5
-        if len(script_keys) != expected_key_count or len(args) != 5:
+        expected_key_count = 2 if domain == "GENERIC" else 6
+        expected_arg_counts = {5} if domain == "GENERIC" else {5, 10}
+        if (
+            len(script_keys) != expected_key_count
+            or len(args) not in expected_arg_counts
+        ):
             return ["ERR", "COORDINATION_STATE_CORRUPT"]
         request = CanonicalInput(args[0], args[1])
         scope, acquisition_id, ttl_ms = args[2], args[3], int(args[4])
         if domain == "GENERIC":
             lock_key, receipt_key = script_keys
-            confirmed_key = fence_key = reservation_key = None
+            confirmed_key = fence_key = reservation_key = proof_key = None
         else:
-            confirmed_key, fence_key, lock_key, reservation_key, receipt_key = (
-                script_keys
-            )
+            (
+                lock_key,
+                fence_key,
+                confirmed_key,
+                reservation_key,
+                proof_key,
+                receipt_key,
+            ) = script_keys
 
         replay = self._receipt_replay(receipt_key, request.sha256, "LEASE_REPLAYED")
         if replay is not None:
@@ -170,9 +179,21 @@ class LeaseEvalStub:
         if ttl_ms < 1 or ttl_ms > 300_000:
             return ["ERR", "COORDINATION_STATE_CORRUPT"]
         if domain == "GRAPH_COMMIT":
+            assert proof_key is not None
+            core_keys = script_keys[:5]
+            if len(args) == 5:
+                status = self._status(core_keys, [scope])
+                return ["OK", "GRAPH_PREFLIGHT", *status[2:]]
+            normalized_expected = tuple(
+                None if value == "__SHAJRA_MISSING_V1__" else value
+                for value in args[5:]
+            )
+            if self._core_raw(core_keys) != normalized_expected:
+                return ["ERR", "COORDINATION_STATE_CORRUPT"]
             confirmed = self.scalars.get(confirmed_key)
             fence = self.scalars.get(fence_key)
-            if confirmed is None or fence is None:
+            proof = self.proofs.get(proof_key)
+            if confirmed is None or fence is None or proof is None:
                 return ["ERR", "COORDINATION_UNINITIALIZED"]
             if self.reservations.intersection({reservation_key}):
                 try:
@@ -337,10 +358,10 @@ class LeaseEvalStub:
         return ["OK", "LEASE_OWNED"]
 
     def _authorize(self, script_keys: list[str], args: list[str]) -> list[object]:
-        if len(script_keys) != 3 or len(args) != 3:
+        if len(script_keys) != 5 or len(args) not in {3, 8}:
             return ["ERR", "COORDINATION_STATE_CORRUPT"]
-        confirmed_key, lock_key, reservation_key = script_keys
-        scope, proposed_raw, expected_lock = args
+        lock_key, fence_key, confirmed_key, reservation_key, proof_key = script_keys
+        scope, proposed_raw, expected_lock = args[:3]
         current_raw = self.reservation_values.get(reservation_key)
         if current_raw is not None:
             try:
@@ -350,6 +371,16 @@ class LeaseEvalStub:
             if current_raw == proposed_raw:
                 return ["OK", "RESERVATION_REPLAYED", current_raw]
             return ["ERR", "RESERVATION_CONFLICT"]
+        if len(args) == 3:
+            status = self._status(script_keys, [scope])
+            return ["OK", "AUTHORIZATION_PREFLIGHT", *status[2:]]
+        normalized_expected = tuple(
+            None if value == "__SHAJRA_MISSING_V1__" else value for value in args[3:]
+        )
+        if self._core_raw(script_keys) != normalized_expected:
+            return ["ERR", "COORDINATION_STATE_CORRUPT"]
+        if self.scalars.get(fence_key) is None or self.proofs.get(proof_key) is None:
+            return ["ERR", "COORDINATION_STATE_CORRUPT"]
         current = self.leases.get(lock_key)
         if current is None or not isinstance(current, GraphLease):
             return ["ERR", "LEASE_LOST"]
@@ -388,9 +419,9 @@ class LeaseEvalStub:
         ]
 
     def _confirm(self, script_keys: list[str], args: list[str]) -> list[object]:
-        if len(script_keys) != 3 or len(args) != 9:
+        if len(script_keys) != 5 or len(args) != 14:
             return ["ERR", "COORDINATION_STATE_CORRUPT"]
-        confirmed_key, reservation_key, proof_key = script_keys
+        _lock_key, _fence_key, confirmed_key, reservation_key, proof_key = script_keys
         (
             scope,
             operation_id,
@@ -401,6 +432,7 @@ class LeaseEvalStub:
             commit_json,
             _nonce_hmac,
             expected_previous,
+            *expected_raw,
         ) = args
         confirmed = int(self.scalars.get(confirmed_key, "-1"))
         proof_raw = self.proofs.get(proof_key)
@@ -429,6 +461,13 @@ class LeaseEvalStub:
                 )
             ):
                 return ["OK", "CONFIRMATION_REPLAYED", proof_raw]
+        current_raw = self._core_raw(script_keys)
+        normalized_expected = tuple(
+            None if value == "__SHAJRA_MISSING_V1__" else value
+            for value in expected_raw
+        )
+        if current_raw != normalized_expected:
+            return ["ERR", "CONFIRMATION_CONFLICT"]
         if int(revision) <= confirmed:
             return ["ERR", "CONFIRMATION_PROOF_EVICTED", str(confirmed)]
         reservation_raw = self.reservation_values.get(reservation_key)
@@ -1211,7 +1250,7 @@ def test_get_status_uses_one_coherent_snapshot_and_validates_ready_and_committin
         "orphan-proof",
         "proof-fence-gap",
         "lock-fence-gap",
-        "reservation-fence-gap",
+        "reservation-fence-ahead",
         "lock-revision-gap",
     ),
 )
@@ -1242,12 +1281,12 @@ def test_get_status_maps_partial_malformed_or_invariant_breaking_state_to_corrup
     elif corruption == "lock-fence-gap":
         lease = graph.acquire("family", 0, "acq")
         redis.scalars[keys.graph_fence("family")] = str(lease.fencing_token + 1)
-    elif corruption == "reservation-fence-gap":
+    elif corruption == "reservation-fence-ahead":
         lease = graph.acquire("family", 0, "acq")
         commit, staged = _commit_values(lease, 1)
         graph.authorize_commit(lease, commit, staged, "authorize")
         redis.advance(16_000)
-        redis.scalars[keys.graph_fence("family")] = str(lease.fencing_token + 1)
+        redis.scalars[keys.graph_fence("family")] = str(lease.fencing_token - 1)
     elif corruption == "lock-revision-gap":
         lease = graph.acquire("family", 0, "acq")
         redis.initialize_graph("family", revision=1, fencing_floor=lease.fencing_token)

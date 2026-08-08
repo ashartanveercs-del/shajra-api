@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from upstash_url import require_canonical_upstash_url
+
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -68,6 +70,7 @@ class Settings(BaseSettings):
             missing = [name for name, value in required.items() if _is_missing(value)]
             if missing:
                 raise ValueError("Missing required settings: " + ", ".join(sorted(missing)))
+            require_canonical_upstash_url(self.upstash_redis_rest_url or "")
             if not re.fullmatch(
                 r"[a-z0-9]+(?:-[a-z0-9]+)*", self.redis_namespace or ""
             ) or not 1 <= len(self.redis_namespace or "") <= 32:

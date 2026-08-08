@@ -85,6 +85,160 @@ end
 local function canonical_positive(value)
   return canonical_nonnegative(value) and value ~= '0'
 end
+local function canonical_increment(value)
+  if not canonical_nonnegative(value) then return nil end
+  local digits = {}
+  local carry = 1
+  for index = #value, 1, -1 do
+    local digit = string.byte(value, index) - 48 + carry
+    if digit >= 10 then digit = digit - 10 carry = 1 else carry = 0 end
+    table.insert(digits, 1, string.char(48 + digit))
+  end
+  if carry == 1 then table.insert(digits, 1, '1') end
+  local result = table.concat(digits)
+  if not canonical_nonnegative(result) then return nil end
+  return result
+end
+local function decimal_compare(left, right)
+  if #left < #right then return -1 end
+  if #left > #right then return 1 end
+  if left < right then return -1 end
+  if left > right then return 1 end
+  return 0
+end
+local function decimal_lte(left, right)
+  return decimal_compare(left, right) <= 0
+end
+local function decimal_add(left, right)
+  if not canonical_nonnegative(left) or not canonical_nonnegative(right) then
+    return nil
+  end
+  local digits = {}
+  local carry = 0
+  local left_index = #left
+  local right_index = #right
+  while left_index >= 1 or right_index >= 1 or carry ~= 0 do
+    local left_digit = left_index >= 1 and string.byte(left, left_index) - 48 or 0
+    local right_digit = right_index >= 1 and string.byte(right, right_index) - 48 or 0
+    local digit = left_digit + right_digit + carry
+    carry = math.floor(digit / 10)
+    table.insert(digits, 1, string.char(48 + (digit % 10)))
+    left_index = left_index - 1
+    right_index = right_index - 1
+  end
+  local result = table.concat(digits)
+  if not canonical_nonnegative(result) then return nil end
+  return result
+end
+local function decimal_subtract(left, right)
+  if not canonical_nonnegative(left) or not canonical_nonnegative(right)
+      or decimal_compare(left, right) < 0 then return nil end
+  local digits = {}
+  local borrow = 0
+  local offset = #left - #right
+  for index = #left, 1, -1 do
+    local right_index = index - offset
+    local right_digit = right_index >= 1 and string.byte(right, right_index) - 48 or 0
+    local digit = string.byte(left, index) - 48 - borrow - right_digit
+    if digit < 0 then digit = digit + 10 borrow = 1 else borrow = 0 end
+    table.insert(digits, 1, string.char(48 + digit))
+  end
+  local result = string.gsub(table.concat(digits), '^0+', '')
+  if result == '' then result = '0' end
+  return result
+end
+local function decimal_times_1000(value)
+  if not canonical_nonnegative(value) then return nil end
+  if value == '0' then return '0' end
+  local result = value .. '000'
+  if not canonical_nonnegative(result) then return nil end
+  return result
+end
+local function decimal_mod_small(value, divisor)
+  if not canonical_nonnegative(value) or type(divisor) ~= 'number'
+      or divisor < 1 or divisor ~= math.floor(divisor) then return nil end
+  local remainder = 0
+  for index = 1, #value do
+    remainder = ((remainder * 10) + string.byte(value, index) - 48) % divisor
+  end
+  return remainder
+end
+local function redis_time_ms(clock)
+  local seconds = tostring(clock[1])
+  local microseconds = tostring(clock[2])
+  if not canonical_nonnegative(seconds) or not canonical_nonnegative(microseconds)
+      or decimal_compare(microseconds, '999999') > 0 then return nil end
+  local seconds_ms = decimal_times_1000(seconds)
+  local millisecond_part = tostring(math.floor(tonumber(microseconds) / 1000))
+  if not seconds_ms then return nil end
+  return decimal_add(seconds_ms, millisecond_part)
+end
+local function valid_digest(value)
+  return type(value) == 'string' and #value == 64
+    and not string.find(value, '[^0-9a-f]')
+end
+local function valid_text(value, maximum)
+  return type(value) == 'string' and value ~= '' and #value <= maximum
+    and not string.find(value, '\0', 1, true)
+end
+local function valid_deployment(value)
+  return type(value) == 'string' and #value >= 1 and #value <= 32
+    and not string.find(value, '[^a-z0-9-]')
+    and string.sub(value, 1, 1) ~= '-'
+    and string.sub(value, -1) ~= '-'
+    and not string.find(value, '--', 1, true)
+end
+local function scope_key_parts(key, domain)
+  if type(key) ~= 'string' then return nil end
+  local tag, deployment, scope_hmac, suffix = string.match(key,
+    '^({sj:v1:([a-z0-9-]+):' .. domain .. ':([0-9a-f]+)}):(.+)$')
+  if not tag or not valid_deployment(deployment) or not valid_digest(scope_hmac)
+      or not valid_text(suffix, 256) then return nil end
+  return tag, scope_hmac, suffix
+end
+local function global_key_parts(key, domain)
+  if type(key) ~= 'string' then return nil end
+  local tag, deployment, suffix = string.match(key,
+    '^({sj:v1:([a-z0-9-]+):' .. domain .. '}):(.+)$')
+  if not tag or not valid_deployment(deployment)
+      or not valid_text(suffix, 256) then return nil end
+  return tag, suffix
+end
+local function digest_suffix(suffix, prefix)
+  if type(suffix) ~= 'string' or string.sub(suffix, 1, #prefix) ~= prefix then
+    return nil
+  end
+  local digest = string.sub(suffix, #prefix + 1)
+  if not valid_digest(digest) then return nil end
+  return digest
+end
+local function graph_core_key_parts(keys)
+  local tag, scope_hmac, suffix = scope_key_parts(keys[1], 'graph')
+  if not tag or suffix ~= 'lock' then return nil end
+  local expected_suffixes = {'fence', 'confirmed-revision', 'commit-reservation',
+    'last-confirmation'}
+  for index = 2, 5 do
+    local other_tag, other_scope_hmac, other_suffix = scope_key_parts(
+      keys[index], 'graph')
+    if other_tag ~= tag or other_scope_hmac ~= scope_hmac
+        or other_suffix ~= expected_suffixes[index - 1] then return nil end
+  end
+  return tag, scope_hmac
+end
+local function ensure_exact_expiry(key, expected)
+  if not canonical_positive(expected) then return false end
+  if decimal_compare(expected, '9007199254740991') > 0 then
+    redis.call('PEXPIREAT', key, expected)
+    return true
+  end
+  local observed = redis.call('PEXPIRETIME', key)
+  local target = tonumber(expected)
+  if observed == -1 or (observed >= 0 and observed < target) then
+    redis.call('PEXPIREAT', key, expected)
+    return true
+  end
+  return observed == target
+end
 local function decode_object(raw)
   local ok, value = pcall(cjson.decode, raw)
   if not ok or type(value) ~= 'table' then return nil end
@@ -189,6 +343,82 @@ local function strict_object(raw, schema, fields)
   if not ok or canonical ~= raw then return nil end
   return value
 end
+local function exact_table(value, schema, fields)
+  if type(value) ~= 'table' or value.schema ~= schema or value.version ~= 1 then
+    return nil
+  end
+  for key, _ in pairs(value) do if not fields[key] then return nil end end
+  for key, _ in pairs(fields) do if value[key] == nil then return nil end end
+  return value
+end
+local function strict_graph_commit(raw)
+  if type(raw) ~= 'string' then return nil end
+  local commit = decode_object(raw)
+  if not commit then return nil end
+  local fields = {operation_id=true,revision=true,fencing_token=true,
+    permit_id=true,semantic_checksum=true,committed_at=true}
+  for key, _ in pairs(commit) do if not fields[key] then return nil end end
+  for key, _ in pairs(fields) do if commit[key] == nil then return nil end end
+  local ok, canonical = pcall(canonical_json, commit)
+  if not ok or canonical ~= raw or not valid_text(commit.operation_id, 512)
+      or type(commit.revision) ~= 'number' or commit.revision < 1
+      or commit.revision ~= math.floor(commit.revision)
+      or type(commit.fencing_token) ~= 'number' or commit.fencing_token < 1
+      or commit.fencing_token ~= math.floor(commit.fencing_token)
+      or not valid_text(commit.permit_id, 512)
+      or not valid_digest(commit.semantic_checksum)
+      or not valid_text(commit.committed_at, 512) then return nil end
+  local revision = string.format('%.0f', commit.revision)
+  local fence = string.format('%.0f', commit.fencing_token)
+  if not canonical_positive(revision) or not canonical_positive(fence) then return nil end
+  return commit, revision, fence
+end
+local function strict_reservation(raw)
+  local reservation = strict_object(raw, 'shajra.commit-reservation', {
+    schema=true,version=true,state=true,scope_hmac=true,permit=true,
+    commit_json=true,commit_sha256=true,staged_write_receipt_json=true,
+    staged_write_receipt_sha256=true,authorization_request_nonce_hmac=true})
+  if not reservation or reservation.state ~= 'COMMITTING'
+      or not valid_digest(reservation.scope_hmac)
+      or not valid_digest(reservation.commit_sha256)
+      or not valid_digest(reservation.staged_write_receipt_sha256)
+      or not valid_digest(reservation.authorization_request_nonce_hmac) then
+    return nil
+  end
+  local permit = exact_table(reservation.permit, 'shajra.commit-permit', {
+    schema=true,version=true,scope=true,operation_id=true,revision=true,
+    fencing_token=true,permit_id=true,commit_sha256=true})
+  if not permit or type(permit.scope) ~= 'string' or permit.scope == ''
+      or type(permit.operation_id) ~= 'string'
+      or string.sub(permit.operation_id, 1, 3) ~= 'op_' or #permit.operation_id <= 3
+      or not canonical_positive(permit.revision)
+      or not canonical_positive(permit.fencing_token)
+      or type(permit.permit_id) ~= 'string'
+      or string.sub(permit.permit_id, 1, 4) ~= 'cpr_' or #permit.permit_id <= 4
+      or not valid_digest(permit.commit_sha256) then return nil end
+  local commit, commit_revision, commit_fence = strict_graph_commit(
+    reservation.commit_json)
+  if not commit then return nil end
+  if not canonical_positive(commit_revision) or not canonical_positive(commit_fence)
+      or permit.operation_id ~= commit.operation_id
+      or permit.revision ~= commit_revision
+      or permit.fencing_token ~= commit_fence
+      or permit.permit_id ~= commit.permit_id
+      or permit.commit_sha256 ~= reservation.commit_sha256 then return nil end
+  if type(reservation.staged_write_receipt_json) ~= 'string' then return nil end
+  local staged = strict_object(reservation.staged_write_receipt_json,
+    'shajra.staged-write-receipt', {schema=true,version=true,operation_id=true,
+      revision=true,fencing_token=true,write_set_json=true,write_set_sha256=true})
+  if not staged or type(staged.operation_id) ~= 'string'
+      or not canonical_positive(staged.revision)
+      or not canonical_positive(staged.fencing_token)
+      or type(staged.write_set_json) ~= 'string'
+      or not valid_digest(staged.write_set_sha256)
+      or staged.operation_id ~= permit.operation_id
+      or staged.revision ~= permit.revision
+      or staged.fencing_token ~= permit.fencing_token then return nil end
+  return reservation, permit, commit, staged
+end
 """
 
 
@@ -199,14 +429,38 @@ GENERIC_ACQUIRE_LUA = (
 if #KEYS ~= 2 or #ARGV ~= 5 or not canonical_positive(ARGV[5]) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
+local lock_tag, key_scope_hmac, lock_suffix = scope_key_parts(KEYS[1], 'generic')
+local receipt_tag, receipt_scope_hmac, receipt_suffix = scope_key_parts(
+  KEYS[2], 'generic')
+local receipt_acquisition_hmac = receipt_suffix
+  and digest_suffix(receipt_suffix, 'lease-result:acquire:')
+if not lock_tag or lock_suffix ~= 'lock' or receipt_tag ~= lock_tag
+    or receipt_scope_hmac ~= key_scope_hmac or not receipt_acquisition_hmac
+    or not valid_digest(ARGV[2]) or not valid_text(ARGV[3], 512)
+    or not valid_text(ARGV[4], 512) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local request = strict_object(ARGV[1], 'shajra.lease-acquire-request', {
+  schema=true,version=true,domain=true,scope_hmac=true,
+  acquisition_id_hmac=true,requested_ttl_ms=true})
+if not request or request.domain ~= 'GENERIC'
+    or request.requested_ttl_ms ~= ARGV[5]
+    or not valid_digest(request.scope_hmac)
+    or not valid_digest(request.acquisition_id_hmac)
+    or request.scope_hmac ~= key_scope_hmac
+    or request.acquisition_id_hmac ~= receipt_acquisition_hmac then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local retained = redis.call('GET', KEYS[2])
 if retained then
   local receipt = strict_object(retained, 'shajra.lease-acquisition-result', {
     schema=true,version=true,input_sha256=true,domain=true,scope_hmac=true,
     acquisition_id_hmac=true,requested_ttl_ms=true,lease=true,
     receipt_expires_at_ms=true})
-  if not receipt or type(receipt.input_sha256) ~= 'string'
+  if not receipt or not valid_digest(receipt.input_sha256)
       or receipt.domain ~= 'GENERIC'
+      or receipt.scope_hmac ~= key_scope_hmac
+      or receipt.acquisition_id_hmac ~= receipt_acquisition_hmac
       or not canonical_positive(receipt.requested_ttl_ms)
       or not canonical_positive(receipt.receipt_expires_at_ms) then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
@@ -220,13 +474,6 @@ local requested_ttl = tonumber(ARGV[5])
 if not requested_ttl or requested_ttl > 300000 then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local request = strict_object(ARGV[1], 'shajra.lease-acquire-request', {
-  schema=true,version=true,domain=true,scope_hmac=true,
-  acquisition_id_hmac=true,requested_ttl_ms=true})
-if not request or request.domain ~= 'GENERIC'
-    or request.requested_ttl_ms ~= ARGV[5] then
-  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
-end
 local current = redis.call('GET', KEYS[1])
 if current then
   local lock = strict_object(current, 'shajra.generic-lock', {
@@ -235,43 +482,68 @@ if current then
     renew_deadline_ms=true})
   local pttl = redis.call('PTTL', KEYS[1])
   if not lock or lock.domain ~= 'GENERIC' or lock.scope_hmac ~= request.scope_hmac
-      or type(lock.acquisition_id_hmac) ~= 'string'
+      or not valid_digest(lock.scope_hmac)
+      or not valid_digest(lock.acquisition_id_hmac)
       or not canonical_positive(lock.expires_at_ms)
       or not canonical_positive(lock.ttl_ms)
       or not canonical_nonnegative(lock.renew_deadline_ms)
       or pttl <= 0 or pttl > tonumber(lock.ttl_ms)
-      or tonumber(lock.expires_at_ms) - tonumber(lock.renew_deadline_ms) ~= 5000 then
+      or decimal_subtract(lock.expires_at_ms, lock.renew_deadline_ms) ~= '5000' then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   return {'ERR', 'LOCK_UNAVAILABLE'}
 end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-local provisional_expires = server_ms + requested_ttl
-local provisional_deadline = provisional_expires - 5000
+local server_ms = redis_time_ms(clock)
+local provisional_expires = server_ms and decimal_add(server_ms, ARGV[5])
+local provisional_deadline = provisional_expires
+  and decimal_subtract(provisional_expires, '5000')
+if not server_ms or not provisional_expires or not provisional_deadline then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local provisional_lock = canonical_json({schema='shajra.generic-lock',version=1,domain='GENERIC',
   scope_hmac=request.scope_hmac,acquisition_id_hmac=request.acquisition_id_hmac,
-  expires_at_ms=tostring(provisional_expires),ttl_ms=ARGV[5],
-  renew_deadline_ms=tostring(provisional_deadline)})
+  expires_at_ms=provisional_expires,ttl_ms=ARGV[5],
+  renew_deadline_ms=provisional_deadline})
 redis.call('SET', KEYS[1], provisional_lock, 'PX', ARGV[5])
 local pttl = redis.call('PTTL', KEYS[1])
+if pttl <= 0 or pttl > requested_ttl then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local pttl_text = tostring(pttl)
-local expires = server_ms + pttl
-local deadline = expires - 5000
+local applied_expiry = redis.call('PEXPIRETIME', KEYS[1])
+local expires = tostring(applied_expiry)
+local deadline = decimal_subtract(expires, '5000')
+if applied_expiry <= 0 or not deadline then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local lock = canonical_json({schema='shajra.generic-lock',version=1,domain='GENERIC',
   scope_hmac=request.scope_hmac,acquisition_id_hmac=request.acquisition_id_hmac,
-  expires_at_ms=tostring(expires),ttl_ms=pttl_text,renew_deadline_ms=tostring(deadline)})
+  expires_at_ms=expires,ttl_ms=pttl_text,renew_deadline_ms=deadline})
 redis.call('SET', KEYS[1], lock, 'KEEPTTL')
+local final_pttl = redis.call('PTTL', KEYS[1])
+local final_expiry = redis.call('PEXPIRETIME', KEYS[1])
+if final_pttl <= 0 or final_pttl > pttl or tostring(final_expiry) ~= expires then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local lease = {schema='shajra.generic-lease',version=1,scope=ARGV[3],
-  acquisition_id=ARGV[4],expires_at_ms=tostring(expires),ttl_ms=pttl_text,
-  renew_deadline_ms=tostring(deadline)}
-local receipt_expires = server_ms + 60000
+  acquisition_id=ARGV[4],expires_at_ms=expires,ttl_ms=pttl_text,
+  renew_deadline_ms=deadline}
+local lease_started = decimal_subtract(expires, pttl_text)
+local receipt_expires = lease_started and decimal_add(lease_started, '60000')
+if not receipt_expires then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local result = canonical_json({schema='shajra.lease-acquisition-result',version=1,
   input_sha256=ARGV[2],domain='GENERIC',scope_hmac=request.scope_hmac,
   acquisition_id_hmac=request.acquisition_id_hmac,requested_ttl_ms=ARGV[5],
-  lease=lease,receipt_expires_at_ms=tostring(receipt_expires)})
+  lease=lease,receipt_expires_at_ms=receipt_expires})
 redis.call('SET', KEYS[2], result)
-redis.call('PEXPIREAT', KEYS[2], tostring(receipt_expires))
+redis.call('PEXPIREAT', KEYS[2], receipt_expires)
 return {'OK', 'LEASE_ACQUIRED', result}
 """
 )
@@ -281,17 +553,44 @@ GRAPH_ACQUIRE_LUA = (
     "-- shajra:graph-acquire:v1\n"
     + _LUA_DECIMAL_VALIDATION
     + r"""
-if #KEYS ~= 5 or #ARGV ~= 5 or not canonical_positive(ARGV[5]) then
+local MISSING = '__SHAJRA_MISSING_V1__'
+if #KEYS ~= 6 or (#ARGV ~= 5 and #ARGV ~= 10)
+    or not canonical_positive(ARGV[5]) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local retained = redis.call('GET', KEYS[5])
+local core_tag, key_scope_hmac = graph_core_key_parts(KEYS)
+local receipt_tag, receipt_scope_hmac, receipt_suffix = scope_key_parts(
+  KEYS[6], 'graph')
+local receipt_acquisition_hmac = receipt_suffix
+  and digest_suffix(receipt_suffix, 'lease-result:acquire:')
+if not core_tag or receipt_tag ~= core_tag
+    or receipt_scope_hmac ~= key_scope_hmac or not receipt_acquisition_hmac
+    or not valid_digest(ARGV[2]) or not valid_text(ARGV[3], 512)
+    or not valid_text(ARGV[4], 512) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local request = strict_object(ARGV[1], 'shajra.lease-acquire-request', {
+  schema=true,version=true,domain=true,scope_hmac=true,
+  acquisition_id_hmac=true,requested_ttl_ms=true,committed_revision=true})
+if not request or request.domain ~= 'GRAPH_COMMIT'
+    or request.requested_ttl_ms ~= ARGV[5]
+    or not canonical_nonnegative(request.committed_revision)
+    or not valid_digest(request.scope_hmac)
+    or not valid_digest(request.acquisition_id_hmac)
+    or request.scope_hmac ~= key_scope_hmac
+    or request.acquisition_id_hmac ~= receipt_acquisition_hmac then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local retained = redis.call('GET', KEYS[6])
 if retained then
   local receipt = strict_object(retained, 'shajra.lease-acquisition-result', {
     schema=true,version=true,input_sha256=true,domain=true,scope_hmac=true,
     acquisition_id_hmac=true,requested_ttl_ms=true,committed_revision=true,
     lease=true,receipt_expires_at_ms=true})
-  if not receipt or type(receipt.input_sha256) ~= 'string'
+  if not receipt or not valid_digest(receipt.input_sha256)
       or receipt.domain ~= 'GRAPH_COMMIT'
+      or receipt.scope_hmac ~= key_scope_hmac
+      or receipt.acquisition_id_hmac ~= receipt_acquisition_hmac
       or not canonical_positive(receipt.requested_ttl_ms)
       or not canonical_nonnegative(receipt.committed_revision)
       or not canonical_positive(receipt.receipt_expires_at_ms) then
@@ -306,41 +605,75 @@ local requested_ttl = tonumber(ARGV[5])
 if not requested_ttl or requested_ttl > 300000 then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local confirmed = redis.call('GET', KEYS[1])
-local fence = redis.call('GET', KEYS[2])
+local current = redis.call('MGET', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+local current_pttl = -2
+if current[1] then current_pttl = redis.call('PTTL', KEYS[1]) end
+if #ARGV == 5 then
+  return {'OK', 'GRAPH_PREFLIGHT', current[3] or '', current[2] or '',
+    current[1] or '', tostring(current_pttl), current[4] or '', current[5] or ''}
+end
+for index = 1, 5 do
+  local expected = ARGV[5 + index]
+  if expected == MISSING then
+    if current[index] then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  elseif not current[index] or current[index] ~= expected then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+end
+local confirmed = current[3]
+local fence = current[2]
 if not confirmed or not fence then return {'ERR', 'COORDINATION_UNINITIALIZED'} end
-if not canonical_nonnegative(confirmed) or not canonical_nonnegative(fence) then
+if not canonical_nonnegative(confirmed) or not canonical_positive(fence) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local request = strict_object(ARGV[1], 'shajra.lease-acquire-request', {
-  schema=true,version=true,domain=true,scope_hmac=true,
-  acquisition_id_hmac=true,requested_ttl_ms=true,committed_revision=true})
-if not request or request.domain ~= 'GRAPH_COMMIT'
-    or request.requested_ttl_ms ~= ARGV[5]
-    or not canonical_nonnegative(request.committed_revision) then
+local proof_raw = current[5]
+local proof = decode_object(proof_raw or '')
+if not proof or type(proof.schema) ~= 'string' then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if proof.schema == 'shajra.confirmed-commit-receipt' then
+  proof = strict_object(proof_raw, 'shajra.confirmed-commit-receipt', {
+    schema=true,version=true,scope_hmac=true,permit=true,commit_json=true,
+    commit_sha256=true,staged_write_receipt_json=true,
+    staged_write_receipt_sha256=true})
+  if not proof or not proof.permit or proof.permit.revision ~= confirmed
+      or proof.scope_hmac ~= key_scope_hmac then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+elseif proof.schema == 'shajra.reconciled-head-receipt' then
+  proof = strict_object(proof_raw, 'shajra.reconciled-head-receipt', {
+    schema=true,version=true,scope_hmac=true,revision=true,
+    semantic_checksum=true,head_commit_sha256=true,evidence_sha256=true,
+    admin_request_nonce_hmac=true,proof_sha256=true})
+  if not proof or proof.revision ~= confirmed or proof.scope_hmac ~= key_scope_hmac then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+else
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
 if confirmed ~= request.committed_revision then
   return {'ERR', 'COORDINATION_REVISION_MISMATCH'}
 end
-local reservation = redis.call('GET', KEYS[4])
+local reservation = current[4]
 if reservation then
-  local decoded_reservation = strict_object(reservation, 'shajra.commit-reservation', {
-    schema=true,version=true,state=true,scope_hmac=true,permit=true,
-    commit_json=true,commit_sha256=true,staged_write_receipt_json=true,
-    staged_write_receipt_sha256=true,authorization_request_nonce_hmac=true})
-  if not decoded_reservation then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  local decoded_reservation, reservation_permit = strict_reservation(reservation)
+  if not decoded_reservation or decoded_reservation.scope_hmac ~= key_scope_hmac
+      or reservation_permit.revision ~= canonical_increment(confirmed)
+      or decimal_compare(reservation_permit.fencing_token, fence) > 0 then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
   return {'ERR', 'COMMIT_RECOVERY_REQUIRED'}
 end
-local current = redis.call('GET', KEYS[3])
-if current then
-  local lock = strict_object(current, 'shajra.graph-lock', {
+local current_lock = current[1]
+if current_lock then
+  local lock = strict_object(current_lock, 'shajra.graph-lock', {
     schema=true,version=true,domain=true,scope_hmac=true,
     acquisition_id_hmac=true,fencing_token=true,base_revision=true,
     expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true})
-  local pttl = redis.call('PTTL', KEYS[3])
+  local pttl = current_pttl
   if not lock or lock.domain ~= 'GRAPH_COMMIT' or lock.scope_hmac ~= request.scope_hmac
-      or type(lock.acquisition_id_hmac) ~= 'string'
+      or not valid_digest(lock.scope_hmac)
+      or not valid_digest(lock.acquisition_id_hmac)
       or not canonical_positive(lock.fencing_token)
       or not canonical_nonnegative(lock.base_revision)
       or not canonical_positive(lock.expires_at_ms)
@@ -348,45 +681,69 @@ if current then
       or not canonical_nonnegative(lock.renew_deadline_ms)
       or lock.fencing_token ~= fence or lock.base_revision ~= confirmed
       or pttl <= 0 or pttl > tonumber(lock.ttl_ms)
-      or tonumber(lock.expires_at_ms) - tonumber(lock.renew_deadline_ms) ~= 5000 then
+      or decimal_subtract(lock.expires_at_ms, lock.renew_deadline_ms) ~= '5000' then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   return {'ERR', 'LOCK_UNAVAILABLE'}
 end
-if fence == I64_MAX then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
-redis.call('INCR', KEYS[2])
-local next_fence = redis.call('GET', KEYS[2])
+local next_fence = canonical_increment(fence)
+if not next_fence then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-local provisional_expires = server_ms + requested_ttl
-local provisional_deadline = provisional_expires - 5000
+local server_ms = redis_time_ms(clock)
+local provisional_expires = server_ms and decimal_add(server_ms, ARGV[5])
+local provisional_deadline = provisional_expires
+  and decimal_subtract(provisional_expires, '5000')
+if not server_ms or not provisional_expires or not provisional_deadline then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local provisional_lock = canonical_json({schema='shajra.graph-lock',version=1,domain='GRAPH_COMMIT',
   scope_hmac=request.scope_hmac,acquisition_id_hmac=request.acquisition_id_hmac,
   fencing_token=next_fence,base_revision=request.committed_revision,
-  expires_at_ms=tostring(provisional_expires),ttl_ms=ARGV[5],
-  renew_deadline_ms=tostring(provisional_deadline)})
-redis.call('SET', KEYS[3], provisional_lock, 'PX', ARGV[5])
-local pttl = redis.call('PTTL', KEYS[3])
+  expires_at_ms=provisional_expires,ttl_ms=ARGV[5],
+  renew_deadline_ms=provisional_deadline})
+redis.call('SET', KEYS[1], provisional_lock, 'PX', ARGV[5])
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl <= 0 or pttl > requested_ttl then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local pttl_text = tostring(pttl)
-local expires = server_ms + pttl
-local deadline = expires - 5000
+local applied_expiry = redis.call('PEXPIRETIME', KEYS[1])
+local expires = tostring(applied_expiry)
+local deadline = decimal_subtract(expires, '5000')
+if applied_expiry <= 0 or not deadline then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local lock = canonical_json({schema='shajra.graph-lock',version=1,domain='GRAPH_COMMIT',
   scope_hmac=request.scope_hmac,acquisition_id_hmac=request.acquisition_id_hmac,
   fencing_token=next_fence,base_revision=request.committed_revision,
-  expires_at_ms=tostring(expires),ttl_ms=pttl_text,renew_deadline_ms=tostring(deadline)})
-redis.call('SET', KEYS[3], lock, 'KEEPTTL')
+  expires_at_ms=expires,ttl_ms=pttl_text,renew_deadline_ms=deadline})
+redis.call('SET', KEYS[1], lock, 'KEEPTTL')
+local final_pttl = redis.call('PTTL', KEYS[1])
+local final_expiry = redis.call('PEXPIRETIME', KEYS[1])
+if final_pttl <= 0 or final_pttl > pttl or tostring(final_expiry) ~= expires then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local lease = {schema='shajra.graph-lease',version=1,scope=ARGV[3],
   acquisition_id=ARGV[4],fencing_token=next_fence,
-  base_revision=request.committed_revision,expires_at_ms=tostring(expires),
-  ttl_ms=pttl_text,renew_deadline_ms=tostring(deadline)}
-local receipt_expires = server_ms + 60000
+  base_revision=request.committed_revision,expires_at_ms=expires,
+  ttl_ms=pttl_text,renew_deadline_ms=deadline}
+local lease_started = decimal_subtract(expires, pttl_text)
+local receipt_expires = lease_started and decimal_add(lease_started, '60000')
+if not receipt_expires then
+  redis.call('DEL', KEYS[1])
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local result = canonical_json({schema='shajra.lease-acquisition-result',version=1,
   input_sha256=ARGV[2],domain='GRAPH_COMMIT',scope_hmac=request.scope_hmac,
   acquisition_id_hmac=request.acquisition_id_hmac,requested_ttl_ms=ARGV[5],
   committed_revision=request.committed_revision,lease=lease,
-  receipt_expires_at_ms=tostring(receipt_expires)})
-redis.call('SET', KEYS[5], result)
-redis.call('PEXPIREAT', KEYS[5], tostring(receipt_expires))
+  receipt_expires_at_ms=receipt_expires})
+redis.call('SET', KEYS[2], next_fence)
+redis.call('SET', KEYS[6], result)
+redis.call('PEXPIREAT', KEYS[6], receipt_expires)
 return {'OK', 'LEASE_ACQUIRED', result}
 """
 )
@@ -399,30 +756,50 @@ LEASE_RENEW_LUA = (
 if #KEYS ~= 2 or #ARGV ~= 6 or not canonical_positive(ARGV[5]) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local retained = redis.call('GET', KEYS[2])
-if retained then
-  local receipt = strict_object(retained, 'shajra.lease-operation-result', {
-    schema=true,version=true,input_sha256=true,method=true,domain=true,
-    scope_hmac=true,acquisition_id_hmac=true,request_nonce_hmac=true,
-    result=true,receipt_expires_at_ms=true})
-  if not receipt or type(receipt.input_sha256) ~= 'string'
-      or receipt.method ~= 'renew'
-      or not canonical_positive(receipt.receipt_expires_at_ms) then
-    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
-  end
-  if receipt.input_sha256 == ARGV[2] then
-    return {'OK', 'LEASE_RENEW_REPLAYED', retained}
-  end
-  return {'ERR', 'NONCE_REUSE_CONFLICT'}
-end
 local request = strict_object(ARGV[1], 'shajra.lease-operation-request', {
   schema=true,version=true,method=true,domain=true,scope_hmac=true,
   acquisition_id_hmac=true,request_nonce_hmac=true,lock_sha256=true,
   requested_ttl_ms=true})
 if not request or request.method ~= 'renew'
     or (request.domain ~= 'GENERIC' and request.domain ~= 'GRAPH_COMMIT')
-    or request.requested_ttl_ms ~= ARGV[5] then
+    or request.requested_ttl_ms ~= ARGV[5]
+    or not decimal_lte(ARGV[5], '300000')
+    or not valid_digest(ARGV[2]) or not valid_digest(request.scope_hmac)
+    or not valid_digest(request.acquisition_id_hmac)
+    or not valid_digest(request.request_nonce_hmac)
+    or not valid_digest(request.lock_sha256)
+    or not valid_text(ARGV[3], 512) or not valid_text(ARGV[4], 512) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local key_domain = request.domain == 'GENERIC' and 'generic' or 'graph'
+local lock_tag, key_scope_hmac, lock_suffix = scope_key_parts(KEYS[1], key_domain)
+local receipt_tag, receipt_scope_hmac, receipt_suffix = scope_key_parts(
+  KEYS[2], key_domain)
+local receipt_nonce_hmac = receipt_suffix
+  and digest_suffix(receipt_suffix, 'lease-result:operation:')
+if not lock_tag or lock_suffix ~= 'lock' or receipt_tag ~= lock_tag
+    or receipt_scope_hmac ~= key_scope_hmac or not receipt_nonce_hmac
+    or request.scope_hmac ~= key_scope_hmac
+    or request.request_nonce_hmac ~= receipt_nonce_hmac then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local retained = redis.call('GET', KEYS[2])
+if retained then
+  local receipt = strict_object(retained, 'shajra.lease-operation-result', {
+    schema=true,version=true,input_sha256=true,method=true,domain=true,
+    scope_hmac=true,acquisition_id_hmac=true,request_nonce_hmac=true,
+    result=true,receipt_expires_at_ms=true})
+  if not receipt or not valid_digest(receipt.input_sha256)
+      or receipt.domain ~= request.domain
+      or receipt.scope_hmac ~= key_scope_hmac
+      or receipt.acquisition_id_hmac ~= request.acquisition_id_hmac
+      or receipt.request_nonce_hmac ~= receipt_nonce_hmac
+      or not canonical_positive(receipt.receipt_expires_at_ms) then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+  if receipt.input_sha256 ~= ARGV[2] then return {'ERR', 'NONCE_REUSE_CONFLICT'} end
+  if receipt.method ~= 'renew' then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  return {'OK', 'LEASE_RENEW_REPLAYED', retained}
 end
 local current = redis.call('GET', KEYS[1])
 local current_pttl = redis.call('PTTL', KEYS[1])
@@ -439,43 +816,99 @@ else
     acquisition_id_hmac=true,fencing_token=true,base_revision=true,
     expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true})
 end
-if not lock_value then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if not lock_value or lock_value.domain ~= request.domain
+    or lock_value.scope_hmac ~= request.scope_hmac
+    or lock_value.acquisition_id_hmac ~= request.acquisition_id_hmac
+    or not valid_digest(lock_value.scope_hmac)
+    or not valid_digest(lock_value.acquisition_id_hmac)
+    or not canonical_positive(lock_value.expires_at_ms)
+    or not canonical_positive(lock_value.ttl_ms)
+    or not decimal_lte(lock_value.ttl_ms, '300000')
+    or not canonical_nonnegative(lock_value.renew_deadline_ms)
+    or decimal_subtract(lock_value.expires_at_ms,
+      lock_value.renew_deadline_ms) ~= '5000'
+    or current_pttl > tonumber(lock_value.ttl_ms) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if request.domain == 'GRAPH_COMMIT'
+    and (not canonical_positive(lock_value.fencing_token)
+      or not canonical_nonnegative(lock_value.base_revision)) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 if current ~= ARGV[6] then return {'ERR', 'LEASE_LOST'} end
+local original_expires_at_ms = redis.call('PEXPIRETIME', KEYS[1])
+if original_expires_at_ms <= 0
+    or tostring(original_expires_at_ms) ~= lock_value.expires_at_ms then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local function restore_original_lock()
+  redis.call('SET', KEYS[1], current)
+  redis.call('PEXPIREAT', KEYS[1], tostring(original_expires_at_ms))
+end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
+local server_ms = redis_time_ms(clock)
+if not server_ms then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if decimal_lte(lock_value.renew_deadline_ms, server_ms) then
+  return {'ERR', 'LEASE_LOST'}
+end
 local requested_ttl = tonumber(ARGV[5])
 if not requested_ttl or requested_ttl > 300000 then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local provisional_expires = server_ms + requested_ttl
-lock_value.expires_at_ms = tostring(provisional_expires)
+local provisional_expires = decimal_add(server_ms, ARGV[5])
+local provisional_deadline = provisional_expires
+  and decimal_subtract(provisional_expires, '5000')
+if not provisional_expires or not provisional_deadline then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+lock_value.expires_at_ms = provisional_expires
 lock_value.ttl_ms = ARGV[5]
-lock_value.renew_deadline_ms = tostring(provisional_expires - 5000)
+lock_value.renew_deadline_ms = provisional_deadline
 redis.call('SET', KEYS[1], canonical_json(lock_value), 'PX', ARGV[5])
 local pttl = redis.call('PTTL', KEYS[1])
+if pttl <= 0 or pttl > requested_ttl then
+  restore_original_lock()
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local pttl_text = tostring(pttl)
-local expires = server_ms + pttl
-local deadline = expires - 5000
-lock_value.expires_at_ms = tostring(expires)
+local applied_expiry = redis.call('PEXPIRETIME', KEYS[1])
+local expires = tostring(applied_expiry)
+local deadline = decimal_subtract(expires, '5000')
+if applied_expiry <= 0 or not deadline then
+  restore_original_lock()
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+lock_value.expires_at_ms = expires
 lock_value.ttl_ms = pttl_text
-lock_value.renew_deadline_ms = tostring(deadline)
+lock_value.renew_deadline_ms = deadline
 local next_lock = canonical_json(lock_value)
 redis.call('SET', KEYS[1], next_lock, 'KEEPTTL')
+local final_pttl = redis.call('PTTL', KEYS[1])
+local final_expiry = redis.call('PEXPIRETIME', KEYS[1])
+if final_pttl <= 0 or final_pttl > pttl or tostring(final_expiry) ~= expires then
+  restore_original_lock()
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local lease = {schema=(request.domain == 'GENERIC' and 'shajra.generic-lease' or 'shajra.graph-lease'),
-  version=1,scope=ARGV[3],acquisition_id=ARGV[4],expires_at_ms=tostring(expires),
-  ttl_ms=pttl_text,renew_deadline_ms=tostring(deadline)}
+  version=1,scope=ARGV[3],acquisition_id=ARGV[4],expires_at_ms=expires,
+  ttl_ms=pttl_text,renew_deadline_ms=deadline}
 if request.domain == 'GRAPH_COMMIT' then
   lease.fencing_token=lock_value.fencing_token
   lease.base_revision=lock_value.base_revision
 end
-local receipt_expires = server_ms + 60000
+local lease_started = decimal_subtract(expires, pttl_text)
+local receipt_expires = lease_started and decimal_add(lease_started, '60000')
+if not receipt_expires then
+  restore_original_lock()
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local result = canonical_json({schema='shajra.lease-operation-result',version=1,
   input_sha256=ARGV[2],method='renew',domain=request.domain,
   scope_hmac=request.scope_hmac,acquisition_id_hmac=request.acquisition_id_hmac,
   request_nonce_hmac=request.request_nonce_hmac,result=lease,
-  receipt_expires_at_ms=tostring(receipt_expires)})
+  receipt_expires_at_ms=receipt_expires})
 redis.call('SET', KEYS[2], result)
-redis.call('PEXPIREAT', KEYS[2], tostring(receipt_expires))
+redis.call('PEXPIREAT', KEYS[2], receipt_expires)
 return {'OK', 'LEASE_RENEWED', result}
 """
 )
@@ -486,28 +919,47 @@ LEASE_RELEASE_LUA = (
     + _LUA_DECIMAL_VALIDATION
     + r"""
 if #KEYS ~= 2 or #ARGV ~= 5 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+local request = strict_object(ARGV[1], 'shajra.lease-operation-request', {
+  schema=true,version=true,method=true,domain=true,scope_hmac=true,
+  acquisition_id_hmac=true,request_nonce_hmac=true,lock_sha256=true})
+if not request or request.method ~= 'release'
+    or (request.domain ~= 'GENERIC' and request.domain ~= 'GRAPH_COMMIT')
+    or not valid_digest(ARGV[2]) or not valid_digest(request.scope_hmac)
+    or not valid_digest(request.acquisition_id_hmac)
+    or not valid_digest(request.request_nonce_hmac)
+    or not valid_digest(request.lock_sha256)
+    or not valid_text(ARGV[3], 512) or not valid_text(ARGV[4], 512) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local key_domain = request.domain == 'GENERIC' and 'generic' or 'graph'
+local lock_tag, key_scope_hmac, lock_suffix = scope_key_parts(KEYS[1], key_domain)
+local receipt_tag, receipt_scope_hmac, receipt_suffix = scope_key_parts(
+  KEYS[2], key_domain)
+local receipt_nonce_hmac = receipt_suffix
+  and digest_suffix(receipt_suffix, 'lease-result:operation:')
+if not lock_tag or lock_suffix ~= 'lock' or receipt_tag ~= lock_tag
+    or receipt_scope_hmac ~= key_scope_hmac or not receipt_nonce_hmac
+    or request.scope_hmac ~= key_scope_hmac
+    or request.request_nonce_hmac ~= receipt_nonce_hmac then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local retained = redis.call('GET', KEYS[2])
 if retained then
   local receipt = strict_object(retained, 'shajra.lease-operation-result', {
     schema=true,version=true,input_sha256=true,method=true,domain=true,
     scope_hmac=true,acquisition_id_hmac=true,request_nonce_hmac=true,
     result=true,receipt_expires_at_ms=true})
-  if not receipt or type(receipt.input_sha256) ~= 'string'
-      or receipt.method ~= 'release'
+  if not receipt or not valid_digest(receipt.input_sha256)
+      or receipt.domain ~= request.domain
+      or receipt.scope_hmac ~= key_scope_hmac
+      or receipt.acquisition_id_hmac ~= request.acquisition_id_hmac
+      or receipt.request_nonce_hmac ~= receipt_nonce_hmac
       or not canonical_positive(receipt.receipt_expires_at_ms) then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
-  if receipt.input_sha256 == ARGV[2] then
-    return {'OK', 'LEASE_RELEASE_REPLAYED', retained}
-  end
-  return {'ERR', 'NONCE_REUSE_CONFLICT'}
-end
-local request = strict_object(ARGV[1], 'shajra.lease-operation-request', {
-  schema=true,version=true,method=true,domain=true,scope_hmac=true,
-  acquisition_id_hmac=true,request_nonce_hmac=true,lock_sha256=true})
-if not request or request.method ~= 'release'
-    or (request.domain ~= 'GENERIC' and request.domain ~= 'GRAPH_COMMIT') then
-  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  if receipt.input_sha256 ~= ARGV[2] then return {'ERR', 'NONCE_REUSE_CONFLICT'} end
+  if receipt.method ~= 'release' then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  return {'OK', 'LEASE_RELEASE_REPLAYED', retained}
 end
 local current = redis.call('GET', KEYS[1])
 local pttl = redis.call('PTTL', KEYS[1])
@@ -527,99 +979,232 @@ end
 if not lock_value then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
 if current ~= ARGV[5] then return {'ERR', 'LEASE_LOST'} end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-local receipt_expires = server_ms + 60000
+local server_ms = redis_time_ms(clock)
+local receipt_expires = server_ms and decimal_add(server_ms, '60000')
+if not server_ms or not receipt_expires then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local release = {schema='shajra.lease-release-result',version=1,
-  code='LEASE_RELEASED',acquisition_id=ARGV[4],released_at_ms=tostring(server_ms)}
+  code='LEASE_RELEASED',acquisition_id=ARGV[4],released_at_ms=server_ms}
 local result = canonical_json({schema='shajra.lease-operation-result',version=1,
   input_sha256=ARGV[2],method='release',domain=request.domain,
   scope_hmac=request.scope_hmac,acquisition_id_hmac=request.acquisition_id_hmac,
   request_nonce_hmac=request.request_nonce_hmac,result=release,
-  receipt_expires_at_ms=tostring(receipt_expires)})
+  receipt_expires_at_ms=receipt_expires})
 redis.call('DEL', KEYS[1])
-redis.call('SET', KEYS[2], result)
-redis.call('PEXPIREAT', KEYS[2], tostring(receipt_expires))
+redis.call('SET', KEYS[2], result, 'PXAT', receipt_expires)
 return {'OK', 'LEASE_RELEASED', result}
 """
 )
 
 
-LEASE_ASSERT_LUA = r"""-- shajra:lease-assert:v1
+LEASE_ASSERT_LUA = (
+    "-- shajra:lease-assert:v1\n"
+    + _LUA_DECIMAL_VALIDATION
+    + r"""
 if #KEYS ~= 1 or #ARGV ~= 3 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+local tag, key_scope_hmac, suffix = scope_key_parts(KEYS[1], 'generic')
+local domain = 'GENERIC'
+if not tag then
+  tag, key_scope_hmac, suffix = scope_key_parts(KEYS[1], 'graph')
+  domain = 'GRAPH_COMMIT'
+end
+if not tag or suffix ~= 'lock' or not valid_text(ARGV[1], 512)
+    or not valid_text(ARGV[2], 512) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local fields = {schema=true,version=true,domain=true,scope_hmac=true,
+  acquisition_id_hmac=true,expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true}
+local schema = 'shajra.generic-lock'
+if domain == 'GRAPH_COMMIT' then
+  fields.fencing_token = true
+  fields.base_revision = true
+  schema = 'shajra.graph-lock'
+end
+local expected = strict_object(ARGV[3], schema, fields)
+if not expected or expected.domain ~= domain or expected.scope_hmac ~= key_scope_hmac
+    or not valid_digest(expected.scope_hmac)
+    or not valid_digest(expected.acquisition_id_hmac)
+    or not canonical_positive(expected.expires_at_ms)
+    or not canonical_positive(expected.ttl_ms)
+    or not canonical_nonnegative(expected.renew_deadline_ms)
+    or decimal_subtract(expected.expires_at_ms,
+      expected.renew_deadline_ms) ~= '5000'
+    or (domain == 'GRAPH_COMMIT' and (not canonical_positive(expected.fencing_token)
+      or not canonical_nonnegative(expected.base_revision))) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local current = redis.call('GET', KEYS[1])
 local pttl = redis.call('PTTL', KEYS[1])
 if not current or current ~= ARGV[3] or pttl <= 0 then return {'ERR', 'LEASE_LOST'} end
 return {'OK', 'LEASE_OWNED'}
 """
+)
 
 
 AUTHORIZE_COMMIT_LUA = (
     "-- shajra:commit-authorize:v1\n"
     + _LUA_DECIMAL_VALIDATION
     + r"""
-if #KEYS ~= 3 or #ARGV ~= 3 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
-local retained = redis.call('GET', KEYS[3])
+local MISSING = '__SHAJRA_MISSING_V1__'
+if #KEYS ~= 5 or (#ARGV ~= 3 and #ARGV ~= 8) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local core_tag, key_scope_hmac = graph_core_key_parts(KEYS)
+local proposed, proposed_permit = strict_reservation(ARGV[2])
+local expected_lock = strict_object(ARGV[3], 'shajra.graph-lock', {
+  schema=true,version=true,domain=true,scope_hmac=true,
+  acquisition_id_hmac=true,fencing_token=true,base_revision=true,
+  expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true})
+if not core_tag or not valid_text(ARGV[1], 512) or not proposed
+    or proposed.scope_hmac ~= key_scope_hmac
+    or proposed_permit.scope ~= ARGV[1]
+    or not expected_lock or expected_lock.domain ~= 'GRAPH_COMMIT'
+    or expected_lock.scope_hmac ~= key_scope_hmac
+    or not valid_digest(expected_lock.scope_hmac)
+    or not valid_digest(expected_lock.acquisition_id_hmac)
+    or not canonical_positive(expected_lock.fencing_token)
+    or not canonical_nonnegative(expected_lock.base_revision)
+    or not canonical_positive(expected_lock.expires_at_ms)
+    or not canonical_positive(expected_lock.ttl_ms)
+    or not canonical_nonnegative(expected_lock.renew_deadline_ms)
+    or decimal_subtract(expected_lock.expires_at_ms,
+      expected_lock.renew_deadline_ms) ~= '5000' then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local retained = redis.call('GET', KEYS[4])
 if retained then
-  local reservation = strict_object(retained, 'shajra.commit-reservation', {
-    schema=true,version=true,state=true,scope_hmac=true,permit=true,
-    commit_json=true,commit_sha256=true,staged_write_receipt_json=true,
-    staged_write_receipt_sha256=true,authorization_request_nonce_hmac=true})
+  local reservation = strict_reservation(retained)
   if not reservation then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   if retained == ARGV[2] then return {'OK', 'RESERVATION_REPLAYED', retained} end
   return {'ERR', 'RESERVATION_CONFLICT'}
 end
-local confirmed = redis.call('GET', KEYS[1])
+local current = redis.call('MGET', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+local current_pttl = -2
+if current[1] then current_pttl = redis.call('PTTL', KEYS[1]) end
+if #ARGV == 3 then
+  return {'OK', 'AUTHORIZATION_PREFLIGHT', current[3] or '', current[2] or '',
+    current[1] or '', tostring(current_pttl), current[4] or '', current[5] or ''}
+end
+for index = 1, 5 do
+  local expected = ARGV[3 + index]
+  if expected == MISSING then
+    if current[index] then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  elseif not current[index] or current[index] ~= expected then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+end
+local confirmed = current[3]
+local fence = current[2]
 if not confirmed then return {'ERR', 'COORDINATION_UNINITIALIZED'} end
-if not canonical_nonnegative(confirmed) then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
-local lock = redis.call('GET', KEYS[2])
-local pttl = redis.call('PTTL', KEYS[2])
+if not fence or not canonical_nonnegative(confirmed) or not canonical_positive(fence) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local proof_raw = current[5]
+local proof = decode_object(proof_raw or '')
+if not proof or type(proof.schema) ~= 'string' then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if proof.schema == 'shajra.confirmed-commit-receipt' then
+  proof = strict_object(proof_raw, 'shajra.confirmed-commit-receipt', {
+    schema=true,version=true,scope_hmac=true,permit=true,commit_json=true,
+    commit_sha256=true,staged_write_receipt_json=true,
+    staged_write_receipt_sha256=true})
+  if not proof or not proof.permit or proof.permit.revision ~= confirmed then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+elseif proof.schema == 'shajra.reconciled-head-receipt' then
+  proof = strict_object(proof_raw, 'shajra.reconciled-head-receipt', {
+    schema=true,version=true,scope_hmac=true,revision=true,
+    semantic_checksum=true,head_commit_sha256=true,evidence_sha256=true,
+    admin_request_nonce_hmac=true,proof_sha256=true})
+  if not proof or proof.revision ~= confirmed then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+else
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if proof.scope_hmac ~= key_scope_hmac or not valid_digest(proof.scope_hmac) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local lock = current[1]
+local pttl = current_pttl
 if not lock or pttl <= 0 then return {'ERR', 'LEASE_LOST'} end
 local lock_value = strict_object(lock, 'shajra.graph-lock', {
   schema=true,version=true,domain=true,scope_hmac=true,
   acquisition_id_hmac=true,fencing_token=true,base_revision=true,
   expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true})
-if not lock_value then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
-if lock ~= ARGV[3] then return {'ERR', 'LEASE_LOST'} end
-local proposed = strict_object(ARGV[2], 'shajra.commit-reservation', {
-  schema=true,version=true,state=true,scope_hmac=true,permit=true,
-  commit_json=true,commit_sha256=true,staged_write_receipt_json=true,
-  staged_write_receipt_sha256=true,authorization_request_nonce_hmac=true})
-if not proposed or proposed.state ~= 'COMMITTING'
-    or lock_value.base_revision ~= confirmed
-    or proposed.scope_hmac ~= lock_value.scope_hmac then
+if not lock_value or lock_value.domain ~= 'GRAPH_COMMIT'
+    or lock_value.scope_hmac ~= key_scope_hmac
+    or not valid_digest(lock_value.scope_hmac)
+    or not valid_digest(lock_value.acquisition_id_hmac)
+    or not canonical_positive(lock_value.fencing_token)
+    or not canonical_nonnegative(lock_value.base_revision)
+    or not canonical_positive(lock_value.expires_at_ms)
+    or not canonical_positive(lock_value.ttl_ms)
+    or not canonical_nonnegative(lock_value.renew_deadline_ms)
+    or decimal_subtract(lock_value.expires_at_ms,
+      lock_value.renew_deadline_ms) ~= '5000'
+    or pttl > tonumber(lock_value.ttl_ms) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-redis.call('SET', KEYS[3], ARGV[2])
+if lock ~= ARGV[3] then return {'ERR', 'LEASE_LOST'} end
+if not proposed
+    or lock_value.base_revision ~= confirmed
+    or lock_value.fencing_token ~= fence
+    or proposed.scope_hmac ~= lock_value.scope_hmac
+    or proposed_permit.fencing_token ~= lock_value.fencing_token then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if canonical_increment(confirmed) ~= proposed_permit.revision then
+  return {'ERR', 'RESERVATION_CONFLICT'}
+end
+redis.call('SET', KEYS[4], ARGV[2])
 return {'OK', 'RESERVATION_CREATED', ARGV[2]}
 """
 )
 
 
-COORDINATION_STATUS_LUA = r"""-- shajra:coordination-status:v1
+COORDINATION_STATUS_LUA = (
+    "-- shajra:coordination-status:v1\n"
+    + _LUA_DECIMAL_VALIDATION
+    + r"""
 if #KEYS ~= 5 or #ARGV ~= 1 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if not graph_core_key_parts(KEYS) or not valid_text(ARGV[1], 512) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local values = redis.call('MGET', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
 local pttl = -2
 if values[1] then pttl = redis.call('PTTL', KEYS[1]) end
 return {'OK', 'STATUS', values[3] or '', values[2] or '', values[1] or '',
   tostring(pttl), values[4] or '', values[5] or ''}
 """
+)
 
 
 CONFIRM_COMMIT_LUA = (
     "-- shajra:commit-confirm:v1\n"
     + _LUA_DECIMAL_VALIDATION
     + r"""
-if #KEYS ~= 3 or #ARGV ~= 9 or not canonical_positive(ARGV[3])
+local MISSING = '__SHAJRA_MISSING_V1__'
+if #KEYS ~= 5 or #ARGV ~= 14 or not canonical_positive(ARGV[3])
     or not canonical_positive(ARGV[4]) or not canonical_nonnegative(ARGV[9]) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local confirmed = redis.call('GET', KEYS[1])
-if not confirmed or not canonical_nonnegative(confirmed) then
-  return {'ERR', 'COORDINATION_UNINITIALIZED'}
+local core_tag, key_scope_hmac = graph_core_key_parts(KEYS)
+local requested_commit, requested_revision, requested_fence = strict_graph_commit(
+  ARGV[7])
+if not core_tag or not valid_text(ARGV[1], 512)
+    or not valid_text(ARGV[2], 512) or not valid_text(ARGV[5], 512)
+    or not valid_digest(ARGV[6]) or not valid_digest(ARGV[8])
+    or not requested_commit or requested_commit.operation_id ~= ARGV[2]
+    or requested_revision ~= ARGV[3] or requested_fence ~= ARGV[4]
+    or requested_commit.permit_id ~= ARGV[5] then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local proof_raw = redis.call('GET', KEYS[3])
+local proof_raw = redis.call('GET', KEYS[5])
 if proof_raw then
   local decoded = decode_object(proof_raw)
   if not decoded or type(decoded.schema) ~= 'string' then
@@ -637,7 +1222,10 @@ if proof_raw then
       semantic_checksum=true,head_commit_sha256=true,evidence_sha256=true,
       admin_request_nonce_hmac=true,proof_sha256=true})
   end
-  if not proof then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  if not proof or proof.scope_hmac ~= key_scope_hmac
+      or not valid_digest(proof.scope_hmac) then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
   if proof.schema == 'shajra.confirmed-commit-receipt' and proof.permit
       and proof.permit.operation_id == ARGV[2]
       and proof.permit.revision == ARGV[3]
@@ -647,26 +1235,93 @@ if proof_raw then
     return {'OK', 'CONFIRMATION_REPLAYED', proof_raw}
   end
 end
-local function decimal_lte(left, right)
-  if #left ~= #right then return #left < #right end
-  return left <= right
+local current = redis.call('MGET', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+for index = 1, 5 do
+  local expected = ARGV[9 + index]
+  if expected == MISSING then
+    if current[index] then return {'ERR', 'CONFIRMATION_CONFLICT'} end
+  elseif not current[index] or current[index] ~= expected then
+    return {'ERR', 'CONFIRMATION_CONFLICT'}
+  end
+end
+local confirmed = current[3]
+if not confirmed or not canonical_nonnegative(confirmed) then
+  return {'ERR', 'COORDINATION_UNINITIALIZED'}
+end
+local fence = current[2]
+if not fence or not canonical_positive(fence) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local core_proof_raw = current[5]
+local core_proof = decode_object(core_proof_raw or '')
+if not core_proof or type(core_proof.schema) ~= 'string' then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if core_proof.schema == 'shajra.confirmed-commit-receipt' then
+  core_proof = strict_object(core_proof_raw, 'shajra.confirmed-commit-receipt', {
+    schema=true,version=true,scope_hmac=true,permit=true,commit_json=true,
+    commit_sha256=true,staged_write_receipt_json=true,
+    staged_write_receipt_sha256=true})
+  if not core_proof or not core_proof.permit
+      or core_proof.permit.revision ~= confirmed
+      or not canonical_positive(core_proof.permit.fencing_token)
+      or decimal_compare(core_proof.permit.fencing_token, fence) > 0 then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+elseif core_proof.schema == 'shajra.reconciled-head-receipt' then
+  core_proof = strict_object(core_proof_raw, 'shajra.reconciled-head-receipt', {
+    schema=true,version=true,scope_hmac=true,revision=true,
+    semantic_checksum=true,head_commit_sha256=true,evidence_sha256=true,
+    admin_request_nonce_hmac=true,proof_sha256=true})
+  if not core_proof or core_proof.revision ~= confirmed then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
+else
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if core_proof.scope_hmac ~= key_scope_hmac
+    or not valid_digest(core_proof.scope_hmac) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local lock_raw = current[1]
+if lock_raw then
+  local lock = strict_object(lock_raw, 'shajra.graph-lock', {
+    schema=true,version=true,domain=true,scope_hmac=true,
+    acquisition_id_hmac=true,fencing_token=true,base_revision=true,
+    expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true})
+  local lock_pttl = redis.call('PTTL', KEYS[1])
+  if not lock or lock.domain ~= 'GRAPH_COMMIT' or lock.scope_hmac ~= key_scope_hmac
+      or not valid_digest(lock.acquisition_id_hmac)
+      or lock.fencing_token ~= fence or lock.base_revision ~= confirmed
+      or not canonical_positive(lock.ttl_ms) or lock_pttl <= 0
+      or lock_pttl > tonumber(lock.ttl_ms)
+      or decimal_subtract(lock.expires_at_ms,
+        lock.renew_deadline_ms) ~= '5000' then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
 end
 if decimal_lte(ARGV[3], confirmed) then
   return {'ERR', 'CONFIRMATION_PROOF_EVICTED', confirmed}
 end
-local reservation_raw = redis.call('GET', KEYS[2])
+if canonical_increment(confirmed) ~= ARGV[3] or confirmed ~= ARGV[9] then
+  return {'ERR', 'CONFIRMATION_CONFLICT'}
+end
+local reservation_raw = current[4]
 if not reservation_raw then return {'ERR', 'CONFIRMATION_CONFLICT'} end
-local reservation = strict_object(reservation_raw, 'shajra.commit-reservation', {
-  schema=true,version=true,state=true,scope_hmac=true,permit=true,
-  commit_json=true,commit_sha256=true,staged_write_receipt_json=true,
-  staged_write_receipt_sha256=true,authorization_request_nonce_hmac=true})
-if not reservation or not reservation.permit
-    or reservation.permit.operation_id ~= ARGV[2]
-    or reservation.permit.revision ~= ARGV[3]
-    or reservation.permit.fencing_token ~= ARGV[4]
-    or reservation.permit.permit_id ~= ARGV[5]
+local reservation, reservation_permit = strict_reservation(reservation_raw)
+if not reservation or reservation.scope_hmac ~= key_scope_hmac then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if decimal_compare(reservation_permit.fencing_token, fence) > 0 then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if reservation_permit.operation_id ~= ARGV[2]
+    or reservation_permit.revision ~= ARGV[3]
+    or reservation_permit.fencing_token ~= ARGV[4]
+    or reservation_permit.permit_id ~= ARGV[5]
+    or reservation_permit.commit_sha256 ~= ARGV[6]
     or reservation.commit_sha256 ~= ARGV[6]
-    or confirmed ~= ARGV[9] then
+    or reservation.commit_json ~= ARGV[7] then
   return {'ERR', 'CONFIRMATION_CONFLICT'}
 end
 local proof = canonical_json({schema='shajra.confirmed-commit-receipt',version=1,
@@ -674,20 +1329,27 @@ local proof = canonical_json({schema='shajra.confirmed-commit-receipt',version=1
   commit_json=reservation.commit_json,commit_sha256=reservation.commit_sha256,
   staged_write_receipt_json=reservation.staged_write_receipt_json,
   staged_write_receipt_sha256=reservation.staged_write_receipt_sha256})
-redis.call('SET', KEYS[1], ARGV[3])
-redis.call('SET', KEYS[3], proof)
-redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[5], proof)
+redis.call('DEL', KEYS[4])
 return {'OK', 'CONFIRMED', proof}
 """
 )
 
 
-COORDINATION_INSPECT_LUA = r"""-- shajra:coordination-inspect:v1
+COORDINATION_INSPECT_LUA = (
+    "-- shajra:coordination-inspect:v1\n"
+    + _LUA_DECIMAL_VALIDATION
+    + r"""
 if #KEYS ~= 5 or #ARGV ~= 1 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if not graph_core_key_parts(KEYS) or not valid_text(ARGV[1], 512) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local values = redis.call('MGET', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
 return {'OK', 'INSPECTION', values[1] or '', values[2] or '', values[3] or '',
   values[4] or '', values[5] or ''}
 """
+)
 
 
 COORDINATION_ADMIN_LUA = (
@@ -699,6 +1361,64 @@ if #KEYS ~= 6 or #ARGV ~= 17 or not canonical_nonnegative(ARGV[9])
     or not canonical_positive(ARGV[10]) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
+local core_tag, key_scope_hmac = graph_core_key_parts(KEYS)
+local receipt_tag, receipt_scope_hmac, receipt_suffix = scope_key_parts(
+  KEYS[6], 'graph')
+local receipt_nonce_hmac = receipt_suffix
+  and digest_suffix(receipt_suffix, 'admin-result:')
+local request = strict_object(ARGV[1], 'shajra.coordination-admin-request', {
+  schema=true,version=true,method=true,scope_hmac=true,evidence_sha256=true,
+  expected_state_sha256=true})
+local evidence = strict_object(ARGV[3], 'shajra.coordination-evidence', {
+  schema=true,version=true,scope=true,committed_head_revision=true,
+  committed_head_semantic_checksum=true,committed_head_commit_sha256=true,
+  max_durable_fencing_token=true,fencing_floor=true,evidence_sha256=true})
+local proof = strict_object(ARGV[7], 'shajra.reconciled-head-receipt', {
+  schema=true,version=true,scope_hmac=true,revision=true,semantic_checksum=true,
+  head_commit_sha256=true,evidence_sha256=true,admin_request_nonce_hmac=true,
+  proof_sha256=true})
+if not core_tag or receipt_tag ~= core_tag
+    or receipt_scope_hmac ~= key_scope_hmac or not receipt_nonce_hmac
+    or not valid_digest(ARGV[2]) or not valid_digest(ARGV[4])
+    or not valid_digest(ARGV[8]) or not valid_digest(ARGV[17])
+    or not valid_text(ARGV[5], 512) or not valid_text(ARGV[6], 512)
+    or (ARGV[11] ~= 'initialize' and ARGV[11] ~= 'reconcile')
+    or not request or request.method ~= ARGV[11]
+    or request.scope_hmac ~= key_scope_hmac
+    or request.evidence_sha256 ~= (evidence and evidence.evidence_sha256)
+    or request.expected_state_sha256 ~= ARGV[4]
+    or not valid_digest(request.scope_hmac)
+    or not valid_digest(request.evidence_sha256)
+    or not valid_digest(request.expected_state_sha256)
+    or not evidence or evidence.scope ~= ARGV[5]
+    or evidence.committed_head_revision ~= ARGV[9]
+    or evidence.fencing_floor ~= ARGV[10]
+    or not canonical_nonnegative(evidence.committed_head_revision)
+    or not canonical_nonnegative(evidence.max_durable_fencing_token)
+    or not canonical_positive(evidence.fencing_floor)
+    or decimal_compare(evidence.max_durable_fencing_token,
+      evidence.fencing_floor) >= 0
+    or not valid_digest(evidence.committed_head_semantic_checksum)
+    or not valid_digest(evidence.evidence_sha256)
+    or (evidence.committed_head_commit_sha256 ~= cjson.null
+      and not valid_digest(evidence.committed_head_commit_sha256))
+    or (evidence.committed_head_revision == '0'
+      and evidence.committed_head_commit_sha256 ~= cjson.null)
+    or (evidence.committed_head_revision ~= '0'
+      and evidence.committed_head_commit_sha256 == cjson.null)
+    or not proof or proof.scope_hmac ~= key_scope_hmac
+    or proof.revision ~= ARGV[9]
+    or proof.semantic_checksum ~= evidence.committed_head_semantic_checksum
+    or proof.head_commit_sha256 ~= evidence.committed_head_commit_sha256
+    or proof.evidence_sha256 ~= evidence.evidence_sha256
+    or proof.admin_request_nonce_hmac ~= receipt_nonce_hmac
+    or not valid_digest(proof.scope_hmac)
+    or not valid_digest(proof.semantic_checksum)
+    or not valid_digest(proof.evidence_sha256)
+    or not valid_digest(proof.admin_request_nonce_hmac)
+    or not valid_digest(proof.proof_sha256) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local retained = redis.call('GET', KEYS[6])
 if retained then
   local receipt = strict_object(retained, 'shajra.coordination-admin-result', {
@@ -706,7 +1426,9 @@ if retained then
     request_nonce_hmac=true,evidence_sha256=true,expected_state_sha256=true,
     result=true,receipt_expires_at_ms=true})
   if not receipt or not receipt.result
-      or type(receipt.input_sha256) ~= 'string'
+      or not valid_digest(receipt.input_sha256)
+      or receipt.scope_hmac ~= key_scope_hmac
+      or receipt.request_nonce_hmac ~= receipt_nonce_hmac
       or not canonical_positive(receipt.receipt_expires_at_ms) then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
@@ -749,17 +1471,6 @@ if current[3] and canonical_nonnegative(current[3]) then
     return {'ERR', 'ADMIN_EVIDENCE_INVALID'}
   end
 end
-local request = strict_object(ARGV[1], 'shajra.coordination-admin-request', {
-  schema=true,version=true,method=true,scope_hmac=true,evidence_sha256=true,
-  expected_state_sha256=true})
-local evidence = strict_object(ARGV[3], 'shajra.coordination-evidence', {
-  schema=true,version=true,scope=true,committed_head_revision=true,
-  committed_head_semantic_checksum=true,committed_head_commit_sha256=true,
-  max_durable_fencing_token=true,fencing_floor=true,evidence_sha256=true})
-local proof = strict_object(ARGV[7], 'shajra.reconciled-head-receipt', {
-  schema=true,version=true,scope_hmac=true,revision=true,semantic_checksum=true,
-  head_commit_sha256=true,evidence_sha256=true,admin_request_nonce_hmac=true,
-  proof_sha256=true})
 if not request or not evidence or not proof
     or request.schema ~= 'shajra.coordination-admin-request'
     or request.version ~= 1 or request.method ~= ARGV[11]
@@ -771,8 +1482,11 @@ if not request or not evidence or not proof
 end
 local code = (ARGV[11] == 'initialize' and 'ADMIN_INITIALIZED' or 'ADMIN_RECONCILED')
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-local receipt_expires = server_ms + 60000
+local server_ms = redis_time_ms(clock)
+local receipt_expires = server_ms and decimal_add(server_ms, '60000')
+if not server_ms or not receipt_expires then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local transition = {schema='shajra.coordination-admin-transition',version=1,
   code=code,previous_state_sha256=ARGV[4],state_sha256=ARGV[8],
   confirmed_revision=ARGV[9],fencing_floor=ARGV[10]}
@@ -780,12 +1494,11 @@ local result = canonical_json({schema='shajra.coordination-admin-result',version
   input_sha256=ARGV[2],method=ARGV[11],scope_hmac=request.scope_hmac,
   request_nonce_hmac=proof.admin_request_nonce_hmac,
   evidence_sha256=evidence.evidence_sha256,expected_state_sha256=ARGV[4],
-  result=transition,receipt_expires_at_ms=tostring(receipt_expires)})
+  result=transition,receipt_expires_at_ms=receipt_expires})
 redis.call('SET', KEYS[2], ARGV[10])
 redis.call('SET', KEYS[3], ARGV[9])
 redis.call('SET', KEYS[5], ARGV[7])
-redis.call('SET', KEYS[6], result)
-redis.call('PEXPIREAT', KEYS[6], tostring(receipt_expires))
+redis.call('SET', KEYS[6], result, 'PXAT', receipt_expires)
 return {'OK', code, result}
 """
 )
@@ -796,7 +1509,32 @@ REVOCATION_REVOKE_LUA = (
     + _LUA_DECIMAL_VALIDATION
     + r"""
 if #KEYS ~= 2 or #ARGV ~= 6 or not canonical_nonnegative(ARGV[4])
-    or not canonical_nonnegative(ARGV[5]) then
+    or not canonical_nonnegative(ARGV[5]) or not decimal_lte(ARGV[5], '300') then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local token_expiry_ms = decimal_times_1000(ARGV[4])
+local leeway_ms = decimal_times_1000(ARGV[5])
+local expires = token_expiry_ms and leeway_ms
+  and decimal_add(token_expiry_ms, leeway_ms)
+if not expires then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+local entry_tag, entry_suffix = global_key_parts(KEYS[1], 'revocation')
+local receipt_tag, receipt_suffix = global_key_parts(KEYS[2], 'revocation')
+local entry_jti_hmac = entry_suffix and digest_suffix(entry_suffix, 'entry:')
+local receipt_nonce_hmac = receipt_suffix and digest_suffix(receipt_suffix, 'nonce:')
+local request = strict_object(ARGV[1], 'shajra.revocation-request', {
+  schema=true,version=true,jti_hmac=true,token_expires_at_s=true,leeway_s=true})
+local entry_proposed = strict_object(ARGV[6], 'shajra.revocation-entry', {
+  schema=true,version=true,jti_hmac=true,expires_at_ms=true,entry_sha256=true})
+if not entry_tag or receipt_tag ~= entry_tag or not entry_jti_hmac
+    or not receipt_nonce_hmac or not valid_digest(ARGV[2])
+    or not valid_text(ARGV[3], 4096) or not request or not entry_proposed
+    or request.jti_hmac ~= entry_jti_hmac
+    or request.token_expires_at_s ~= ARGV[4]
+    or request.leeway_s ~= ARGV[5]
+    or not valid_digest(request.jti_hmac)
+    or entry_proposed.jti_hmac ~= request.jti_hmac
+    or entry_proposed.expires_at_ms ~= expires
+    or not valid_digest(entry_proposed.entry_sha256) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
 local retained = redis.call('GET', KEYS[2])
@@ -805,7 +1543,7 @@ if retained then
     schema=true,version=true,input_sha256=true,jti_hmac=true,
     token_expires_at_s=true,leeway_s=true,code=true,revoked=true,
     server_time_ms=true,expires_at_ms=true,receipt_expires_at_ms=true})
-  if not receipt or type(receipt.input_sha256) ~= 'string'
+  if not receipt or not valid_digest(receipt.input_sha256)
       or not canonical_nonnegative(receipt.token_expires_at_s)
       or not canonical_nonnegative(receipt.leeway_s)
       or not canonical_nonnegative(receipt.server_time_ms)
@@ -815,8 +1553,6 @@ if retained then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   if receipt.input_sha256 ~= ARGV[2] then return {'ERR', 'NONCE_REUSE_CONFLICT'} end
-  local request = strict_object(ARGV[1], 'shajra.revocation-request', {
-    schema=true,version=true,jti_hmac=true,token_expires_at_s=true,leeway_s=true})
   local revoked_code = receipt.code == 'REVOKED' or receipt.code == 'ALREADY_REVOKED'
   if not request or receipt.jti_hmac ~= request.jti_hmac
       or receipt.token_expires_at_s ~= request.token_expires_at_s
@@ -825,69 +1561,55 @@ if retained then
       or (not revoked_code and receipt.code ~= 'TOKEN_ALREADY_EXPIRED') then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
-  local expected_expires = (tonumber(receipt.token_expires_at_s) * 1000)
-    + (tonumber(receipt.leeway_s) * 1000)
-  local expected_receipt_expires = math.max(
-    expected_expires, tonumber(receipt.server_time_ms) + 60000)
-  if receipt.expires_at_ms ~= tostring(expected_expires)
-      or receipt.receipt_expires_at_ms ~= tostring(expected_receipt_expires) then
+  local retained_server_floor = decimal_add(receipt.server_time_ms, '60000')
+  if not retained_server_floor then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  local expected_receipt_expires = decimal_compare(expires, retained_server_floor) >= 0
+    and expires or retained_server_floor
+  if receipt.expires_at_ms ~= expires
+      or receipt.receipt_expires_at_ms ~= expected_receipt_expires then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
-  local ttl = redis.call('PTTL', KEYS[2])
-  local clock = redis.call('TIME')
-  local now = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-  local remaining = tonumber(receipt.receipt_expires_at_ms) - now
-  if ttl == -1 or (ttl >= 0 and ttl < remaining) then
-    redis.call('PEXPIREAT', KEYS[2], receipt.receipt_expires_at_ms)
-  elseif ttl > remaining then
+  if not ensure_exact_expiry(KEYS[2], receipt.receipt_expires_at_ms) then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   return {'OK', receipt.code, retained}
 end
-local request = strict_object(ARGV[1], 'shajra.revocation-request', {
-  schema=true,version=true,jti_hmac=true,token_expires_at_s=true,leeway_s=true})
-local entry_proposed = strict_object(ARGV[6], 'shajra.revocation-entry', {
-  schema=true,version=true,jti_hmac=true,expires_at_ms=true,entry_sha256=true})
 if not request or not entry_proposed or request.token_expires_at_s ~= ARGV[4]
-    or request.leeway_s ~= ARGV[5] or entry_proposed.jti_hmac ~= request.jti_hmac then
+    or request.leeway_s ~= ARGV[5] or entry_proposed.jti_hmac ~= request.jti_hmac
+    or entry_proposed.expires_at_ms ~= expires
+    or not valid_digest(entry_proposed.entry_sha256) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-local expires = (tonumber(ARGV[4]) * 1000) + (tonumber(ARGV[5]) * 1000)
-if not expires or expires > 9223372036854775807 then
-  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
-end
+local server_ms = redis_time_ms(clock)
+if not server_ms then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
 local existing = redis.call('GET', KEYS[1])
 local code = 'REVOKED'
 local revoked = true
-if server_ms >= expires then
+if decimal_compare(server_ms, expires) >= 0 then
   code = 'TOKEN_ALREADY_EXPIRED'
   revoked = false
 elseif existing then
   if existing ~= ARGV[6] then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
-  local ttl = redis.call('PTTL', KEYS[1])
-  local remaining = expires - server_ms
-  if ttl == -1 or (ttl >= 0 and ttl < remaining) then
-    redis.call('PEXPIREAT', KEYS[1], tostring(expires))
-  elseif ttl > remaining then
+  if not ensure_exact_expiry(KEYS[1], expires) then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   code = 'ALREADY_REVOKED'
 end
-local receipt_expires = math.max(expires, server_ms + 60000)
+local server_receipt_floor = decimal_add(server_ms, '60000')
+if not server_receipt_floor then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+local receipt_expires = decimal_compare(expires, server_receipt_floor) >= 0
+  and expires or server_receipt_floor
 local result = canonical_json({schema='shajra.revocation-result',version=1,
   input_sha256=ARGV[2],jti_hmac=request.jti_hmac,token_expires_at_s=ARGV[4],
-  leeway_s=ARGV[5],code=code,revoked=revoked,server_time_ms=tostring(server_ms),
-  expires_at_ms=tostring(expires),receipt_expires_at_ms=tostring(receipt_expires)})
+  leeway_s=ARGV[5],code=code,revoked=revoked,server_time_ms=server_ms,
+  expires_at_ms=expires,receipt_expires_at_ms=receipt_expires})
 if code == 'REVOKED' then
-  redis.call('SET', KEYS[1], ARGV[6])
-  redis.call('PEXPIREAT', KEYS[1], tostring(expires))
+  redis.call('SET', KEYS[1], ARGV[6], 'PXAT', expires)
 end
-redis.call('SET', KEYS[2], result)
-redis.call('PEXPIREAT', KEYS[2], tostring(receipt_expires))
+redis.call('SET', KEYS[2], result, 'PXAT', receipt_expires)
 return {'OK', code, result}
 """
 )
@@ -898,38 +1620,55 @@ REVOCATION_CHECK_LUA = (
     + _LUA_DECIMAL_VALIDATION
     + r"""
 if #KEYS ~= 1 or #ARGV ~= 4 or not canonical_nonnegative(ARGV[2])
-    or not canonical_nonnegative(ARGV[3]) then
+    or not canonical_nonnegative(ARGV[3]) or not decimal_lte(ARGV[3], '300') then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local token_expiry_ms = decimal_times_1000(ARGV[2])
+local leeway_ms = decimal_times_1000(ARGV[3])
+local expires = token_expiry_ms and leeway_ms
+  and decimal_add(token_expiry_ms, leeway_ms)
+if not expires then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+local entry_tag, entry_suffix = global_key_parts(KEYS[1], 'revocation')
+local entry_jti_hmac = entry_suffix and digest_suffix(entry_suffix, 'entry:')
+local expected_entry = strict_object(ARGV[1], 'shajra.revocation-entry', {
+  schema=true,version=true,jti_hmac=true,expires_at_ms=true,entry_sha256=true})
+if not entry_tag or not entry_jti_hmac or not valid_digest(ARGV[4])
+    or entry_jti_hmac ~= ARGV[4] or not expected_entry
+    or expected_entry.jti_hmac ~= ARGV[4]
+    or expected_entry.expires_at_ms ~= expires
+    or not valid_digest(expected_entry.entry_sha256) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-local expires = (tonumber(ARGV[2]) * 1000) + (tonumber(ARGV[3]) * 1000)
-if server_ms >= expires then
-  return {'OK', 'TOKEN_ALREADY_EXPIRED', 'false', tostring(server_ms), tostring(expires)}
+local server_ms = redis_time_ms(clock)
+if not server_ms then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if decimal_compare(server_ms, expires) >= 0 then
+  return {'OK', 'TOKEN_ALREADY_EXPIRED', 'false', server_ms, expires}
 end
 local raw = redis.call('GET', KEYS[1])
-if not raw then return {'OK', 'NOT_REVOKED', 'false', tostring(server_ms), tostring(expires)} end
+if not raw then return {'OK', 'NOT_REVOKED', 'false', server_ms, expires} end
 if raw ~= ARGV[1] then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local ttl = redis.call('PTTL', KEYS[1])
-local remaining = expires - server_ms
-if ttl == -1 or (ttl >= 0 and ttl < remaining) then
-  redis.call('PEXPIREAT', KEYS[1], tostring(expires))
-elseif ttl > remaining then
+if not ensure_exact_expiry(KEYS[1], expires) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-return {'OK', 'REVOKED', 'true', tostring(server_ms), tostring(expires)}
+return {'OK', 'REVOKED', 'true', server_ms, expires}
 """
 )
 
 
-RATE_TIME_LUA = r"""-- shajra:rate-time:v1
+RATE_TIME_LUA = (
+    "-- shajra:rate-time:v1\n"
+    + _LUA_DECIMAL_VALIDATION
+    + r"""
 if #KEYS ~= 0 or #ARGV ~= 0 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
 local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-return {'OK', 'TIME', tostring(server_ms)}
+local server_ms = redis_time_ms(clock)
+if not server_ms then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+return {'OK', 'TIME', server_ms}
 """
+)
 
 
 RATE_CONSUME_LUA = (
@@ -940,6 +1679,27 @@ if #KEYS ~= 2 or #ARGV ~= 7 or not canonical_nonnegative(ARGV[5])
     or not canonical_positive(ARGV[6]) or not canonical_positive(ARGV[7]) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
+local request = strict_object(ARGV[1], 'shajra.rate-request', {
+  schema=true,version=true,policy_id=true,subject_kind=true,subject_hmac=true,
+  window_start_ms=true,window_ms=true,limit=true})
+local counter_tag, counter_suffix = global_key_parts(KEYS[1], 'rate')
+local receipt_tag, receipt_suffix = global_key_parts(KEYS[2], 'rate')
+local receipt_nonce_hmac = receipt_suffix and digest_suffix(receipt_suffix, 'nonce:')
+local valid_policy = ARGV[3] == 'login' or ARGV[3] == 'submit'
+  or ARGV[3] == 'upload' or ARGV[3] == 'comment' or ARGV[3] == 'story'
+  or ARGV[3] == 'search' or ARGV[3] == 'email-verification'
+local expected_counter_suffix = request and ('counter:' .. ARGV[3] .. ':'
+  .. request.subject_hmac .. ':' .. ARGV[5]) or ''
+if not counter_tag or receipt_tag ~= counter_tag or not receipt_nonce_hmac
+    or counter_suffix ~= expected_counter_suffix or not valid_policy
+    or (ARGV[4] ~= 'IP' and ARGV[4] ~= 'IDENTITY')
+    or not valid_digest(ARGV[2]) or not request
+    or request.policy_id ~= ARGV[3] or request.subject_kind ~= ARGV[4]
+    or request.window_start_ms ~= ARGV[5] or request.window_ms ~= ARGV[6]
+    or request.limit ~= ARGV[7] or not valid_digest(request.subject_hmac)
+    or not decimal_lte(ARGV[6], '86400000') then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local retained = redis.call('GET', KEYS[2])
 if retained then
   local receipt = strict_object(retained, 'shajra.rate-result', {
@@ -947,7 +1707,7 @@ if retained then
     subject_hmac=true,window_start_ms=true,window_ms=true,limit=true,allowed=true,
     observed_count=true,remaining=true,server_time_ms=true,reset_at_ms=true,
     retry_after_ms=true,receipt_expires_at_ms=true})
-  if not receipt or type(receipt.input_sha256) ~= 'string'
+  if not receipt or not valid_digest(receipt.input_sha256)
       or type(receipt.allowed) ~= 'boolean'
       or not canonical_nonnegative(receipt.window_start_ms)
       or not canonical_positive(receipt.window_ms)
@@ -961,9 +1721,6 @@ if retained then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
   if receipt.input_sha256 ~= ARGV[2] then return {'ERR', 'NONCE_REUSE_CONFLICT'} end
-  local request = strict_object(ARGV[1], 'shajra.rate-request', {
-    schema=true,version=true,policy_id=true,subject_kind=true,subject_hmac=true,
-    window_start_ms=true,window_ms=true,limit=true})
   if not request or receipt.policy_id ~= request.policy_id
       or receipt.subject_kind ~= request.subject_kind
       or receipt.subject_hmac ~= request.subject_hmac
@@ -971,44 +1728,47 @@ if retained then
       or receipt.window_ms ~= request.window_ms or receipt.limit ~= request.limit then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
-  local start = tonumber(receipt.window_start_ms)
-  local window = tonumber(receipt.window_ms)
-  local limit = tonumber(receipt.limit)
-  local observed = tonumber(receipt.observed_count)
-  local server = tonumber(receipt.server_time_ms)
-  local reset = start + window
-  local expected_remaining = math.max(limit - observed, 0)
-  local expected_retry = receipt.allowed and 0 or reset - server
-  if receipt.reset_at_ms ~= tostring(reset)
-      or receipt.receipt_expires_at_ms ~= tostring(reset + 60000)
-      or receipt.remaining ~= tostring(expected_remaining)
-      or receipt.retry_after_ms ~= tostring(expected_retry)
-      or server < start or server >= reset or receipt.allowed ~= (observed <= limit) then
+  local reset = decimal_add(receipt.window_start_ms, receipt.window_ms)
+  local receipt_expires = reset and decimal_add(reset, '60000')
+  local comparison = decimal_compare(receipt.observed_count, receipt.limit)
+  local expected_allowed = comparison <= 0
+  local expected_remaining = expected_allowed
+    and decimal_subtract(receipt.limit, receipt.observed_count) or '0'
+  local expected_retry = (not expected_allowed and reset)
+    and decimal_subtract(reset, receipt.server_time_ms) or '0'
+  if not reset or not receipt_expires or not expected_remaining or not expected_retry
+      or receipt.reset_at_ms ~= reset
+      or receipt.receipt_expires_at_ms ~= receipt_expires
+      or receipt.remaining ~= expected_remaining
+      or receipt.retry_after_ms ~= expected_retry
+      or decimal_compare(receipt.server_time_ms, receipt.window_start_ms) < 0
+      or decimal_compare(receipt.server_time_ms, reset) >= 0
+      or receipt.allowed ~= expected_allowed then
     return {'ERR', 'COORDINATION_STATE_CORRUPT'}
   end
-  local clock = redis.call('TIME')
-  local now = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-  local ttl = redis.call('PTTL', KEYS[2])
-  local remaining = tonumber(receipt.receipt_expires_at_ms) - now
-  if ttl == -1 or (ttl >= 0 and ttl < remaining) then
-    redis.call('PEXPIREAT', KEYS[2], receipt.receipt_expires_at_ms)
-  elseif ttl > remaining then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+  if not ensure_exact_expiry(KEYS[2], receipt.receipt_expires_at_ms) then
+    return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+  end
   return {'OK', (receipt.allowed and 'RATE_LIMIT_ALLOWED' or 'RATE_LIMIT_DENIED'), retained}
 end
-local request = strict_object(ARGV[1], 'shajra.rate-request', {
-  schema=true,version=true,policy_id=true,subject_kind=true,subject_hmac=true,
-  window_start_ms=true,window_ms=true,limit=true})
 if not request or request.policy_id ~= ARGV[3] or request.subject_kind ~= ARGV[4]
     or request.window_start_ms ~= ARGV[5] or request.window_ms ~= ARGV[6]
     or request.limit ~= ARGV[7] then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
-local clock = redis.call('TIME')
-local server_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
 local window = tonumber(ARGV[6])
-local actual_start = math.floor(server_ms / window) * window
-if tostring(actual_start) ~= ARGV[5] then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
-local reset = actual_start + window
+if not window or window > 86400000
+    or decimal_mod_small(ARGV[5], window) ~= 0 then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local clock = redis.call('TIME')
+local server_ms = redis_time_ms(clock)
+local reset = decimal_add(ARGV[5], ARGV[6])
+if not server_ms or not reset
+    or decimal_compare(server_ms, ARGV[5]) < 0
+    or decimal_compare(server_ms, reset) >= 0 then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local raw_count = redis.call('GET', KEYS[1])
 local count = '0'
 if raw_count then
@@ -1018,26 +1778,28 @@ end
 if count == I64_MAX then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
 local counter_ttl = redis.call('PTTL', KEYS[1])
 if raw_count then
-  local remaining = reset - server_ms
+  local remaining_text = decimal_subtract(reset, server_ms)
+  local remaining = remaining_text and tonumber(remaining_text)
+  if not remaining then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
   if counter_ttl > remaining then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
 end
-redis.call('INCR', KEYS[1])
-count = redis.call('GET', KEYS[1])
-redis.call('PEXPIREAT', KEYS[1], tostring(reset))
-local numeric_count = tonumber(count)
-local limit = tonumber(ARGV[7])
-local allowed = numeric_count <= limit
-local remaining = math.max(limit - numeric_count, 0)
-local retry_after = (allowed and 0 or reset - server_ms)
-local receipt_expires = reset + 60000
+count = canonical_increment(count)
+if not count then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+local allowed = decimal_compare(count, ARGV[7]) <= 0
+local remaining = allowed and decimal_subtract(ARGV[7], count) or '0'
+local retry_after = allowed and '0' or decimal_subtract(reset, server_ms)
+local receipt_expires = decimal_add(reset, '60000')
+if not remaining or not retry_after or not receipt_expires then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local result = canonical_json({schema='shajra.rate-result',version=1,
   input_sha256=ARGV[2],policy_id=ARGV[3],subject_kind=ARGV[4],
   subject_hmac=request.subject_hmac,window_start_ms=ARGV[5],window_ms=ARGV[6],
-  limit=ARGV[7],allowed=allowed,observed_count=count,remaining=tostring(remaining),
-  server_time_ms=tostring(server_ms),reset_at_ms=tostring(reset),
-  retry_after_ms=tostring(retry_after),receipt_expires_at_ms=tostring(receipt_expires)})
-redis.call('SET', KEYS[2], result)
-redis.call('PEXPIREAT', KEYS[2], tostring(receipt_expires))
+  limit=ARGV[7],allowed=allowed,observed_count=count,remaining=remaining,
+  server_time_ms=server_ms,reset_at_ms=reset,
+  retry_after_ms=retry_after,receipt_expires_at_ms=receipt_expires})
+redis.call('SET', KEYS[1], count, 'PXAT', reset)
+redis.call('SET', KEYS[2], result, 'PXAT', receipt_expires)
 return {'OK', (allowed and 'RATE_LIMIT_ALLOWED' or 'RATE_LIMIT_DENIED'), result}
 """
 )
@@ -1201,10 +1963,110 @@ class UpstashLeaseManager:
         return receipt.result
 
 
+@dataclass(frozen=True, slots=True)
+class _RawGraphCore:
+    values: tuple[str | None, str | None, str | None, str | None, str | None]
+    lock_pttl: str
+
+
 class UpstashCommitCoordinator:
     def __init__(self, redis: EvalAdapter, keys: RedisKeyBuilder) -> None:
         self._redis = redis
         self._keys = keys
+
+    def _read_core(self, scope: str) -> _RawGraphCore:
+        result = self._redis.eval(
+            COORDINATION_STATUS_LUA,
+            [
+                self._keys.graph_lock(scope),
+                self._keys.graph_fence(scope),
+                self._keys.graph_confirmed_revision(scope),
+                self._keys.graph_reservation(scope),
+                self._keys.graph_last_confirmation(scope),
+            ],
+            [scope],
+            nonce_idempotent=False,
+        )
+        _, payload = _tagged(result, {"STATUS"})
+        if len(payload) != 6 or not all(isinstance(value, str) for value in payload):
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        confirmed_raw, fence_raw, lock_raw, pttl_raw, reservation_raw, proof_raw = (
+            payload
+        )
+        return _RawGraphCore(
+            (
+                lock_raw or None,
+                fence_raw or None,
+                confirmed_raw or None,
+                reservation_raw or None,
+                proof_raw or None,
+            ),
+            pttl_raw,
+        )
+
+    def _decode_core(
+        self, scope: str, snapshot: _RawGraphCore
+    ) -> CommitCoordinatorStatus:
+        lock_raw, fence_raw, confirmed_raw, reservation_raw, proof_raw = snapshot.values
+        if confirmed_raw is None and fence_raw is None:
+            if (
+                lock_raw is not None
+                or reservation_raw is not None
+                or proof_raw is not None
+                or snapshot.lock_pttl != "-2"
+            ):
+                raise CoordinationError("COORDINATION_STATE_CORRUPT")
+            raise CoordinationError("COORDINATION_UNINITIALIZED")
+        if confirmed_raw is None or fence_raw is None or proof_raw is None:
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        confirmed = parse_canonical_decimal(confirmed_raw, minimum=0)
+        fence = parse_canonical_decimal(fence_raw, minimum=1)
+        if lock_raw is not None:
+            pttl = parse_canonical_decimal(snapshot.lock_pttl, minimum=1)
+            lock = inspect_graph_lock(lock_raw, self._keys, scope)
+            if (
+                pttl > lock.ttl_ms
+                or lock.fencing_token != fence
+                or lock.base_revision != confirmed
+            ):
+                raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        elif snapshot.lock_pttl != "-2":
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+
+        proof: ConfirmedCommitReceipt | ReconciledHeadReceipt
+        proof_fencing_token: int | None = None
+        try:
+            proof = deserialize_confirmed_commit_receipt(proof_raw, self._keys, scope)
+            proof_revision = proof.commit.revision
+            proof_fencing_token = proof.commit.fencing_token
+        except CoordinationError:
+            proof = deserialize_reconciled_head_receipt(proof_raw, self._keys, scope)
+            proof_revision = proof.revision
+        if proof_revision != confirmed or (
+            proof_fencing_token is not None and proof_fencing_token > fence
+        ):
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+
+        reservation = (
+            deserialize_commit_reservation(reservation_raw, self._keys, scope)
+            if reservation_raw is not None
+            else None
+        )
+        if reservation is not None and (
+            reservation.commit.revision != confirmed + 1
+            or reservation.commit.fencing_token > fence
+        ):
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        state_digest = coordination_state_sha256(snapshot.values)
+        return CommitCoordinatorStatus(
+            scope,
+            "COMMITTING" if reservation is not None else "READY",
+            confirmed,
+            fence,
+            reservation,
+            proof,
+            state_digest,
+        )
 
     def acquire(
         self,
@@ -1221,16 +2083,61 @@ class UpstashCommitCoordinator:
             ttl_ms,
             committed_revision,
         )
+        script_keys = [
+            self._keys.graph_lock(scope),
+            self._keys.graph_fence(scope),
+            self._keys.graph_confirmed_revision(scope),
+            self._keys.graph_reservation(scope),
+            self._keys.graph_last_confirmation(scope),
+            self._keys.graph_acquisition_result(scope, acquisition_id),
+        ]
+        base_args = [request.text, request.sha256, scope, acquisition_id, str(ttl_ms)]
         result = self._redis.eval(
             GRAPH_ACQUIRE_LUA,
+            script_keys,
+            base_args,
+            nonce_idempotent=False,
+        )
+        code, payload = _tagged(result, {"GRAPH_PREFLIGHT", "LEASE_REPLAYED"})
+        if code == "LEASE_REPLAYED":
+            receipt = deserialize_lease_acquisition_receipt(
+                _one_text_payload(payload), request, self._keys, scope, acquisition_id
+            )
+            if type(receipt.lease) is not GraphLease:
+                raise CoordinationError("COORDINATION_STATE_CORRUPT")
+            return receipt.lease
+        if len(payload) != 6 or not all(isinstance(value, str) for value in payload):
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        confirmed_raw, fence_raw, lock_raw, pttl_raw, reservation_raw, proof_raw = (
+            payload
+        )
+        snapshot = _RawGraphCore(
+            (
+                lock_raw or None,
+                fence_raw or None,
+                confirmed_raw or None,
+                reservation_raw or None,
+                proof_raw or None,
+            ),
+            pttl_raw,
+        )
+        status = self._decode_core(scope, snapshot)
+        if status.active_reservation is not None:
+            raise CoordinationError("COMMIT_RECOVERY_REQUIRED")
+        if snapshot.values[0] is not None:
+            raise CoordinationError("LOCK_UNAVAILABLE")
+        if status.confirmed_revision != committed_revision:
+            raise CoordinationError("COORDINATION_REVISION_MISMATCH")
+        result = self._redis.eval(
+            GRAPH_ACQUIRE_LUA,
+            script_keys,
             [
-                self._keys.graph_confirmed_revision(scope),
-                self._keys.graph_fence(scope),
-                self._keys.graph_lock(scope),
-                self._keys.graph_reservation(scope),
-                self._keys.graph_acquisition_result(scope, acquisition_id),
+                *base_args,
+                *(
+                    value if value is not None else "__SHAJRA_MISSING_V1__"
+                    for value in snapshot.values
+                ),
             ],
-            [request.text, request.sha256, scope, acquisition_id, str(ttl_ms)],
             nonce_idempotent=True,
         )
         _, payload = _tagged(result, {"LEASE_ACQUIRED", "LEASE_REPLAYED"})
@@ -1366,17 +2273,63 @@ class UpstashCommitCoordinator:
         reservation_raw = serialize_commit_reservation(
             reservation, self._keys, request_nonce
         )
+        script_keys = [
+            self._keys.graph_lock(lease.scope),
+            self._keys.graph_fence(lease.scope),
+            self._keys.graph_confirmed_revision(lease.scope),
+            self._keys.graph_reservation(lease.scope),
+            self._keys.graph_last_confirmation(lease.scope),
+        ]
+        base_args = [
+            lease.scope,
+            reservation_raw,
+            serialize_graph_lock(lease, self._keys),
+        ]
         result = self._redis.eval(
             AUTHORIZE_COMMIT_LUA,
+            script_keys,
+            base_args,
+            nonce_idempotent=False,
+        )
+        code, payload = _tagged(
+            result, {"AUTHORIZATION_PREFLIGHT", "RESERVATION_REPLAYED"}
+        )
+        if code == "RESERVATION_REPLAYED":
+            persisted = deserialize_commit_reservation(
+                _one_text_payload(payload), self._keys, lease.scope
+            )
+            if persisted != reservation:
+                raise CoordinationError("RESERVATION_CONFLICT")
+            return persisted.permit
+        if len(payload) != 6 or not all(isinstance(value, str) for value in payload):
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        confirmed_raw, fence_raw, lock_raw, pttl_raw, current_reservation, proof_raw = (
+            payload
+        )
+        snapshot = _RawGraphCore(
+            (
+                lock_raw or None,
+                fence_raw or None,
+                confirmed_raw or None,
+                current_reservation or None,
+                proof_raw or None,
+            ),
+            pttl_raw,
+        )
+        status = self._decode_core(lease.scope, snapshot)
+        if status.active_reservation is not None:
+            raise CoordinationError("RESERVATION_CONFLICT")
+        if snapshot.values[0] != base_args[2]:
+            raise CoordinationError("LEASE_LOST")
+        result = self._redis.eval(
+            AUTHORIZE_COMMIT_LUA,
+            script_keys,
             [
-                self._keys.graph_confirmed_revision(lease.scope),
-                self._keys.graph_lock(lease.scope),
-                self._keys.graph_reservation(lease.scope),
-            ],
-            [
-                lease.scope,
-                reservation_raw,
-                serialize_graph_lock(lease, self._keys),
+                *base_args,
+                *(
+                    value if value is not None else "__SHAJRA_MISSING_V1__"
+                    for value in snapshot.values
+                ),
             ],
             nonce_idempotent=True,
         )
@@ -1389,86 +2342,7 @@ class UpstashCommitCoordinator:
         return persisted.permit
 
     def get_status(self, scope: str) -> CommitCoordinatorStatus:
-        result = self._redis.eval(
-            COORDINATION_STATUS_LUA,
-            [
-                self._keys.graph_lock(scope),
-                self._keys.graph_fence(scope),
-                self._keys.graph_confirmed_revision(scope),
-                self._keys.graph_reservation(scope),
-                self._keys.graph_last_confirmation(scope),
-            ],
-            [scope],
-            nonce_idempotent=False,
-        )
-        _, payload = _tagged(result, {"STATUS"})
-        if len(payload) != 6 or not all(isinstance(value, str) for value in payload):
-            raise CoordinationError("COORDINATION_STATE_CORRUPT")
-        confirmed_raw, fence_raw, lock_raw, pttl_raw, reservation_raw, proof_raw = (
-            payload
-        )
-        if not confirmed_raw and not fence_raw:
-            if lock_raw or reservation_raw or proof_raw or pttl_raw != "-2":
-                raise CoordinationError("COORDINATION_STATE_CORRUPT")
-            raise CoordinationError("COORDINATION_UNINITIALIZED")
-        if not confirmed_raw or not fence_raw or not proof_raw:
-            raise CoordinationError("COORDINATION_STATE_CORRUPT")
-        confirmed = parse_canonical_decimal(confirmed_raw, minimum=0)
-        fence = parse_canonical_decimal(fence_raw, minimum=1)
-        if lock_raw:
-            pttl = parse_canonical_decimal(pttl_raw, minimum=1)
-            lock = inspect_graph_lock(lock_raw, self._keys, scope)
-            if (
-                pttl > lock.ttl_ms
-                or lock.fencing_token != fence
-                or lock.base_revision != confirmed
-            ):
-                raise CoordinationError("COORDINATION_STATE_CORRUPT")
-        elif pttl_raw != "-2":
-            raise CoordinationError("COORDINATION_STATE_CORRUPT")
-
-        proof: ConfirmedCommitReceipt | ReconciledHeadReceipt
-        proof_fencing_token: int | None = None
-        try:
-            proof = deserialize_confirmed_commit_receipt(proof_raw, self._keys, scope)
-            proof_revision = proof.commit.revision
-            proof_fencing_token = proof.commit.fencing_token
-        except CoordinationError:
-            proof = deserialize_reconciled_head_receipt(proof_raw, self._keys, scope)
-            proof_revision = proof.revision
-        if proof_revision != confirmed or (
-            proof_fencing_token is not None and proof_fencing_token > fence
-        ):
-            raise CoordinationError("COORDINATION_STATE_CORRUPT")
-
-        reservation = (
-            deserialize_commit_reservation(reservation_raw, self._keys, scope)
-            if reservation_raw
-            else None
-        )
-        if reservation is not None and (
-            reservation.commit.revision != confirmed + 1
-            or reservation.commit.fencing_token != fence
-        ):
-            raise CoordinationError("COORDINATION_STATE_CORRUPT")
-        state_digest = coordination_state_sha256(
-            (
-                lock_raw or None,
-                fence_raw,
-                confirmed_raw,
-                reservation_raw or None,
-                proof_raw,
-            )
-        )
-        return CommitCoordinatorStatus(
-            scope,
-            "COMMITTING" if reservation is not None else "READY",
-            confirmed,
-            fence,
-            reservation,
-            proof,
-            state_digest,
-        )
+        return self._decode_core(scope, self._read_core(scope))
 
     def confirm_commit(
         self, permit: CommitPermit, commit: GraphCommit, request_nonce: str
@@ -1483,9 +2357,50 @@ class UpstashCommitCoordinator:
             or permit.commit_sha256 != graph_commit_sha256(commit)
         ):
             raise CoordinationError("CONFIRMATION_CONFLICT")
+        snapshot = self._read_core(permit.scope)
+        proof_raw = snapshot.values[4]
+        if proof_raw is None:
+            raise CoordinationError("COORDINATION_STATE_CORRUPT")
+        try:
+            prior_proof = deserialize_confirmed_commit_receipt(
+                proof_raw, self._keys, permit.scope
+            )
+        except CoordinationError:
+            deserialize_reconciled_head_receipt(proof_raw, self._keys, permit.scope)
+        else:
+            if prior_proof.permit == permit and prior_proof.commit == commit:
+                return ConfirmationResult(
+                    "CONFIRMATION_REPLAYED", permit, commit.revision
+                )
+        confirmed_raw = snapshot.values[2]
+        reservation_raw = snapshot.values[3]
+        if confirmed_raw is None:
+            raise CoordinationError("CONFIRMATION_CONFLICT")
+        confirmed_revision = parse_canonical_decimal(confirmed_raw, minimum=0)
+        if permit.revision <= confirmed_revision:
+            return ConfirmationResult(
+                "CONFIRMATION_PROOF_EVICTED", permit, confirmed_revision
+            )
+        if reservation_raw is None:
+            raise CoordinationError("CONFIRMATION_CONFLICT")
+        preflight_reservation = deserialize_commit_reservation(
+            reservation_raw, self._keys, permit.scope
+        )
+        if preflight_reservation.commit.revision != confirmed_revision + 1:
+            raise CoordinationError("CONFIRMATION_CONFLICT")
+        status = self._decode_core(permit.scope, snapshot)
+        if (
+            status.active_reservation is None
+            or status.active_reservation.permit != permit
+            or status.active_reservation.commit != commit
+            or status.confirmed_revision != commit.revision - 1
+        ):
+            raise CoordinationError("CONFIRMATION_CONFLICT")
         result = self._redis.eval(
             CONFIRM_COMMIT_LUA,
             [
+                self._keys.graph_lock(permit.scope),
+                self._keys.graph_fence(permit.scope),
                 self._keys.graph_confirmed_revision(permit.scope),
                 self._keys.graph_reservation(permit.scope),
                 self._keys.graph_last_confirmation(permit.scope),
@@ -1500,6 +2415,10 @@ class UpstashCommitCoordinator:
                 canonical_graph_commit_json(commit),
                 self._keys.hmac_hex("graph-confirmation-nonce", request_nonce),
                 str(commit.revision - 1),
+                *(
+                    value if value is not None else "__SHAJRA_MISSING_V1__"
+                    for value in snapshot.values
+                ),
             ],
             nonce_idempotent=True,
         )
@@ -1641,7 +2560,7 @@ class UpstashCoordinationAdmin:
             confirmed is None
             or fence is None
             or reservation.commit.revision != confirmed + 1
-            or reservation.commit.fencing_token != fence
+            or reservation.commit.fencing_token > fence
         ):
             corrupt = True
         mode = (

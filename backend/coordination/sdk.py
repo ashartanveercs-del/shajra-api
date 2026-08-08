@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Sequence
 from typing import Any, Self
 
@@ -10,6 +11,7 @@ import httpx
 from upstash_redis import Redis
 
 from coordination.protocols import CoordinationError
+from upstash_url import require_canonical_upstash_url
 
 
 class UpstashRedisAdapter:
@@ -20,6 +22,10 @@ class UpstashRedisAdapter:
 
     @classmethod
     def connect(cls, url: str, token: str) -> Self:
+        try:
+            require_canonical_upstash_url(url)
+        except ValueError:
+            raise CoordinationError("COORDINATION_STATE_CORRUPT") from None
         return cls(Redis(url=url, token=token, rest_retries=0))
 
     def eval(
@@ -47,7 +53,12 @@ class UpstashRedisAdapter:
                 if inspect.isawaitable(result) or not isinstance(result, list):
                     raise CoordinationError("COORDINATION_UNAVAILABLE")
                 return result
-            except httpx.TransportError:
+            except (
+                httpx.TransportError,
+                httpx.DecodingError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ):
                 if attempt + 1 < attempts:
                     continue
                 raise CoordinationError("COORDINATION_UNAVAILABLE") from None
