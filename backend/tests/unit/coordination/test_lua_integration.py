@@ -22,6 +22,7 @@ from coordination.serialization import (
     RedisKeyBuilder,
     coordination_evidence_sha256,
     lease_acquire_request,
+    lease_operation_request,
     rate_request,
     revocation_request,
     serialize_commit_reservation,
@@ -131,7 +132,15 @@ def _commit_values(lease: GraphLease, revision: int = 1):
         lease.fencing_token,
         "cpr_actual_lua",
         "e" * 64,
-        datetime(2026, 8, 8, 10, 0, revision, tzinfo=UTC),
+        datetime(
+            2026,
+            8,
+            8,
+            10,
+            0,
+            revision if revision <= 59 else 1,
+            tzinfo=UTC,
+        ),
     )
     return commit, staged
 
@@ -212,6 +221,33 @@ def _reservation_values(
 def _redis_time_ms(production_lua: ProductionLuaHarness) -> int:
     result = production_lua.eval(RATE_TIME_LUA, [], [], nonce_idempotent=False)
     return int(result[2])
+
+
+def _seed_live_graph_lock(
+    production_lua: ProductionLuaHarness,
+    keys: RedisKeyBuilder,
+    *,
+    revision: int,
+    fence: int,
+    acquisition_id: str,
+    ttl_ms: int = 15_000,
+) -> GraphLease:
+    now_ms = _redis_time_ms(production_lua)
+    lease = GraphLease(
+        "family",
+        acquisition_id,
+        fence,
+        revision,
+        now_ms + ttl_ms,
+        ttl_ms,
+        now_ms + ttl_ms - 5_000,
+    )
+    production_lua.client.set(
+        keys.graph_lock("family"),
+        serialize_graph_lock(lease, keys),
+        pxat=lease.expires_at_ms,
+    )
+    return lease
 
 
 @pytest.mark.parametrize(
@@ -450,6 +486,258 @@ def test_authorization_lua_rejects_invalid_commit_sequence_without_mutation(
         else ["ERR", "COORDINATION_STATE_CORRUPT"]
     )
     assert result == expected
+    assert _database_snapshot(production_lua) == before
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("commit-payload", "staged-receipt-payload", "write-set-payload"),
+)
+def test_authorization_lua_recomputes_every_recovery_payload_digest_before_mutation(
+    production_lua: ProductionLuaHarness,
+    mismatch: str,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    _seed_ready_graph(production_lua, keys)
+    coordinator = UpstashCommitCoordinator(production_lua, keys)
+    lease = coordinator.acquire("family", 0, f"acq-digest-{mismatch}")
+    _permit, _commit, proposed_raw = _reservation_values(
+        keys, lease, revision=1, nonce=f"authorize-digest-{mismatch}"
+    )
+    proposed = json.loads(proposed_raw)
+    staged = json.loads(proposed["staged_write_receipt_json"])
+
+    if mismatch == "commit-payload":
+        commit = json.loads(proposed["commit_json"])
+        commit["semantic_checksum"] = "f" * 64
+        proposed["commit_json"] = json.dumps(
+            commit, sort_keys=True, separators=(",", ":")
+        )
+    elif mismatch == "staged-receipt-payload":
+        write_set = json.loads(staged["write_set_json"])
+        write_set["person_tombstones"] = ["per_digest_mismatch"]
+        staged["write_set_json"] = json.dumps(write_set, separators=(",", ":"))
+        staged["write_set_sha256"] = hashlib.sha256(
+            staged["write_set_json"].encode("ascii")
+        ).hexdigest()
+        proposed["staged_write_receipt_json"] = json.dumps(
+            staged, sort_keys=True, separators=(",", ":")
+        )
+    else:
+        staged["write_set_sha256"] = "f" * 64
+        proposed["staged_write_receipt_json"] = json.dumps(
+            staged, sort_keys=True, separators=(",", ":")
+        )
+        proposed["staged_write_receipt_sha256"] = hashlib.sha256(
+            proposed["staged_write_receipt_json"].encode("ascii")
+        ).hexdigest()
+
+    proposed_raw = json.dumps(proposed, sort_keys=True, separators=(",", ":"))
+    graph_keys = _core_keys(keys)
+    before = _database_snapshot(production_lua)
+
+    result = production_lua.eval(
+        AUTHORIZE_COMMIT_LUA,
+        graph_keys,
+        [
+            "family",
+            proposed_raw,
+            serialize_graph_lock(lease, keys),
+            *_expected_core_args(production_lua, graph_keys),
+        ],
+        nonce_idempotent=True,
+    )
+
+    assert result == ["ERR", "COORDINATION_STATE_CORRUPT"]
+    assert _database_snapshot(production_lua) == before
+
+
+@pytest.mark.parametrize(
+    ("revision", "fence"),
+    (
+        (9_007_199_254_740_993, 9_007_199_254_740_993),
+        (9_223_372_036_854_775_807, 9_223_372_036_854_775_807),
+    ),
+)
+def test_authorization_lua_preserves_exact_high_commit_revision_and_fence(
+    production_lua: ProductionLuaHarness,
+    revision: int,
+    fence: int,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    _seed_ready_graph(production_lua, keys, revision=revision - 1, fence=fence)
+    lease = _seed_live_graph_lock(
+        production_lua,
+        keys,
+        revision=revision - 1,
+        fence=fence,
+        acquisition_id=f"acq-high-{revision}",
+    )
+    _permit, _commit, proposed_raw = _reservation_values(
+        keys, lease, revision=revision, nonce=f"authorize-high-{revision}"
+    )
+    graph_keys = _core_keys(keys)
+
+    result = production_lua.eval(
+        AUTHORIZE_COMMIT_LUA,
+        graph_keys,
+        [
+            "family",
+            proposed_raw,
+            serialize_graph_lock(lease, keys),
+            *_expected_core_args(production_lua, graph_keys),
+        ],
+        nonce_idempotent=True,
+    )
+
+    assert result == ["OK", "RESERVATION_CREATED", proposed_raw]
+    persisted = production_lua.client.get(keys.graph_reservation("family"))
+    assert persisted == proposed_raw
+    decoded = json.loads(persisted)
+    assert decoded["permit"]["revision"] == str(revision)
+    assert decoded["permit"]["fencing_token"] == str(fence)
+    assert f'"revision":{revision}' in decoded["commit_json"]
+    assert f'"fencing_token":{fence}' in decoded["commit_json"]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("revision", "1.0"),
+        ("revision", "1e0"),
+        ("revision", "01"),
+        ("revision", "9223372036854775808"),
+        ("fencing_token", "-1"),
+        ("fencing_token", "01"),
+        ("fencing_token", "9223372036854775808"),
+    ),
+)
+def test_authorization_lua_rejects_noncanonical_or_overflow_commit_numbers(
+    production_lua: ProductionLuaHarness,
+    field: str,
+    replacement: str,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    _seed_ready_graph(production_lua, keys)
+    lease = _seed_live_graph_lock(
+        production_lua,
+        keys,
+        revision=0,
+        fence=1,
+        acquisition_id=f"acq-invalid-{field}-{replacement}",
+    )
+    _permit, _commit, proposed_raw = _reservation_values(
+        keys, lease, revision=1, nonce=f"authorize-invalid-{field}-{replacement}"
+    )
+    proposed = json.loads(proposed_raw)
+    commit_raw = proposed["commit_json"].replace(
+        f'"{field}":1', f'"{field}":{replacement}'
+    )
+    assert commit_raw != proposed["commit_json"]
+    commit_digest = hashlib.sha256(commit_raw.encode("ascii")).hexdigest()
+    proposed["commit_json"] = commit_raw
+    proposed["commit_sha256"] = commit_digest
+    proposed["permit"]["commit_sha256"] = commit_digest
+    proposed_raw = json.dumps(proposed, sort_keys=True, separators=(",", ":"))
+    graph_keys = _core_keys(keys)
+    before = _database_snapshot(production_lua)
+
+    result = production_lua.eval(
+        AUTHORIZE_COMMIT_LUA,
+        graph_keys,
+        [
+            "family",
+            proposed_raw,
+            serialize_graph_lock(lease, keys),
+            *_expected_core_args(production_lua, graph_keys),
+        ],
+        nonce_idempotent=True,
+    )
+
+    assert result == ["ERR", "COORDINATION_STATE_CORRUPT"]
+    assert _database_snapshot(production_lua) == before
+
+
+@pytest.mark.parametrize(
+    ("domain", "corruption"),
+    (
+        ("generic", "domain"),
+        ("generic", "scope-hmac"),
+        ("generic", "acquisition-hmac"),
+        ("generic", "expires-at"),
+        ("generic", "ttl"),
+        ("generic", "renew-deadline"),
+        ("generic", "applied-expiry"),
+        ("generic", "no-expiry"),
+        ("graph", "fencing-token"),
+        ("graph", "base-revision"),
+    ),
+)
+def test_release_lua_rejects_invalid_current_lock_envelope_without_mutation(
+    production_lua: ProductionLuaHarness,
+    domain: str,
+    corruption: str,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    scope = "family"
+    acquisition_id = f"acq-release-{domain}-{corruption}"
+    if domain == "generic":
+        manager = UpstashLeaseManager(production_lua, keys)
+        lease = manager.acquire(scope, acquisition_id)
+        lock_key = keys.generic_lock(scope)
+        receipt_key = keys.generic_operation_result(scope, "release-corrupt")
+        expected_raw = serialize_generic_lock(lease, keys)
+    else:
+        _seed_ready_graph(production_lua, keys)
+        coordinator = UpstashCommitCoordinator(production_lua, keys)
+        lease = coordinator.acquire(scope, 0, acquisition_id)
+        lock_key = keys.graph_lock(scope)
+        receipt_key = keys.graph_operation_result(scope, "release-corrupt")
+        expected_raw = serialize_graph_lock(lease, keys)
+
+    lock = json.loads(expected_raw)
+    if corruption == "domain":
+        lock["domain"] = "GRAPH_COMMIT"
+    elif corruption == "scope-hmac":
+        lock["scope_hmac"] = "f" * 64
+    elif corruption == "acquisition-hmac":
+        lock["acquisition_id_hmac"] = "f" * 64
+    elif corruption == "expires-at":
+        lock["expires_at_ms"] = str(lease.expires_at_ms + 1)
+    elif corruption == "ttl":
+        lock["ttl_ms"] = "300001"
+    elif corruption == "renew-deadline":
+        lock["renew_deadline_ms"] = str(lease.renew_deadline_ms + 1)
+    elif corruption == "fencing-token":
+        lock["fencing_token"] = "0"
+    elif corruption == "base-revision":
+        lock["base_revision"] = "-1"
+    current_raw = json.dumps(lock, sort_keys=True, separators=(",", ":"))
+
+    if corruption == "no-expiry":
+        production_lua.client.set(lock_key, current_raw)
+    elif corruption == "applied-expiry":
+        production_lua.client.set(lock_key, current_raw, pxat=lease.expires_at_ms + 1)
+    else:
+        production_lua.client.set(lock_key, current_raw, pxat=lease.expires_at_ms)
+
+    request = lease_operation_request(keys, "release", lease, "release-corrupt")
+    request_payload = json.loads(request.text)
+    request_payload["lock_sha256"] = hashlib.sha256(
+        current_raw.encode("ascii")
+    ).hexdigest()
+    request_raw = json.dumps(request_payload, sort_keys=True, separators=(",", ":"))
+    request_sha256 = hashlib.sha256(request_raw.encode("ascii")).hexdigest()
+    before = _database_snapshot(production_lua)
+
+    result = production_lua.eval(
+        LEASE_RELEASE_LUA,
+        [lock_key, receipt_key],
+        [request_raw, request_sha256, scope, acquisition_id, current_raw],
+        nonce_idempotent=True,
+    )
+
+    assert result == ["ERR", "COORDINATION_STATE_CORRUPT"]
     assert _database_snapshot(production_lua) == before
 
 
@@ -705,10 +993,7 @@ def test_revocation_preserves_exact_expiry_above_the_lua_integer_boundary(
     receipt = json.loads(
         production_lua.client.get(keys.revocation_nonce("large-expiry-nonce"))
     )
-    checked = store.is_revoked("large-expiry", token_expires_at_s)
     assert result.expires_at_ms == expected_expires_at_ms
-    assert checked.expires_at_ms == expected_expires_at_ms
-    assert checked.revoked is True
     assert entry["expires_at_ms"] == str(expected_expires_at_ms)
     assert receipt["expires_at_ms"] == str(expected_expires_at_ms)
 
@@ -724,9 +1009,59 @@ def test_revocation_accepts_the_largest_whole_second_signed_64_expiry(
     result = store.revoke("max-expiry", token_expires_at_s, "max-expiry-nonce")
 
     assert result.expires_at_ms == expected_expires_at_ms
-    assert store.is_revoked("max-expiry", token_expires_at_s).expires_at_ms == (
-        expected_expires_at_ms
+    entry = json.loads(production_lua.client.get(keys.revocation_entry("max-expiry")))
+    assert entry["expires_at_ms"] == str(expected_expires_at_ms)
+
+
+@pytest.mark.parametrize("target", ("receipt", "entry"))
+@pytest.mark.parametrize(
+    "expiry_state", ("exact", "overlong", "underlong", "no-expiry")
+)
+def test_revocation_fails_closed_for_unverifiable_retained_high_expiry_without_mutation(
+    production_lua: ProductionLuaHarness,
+    target: str,
+    expiry_state: str,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    store = UpstashRevocationStore(production_lua, keys, leeway_seconds=0)
+    jti = f"retained-high-{target}-{expiry_state}"
+    nonce = f"retained-high-nonce-{target}-{expiry_state}"
+    token_expires_at_s = 9_007_199_254_741
+    expected_expiry = token_expires_at_s * 1_000
+    store.revoke(jti, token_expires_at_s, nonce)
+    entry_key = keys.revocation_entry(jti)
+    receipt_key = keys.revocation_nonce(nonce)
+    entry_raw = production_lua.client.get(entry_key)
+    assert entry_raw is not None
+
+    state_key = receipt_key if target == "receipt" else entry_key
+    if target == "entry":
+        production_lua.client.delete(receipt_key)
+    if expiry_state == "overlong":
+        production_lua.client.pexpireat(state_key, expected_expiry + 1)
+    elif expiry_state == "underlong":
+        production_lua.client.pexpireat(state_key, expected_expiry - 1)
+    elif expiry_state == "no-expiry":
+        production_lua.client.persist(state_key)
+
+    request = revocation_request(keys, jti, token_expires_at_s, 0)
+    before = _database_snapshot(production_lua)
+    result = production_lua.eval(
+        REVOCATION_REVOKE_LUA,
+        [entry_key, receipt_key],
+        [
+            request.text,
+            request.sha256,
+            jti,
+            str(token_expires_at_s),
+            "0",
+            entry_raw,
+        ],
+        nonce_idempotent=True,
     )
+
+    assert result == ["ERR", "COORDINATION_STATE_CORRUPT"]
+    assert _database_snapshot(production_lua) == before
 
 
 def test_revocation_rejects_derived_signed_64_overflow_without_partial_writes(

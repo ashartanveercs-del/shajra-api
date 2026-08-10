@@ -451,3 +451,136 @@ Commands were run from `backend/` unless stated otherwise.
 - No task-blocking correctness concern remains. All Redis/Lua verification is
   deterministic and in-process; no live Upstash compatibility call was made by
   design.
+
+---
+
+# Task 4 Fix Round 2 Report
+
+## Status And Scope
+
+`STATUS: DONE_WITH_CONCERNS`
+
+- Fix base and starting `HEAD`:
+  `98a8e3c90d64cd5d124d74823296b30c7c12f6ee`.
+- Branch: `codex/shajra-reliability` in the existing shared worktree.
+- Preserved and completed the inherited uncommitted changes in
+  `backend/coordination/upstash.py` and
+  `backend/tests/unit/coordination/test_lua_integration.py`.
+- No Redis, Upstash, cloud, deployment, push, merge, or `main` action was
+  performed.
+
+## Round 2 TDD Evidence
+
+### Internal Digest Recalculation
+
+- Test:
+  `test_authorization_lua_recomputes_every_recovery_payload_digest_before_mutation`
+  in `test_lua_integration.py`, parameterized for commit JSON, staged receipt,
+  and write-set payload mismatches.
+- RED: loaded the exact base script from
+  `98a8e3c90d64cd5d124d74823296b30c7c12f6ee` in-process and ran the new test:
+  `3 failed`; each invalid recovery bundle returned success on the base script.
+- GREEN: the exact shipped `AUTHORIZE_COMMIT_LUA` test returned `3 passed in
+  4.35s`.
+- Implementation: the atomic script runs a Redis-Lua-compatible SHA-256 over
+  each exact payload byte string and compares all three internal digest
+  relationships before mutation. The test executes the production Lua itself
+  and snapshots all key bytes and absolute expiries.
+
+### Exact Commit Revision And Fence Parsing
+
+- Tests:
+  `test_authorization_lua_preserves_exact_high_commit_revision_and_fence` and
+  `test_authorization_lua_rejects_noncanonical_or_overflow_commit_numbers`.
+- RED: the initial focused production-Lua command returned `2 failed, 10
+  passed`; both `2^53+1` and signed-64 maximum were rejected by the double-based
+  path.
+- GREEN: the exact high, malformed, noncanonical, and overflow matrix returned
+  `9 passed, 121 deselected in 10.36s`.
+- Implementation: a fixed-schema lexical parser extracts and validates the two
+  canonical signed-64 decimal tokens, masks them with safe integers only for
+  the remaining `cjson` canonicality check, and retains the exact strings for
+  all identity comparisons. The amended path performs no `tonumber`, numeric
+  formatting, or arithmetic on revision/fence values. The tests execute the
+  production Lua itself and verify unchanged state on every rejection.
+
+### Strict Release Envelope Validation
+
+- Test:
+  `test_release_lua_rejects_invalid_current_lock_envelope_without_mutation`,
+  covering domain, scope/acquisition HMACs, expiry, TTL, renewal deadline,
+  applied expiry, no-expiry state, and graph fence/base revision.
+- RED: direct `LEASE_RELEASE_LUA` execution returned `10 failed`; nine cases
+  deleted the lock and wrote a success receipt, while no-expiry state returned
+  the less strict lost result.
+- GREEN: the same exact-production-Lua matrix returned `10 passed in 15.87s`.
+- Implementation: release now recomputes the canonical request and expected-lock
+  digests, validates the complete generic/graph lock against request and key
+  identity, checks all timing and graph fields, and compares PTTL plus absolute
+  expiry before deleting the lock. Every corrupt case preserves lock, receipt,
+  bytes, and TTLs.
+
+### Fail-Closed High Expiry
+
+- Test:
+  `test_revocation_fails_closed_for_unverifiable_retained_high_expiry_without_mutation`,
+  parameterized over retained receipts and retained entries with exact,
+  overlong, underlong, missing-receipt, and no-expiry conditions above `2^53`.
+  Existing largest-whole-second and derived signed-64 overflow tests remain.
+- RED: direct production-Lua replay returned `8 failed`; the old helper accepted
+  or repaired every unverifiable high-expiry retained state.
+- GREEN: the exact replay matrix returned `8 passed in 9.22s`.
+- Implementation: retained expiry validation now returns corruption without any
+  mutation when the expected absolute expiry exceeds Lua's exact integer range.
+  New revocations still pass the exact canonical signed-64 decimal directly to
+  Redis `SET PXAT`, without converting it to a Lua number. Exact high-expiry
+  creation and the signed-64 upper/overflow boundaries execute through the
+  production Lua tests.
+
+## Final Verification
+
+Commands were run from `backend/` unless stated otherwise.
+
+- Four-blocker focused production-Lua slice:
+  `python -m pytest tests/unit/coordination/test_lua_integration.py -q -k
+  "...round-2 selectors..."` -> `33 passed, 115 deselected in 38.89s`.
+- Exact production Lua:
+  `python -m pytest tests/unit/coordination/test_lua_integration.py -q` ->
+  `148 passed in 190.61s`.
+- All coordination:
+  `python -m pytest tests/unit/coordination -q` ->
+  `297 passed in 197.90s`.
+- Configuration:
+  `python -m pytest tests/test_config.py -q` -> `65 passed in 0.92s`.
+- Ruff:
+  `ruff check coordination tests/unit/coordination config.py upstash_url.py
+  tests/test_config.py` -> `All checks passed!`.
+- Scoped format:
+  `ruff format --check coordination tests/unit/coordination upstash_url.py
+  tests/test_config.py` -> `12 files already formatted`.
+- Mypy:
+  `mypy coordination upstash_url.py config.py` ->
+  `Success: no issues found in 7 source files`.
+- Full backend:
+  `python -m pytest -q` -> `744 passed, 1 warning in 198.08s`.
+- Lua syntax: all 14 exported production script constants parsed with
+  `luaparser==3.3.0` -> `14 Lua scripts parsed successfully`.
+- `git diff --check` -> clean after the report update.
+
+## Changed Files
+
+- `backend/coordination/upstash.py`
+- `backend/tests/unit/coordination/test_lua_integration.py`
+- `.superpowers/sdd/2026-08-03-shajra-backend-persistence-and-migration/task-4-report.md`
+
+## Concerns
+
+- Retained absolute expiries above `2^53` deliberately fail closed even when
+  their metadata claims an exact match because Redis exposes `PEXPIRETIME` to
+  Lua as an inexact double; silently accepting or repairing them would violate
+  the binding exactness contract. Exact new-state `PXAT` creation remains
+  supported with canonical decimal strings.
+- The full suite emits the pre-existing `StarletteDeprecationWarning` from
+  FastAPI's test client. The deterministic fakeredis/Lupa harness executes the
+  exact production Lua but, per task constraints, no live Redis compatibility
+  call was made.

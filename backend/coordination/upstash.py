@@ -177,6 +177,124 @@ local function valid_digest(value)
   return type(value) == 'string' and #value == 64
     and not string.find(value, '[^0-9a-f]')
 end
+local SHA256_CONSTANTS = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,
+  0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
+  0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,
+  0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,
+  0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
+  0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,
+  0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,
+  0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
+  0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2}
+local function binary_u32(left, right, operation)
+  left = left % 4294967296
+  right = right % 4294967296
+  local result = 0
+  local place = 1
+  for _ = 1, 32 do
+    local left_bit = left % 2
+    local right_bit = right % 2
+    if operation == 'xor' and left_bit ~= right_bit then result = result + place end
+    if operation == 'and' and left_bit == 1 and right_bit == 1 then
+      result = result + place
+    end
+    left = math.floor(left / 2)
+    right = math.floor(right / 2)
+    place = place * 2
+  end
+  return result
+end
+local function xor_u32(...)
+  local result = 0
+  for index = 1, select('#', ...) do
+    result = binary_u32(result, select(index, ...), 'xor')
+  end
+  return result
+end
+local function and_u32(...)
+  local result = 4294967295
+  for index = 1, select('#', ...) do
+    result = binary_u32(result, select(index, ...), 'and')
+  end
+  return result
+end
+local function not_u32(value)
+  return 4294967295 - (value % 4294967296)
+end
+local function rshift_u32(value, width)
+  return math.floor((value % 4294967296) / (2 ^ width))
+end
+local function ror_u32(value, width)
+  value = value % 4294967296
+  local divisor = 2 ^ width
+  return math.floor(value / divisor) + ((value % divisor) * (2 ^ (32 - width)))
+end
+local function add_u32(...)
+  local sum = 0
+  for index = 1, select('#', ...) do
+    local value = select(index, ...)
+    sum = (sum + value) % 4294967296
+  end
+  return sum
+end
+local function u32_bytes(value)
+  value = value % 4294967296
+  return string.char(math.floor(value / 16777216) % 256,
+    math.floor(value / 65536) % 256, math.floor(value / 256) % 256,
+    value % 256)
+end
+local function sha256_hex(value)
+  if type(value) ~= 'string' then return nil end
+  local bit_length = #value * 8
+  local high = math.floor(bit_length / 4294967296)
+  local low = bit_length % 4294967296
+  local padding = (56 - ((#value + 1) % 64)) % 64
+  local message = value .. string.char(0x80) .. string.rep(string.char(0), padding)
+    .. u32_bytes(high) .. u32_bytes(low)
+  local hashes = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}
+  for offset = 1, #message, 64 do
+    local words = {}
+    for index = 0, 15 do
+      local position = offset + (index * 4)
+      words[index + 1] = (string.byte(message, position) * 16777216)
+        + (string.byte(message, position + 1) * 65536)
+        + (string.byte(message, position + 2) * 256)
+        + string.byte(message, position + 3)
+    end
+    for index = 17, 64 do
+      local left = words[index - 15]
+      local right = words[index - 2]
+      local sigma0 = xor_u32(ror_u32(left, 7), ror_u32(left, 18),
+        rshift_u32(left, 3))
+      local sigma1 = xor_u32(ror_u32(right, 17), ror_u32(right, 19),
+        rshift_u32(right, 10))
+      words[index] = add_u32(words[index - 16], sigma0, words[index - 7], sigma1)
+    end
+    local a,b,c,d,e,f,g,h = hashes[1],hashes[2],hashes[3],hashes[4],
+      hashes[5],hashes[6],hashes[7],hashes[8]
+    for index = 1, 64 do
+      local choice = xor_u32(and_u32(e, f), and_u32(not_u32(e), g))
+      local majority = xor_u32(and_u32(a, b), and_u32(a, c), and_u32(b, c))
+      local sigma0 = xor_u32(ror_u32(a, 2), ror_u32(a, 13), ror_u32(a, 22))
+      local sigma1 = xor_u32(ror_u32(e, 6), ror_u32(e, 11), ror_u32(e, 25))
+      local first = add_u32(h, sigma1, choice, SHA256_CONSTANTS[index], words[index])
+      local second = add_u32(sigma0, majority)
+      h,g,f,e,d,c,b,a = g,f,e,add_u32(d, first),c,b,a,add_u32(first, second)
+    end
+    for index, value_hash in ipairs({a,b,c,d,e,f,g,h}) do
+      hashes[index] = add_u32(hashes[index], value_hash)
+    end
+  end
+  local result = {}
+  for _, hash in ipairs(hashes) do
+    table.insert(result, string.format('%08x', hash))
+  end
+  return table.concat(result)
+end
 local function valid_text(value, maximum)
   return type(value) == 'string' and value ~= '' and #value <= maximum
     and not string.find(value, '\0', 1, true)
@@ -228,8 +346,7 @@ end
 local function ensure_exact_expiry(key, expected)
   if not canonical_positive(expected) then return false end
   if decimal_compare(expected, '9007199254740991') > 0 then
-    redis.call('PEXPIREAT', key, expected)
-    return true
+    return false
   end
   local observed = redis.call('PEXPIRETIME', key)
   local target = tonumber(expected)
@@ -351,26 +468,84 @@ local function exact_table(value, schema, fields)
   for key, _ in pairs(fields) do if value[key] == nil then return nil end end
   return value
 end
+local function consume_literal(raw, position, literal)
+  if string.sub(raw, position, position + #literal - 1) ~= literal then return nil end
+  return position + #literal
+end
+local function consume_json_string(raw, position)
+  if string.byte(raw, position) ~= 0x22 then return nil end
+  position = position + 1
+  while position <= #raw do
+    local byte = string.byte(raw, position)
+    if byte == 0x22 then return position + 1 end
+    if byte == 0x5C then
+      position = position + 1
+      if position > #raw then return nil end
+    elseif byte < 0x20 then
+      return nil
+    end
+    position = position + 1
+  end
+  return nil
+end
+local function consume_positive_decimal(raw, position)
+  local first = position
+  while position <= #raw do
+    local byte = string.byte(raw, position)
+    if byte < 0x30 or byte > 0x39 then break end
+    position = position + 1
+  end
+  local value = string.sub(raw, first, position - 1)
+  if not canonical_positive(value) then return nil end
+  return position, value, first
+end
+local function masked_graph_commit(raw)
+  local position = consume_literal(raw, 1, '{"committed_at":')
+  if not position then return nil end
+  position = consume_json_string(raw, position)
+  if not position then return nil end
+  position = consume_literal(raw, position, ',"fencing_token":')
+  if not position then return nil end
+  local fence_end, fence, fence_start = consume_positive_decimal(raw, position)
+  if not fence_end then return nil end
+  position = consume_literal(raw, fence_end, ',"operation_id":')
+  if not position then return nil end
+  position = consume_json_string(raw, position)
+  if not position then return nil end
+  position = consume_literal(raw, position, ',"permit_id":')
+  if not position then return nil end
+  position = consume_json_string(raw, position)
+  if not position then return nil end
+  position = consume_literal(raw, position, ',"revision":')
+  if not position then return nil end
+  local revision_end, revision, revision_start = consume_positive_decimal(raw, position)
+  if not revision_end then return nil end
+  position = consume_literal(raw, revision_end, ',"semantic_checksum":')
+  if not position then return nil end
+  position = consume_json_string(raw, position)
+  if not position or position ~= #raw or string.sub(raw, position, position) ~= '}' then
+    return nil
+  end
+  local masked = string.sub(raw, 1, fence_start - 1) .. '1'
+    .. string.sub(raw, fence_end, revision_start - 1) .. '1'
+    .. string.sub(raw, revision_end)
+  return masked, revision, fence
+end
 local function strict_graph_commit(raw)
   if type(raw) ~= 'string' then return nil end
-  local commit = decode_object(raw)
+  local masked, revision, fence = masked_graph_commit(raw)
+  if not masked then return nil end
+  local commit = decode_object(masked)
   if not commit then return nil end
   local fields = {operation_id=true,revision=true,fencing_token=true,
     permit_id=true,semantic_checksum=true,committed_at=true}
   for key, _ in pairs(commit) do if not fields[key] then return nil end end
   for key, _ in pairs(fields) do if commit[key] == nil then return nil end end
   local ok, canonical = pcall(canonical_json, commit)
-  if not ok or canonical ~= raw or not valid_text(commit.operation_id, 512)
-      or type(commit.revision) ~= 'number' or commit.revision < 1
-      or commit.revision ~= math.floor(commit.revision)
-      or type(commit.fencing_token) ~= 'number' or commit.fencing_token < 1
-      or commit.fencing_token ~= math.floor(commit.fencing_token)
+  if not ok or canonical ~= masked or not valid_text(commit.operation_id, 512)
       or not valid_text(commit.permit_id, 512)
       or not valid_digest(commit.semantic_checksum)
       or not valid_text(commit.committed_at, 512) then return nil end
-  local revision = string.format('%.0f', commit.revision)
-  local fence = string.format('%.0f', commit.fencing_token)
-  if not canonical_positive(revision) or not canonical_positive(fence) then return nil end
   return commit, revision, fence
 end
 local function strict_reservation(raw)
@@ -398,14 +573,18 @@ local function strict_reservation(raw)
       or not valid_digest(permit.commit_sha256) then return nil end
   local commit, commit_revision, commit_fence = strict_graph_commit(
     reservation.commit_json)
-  if not commit then return nil end
+  if not commit or sha256_hex(reservation.commit_json) ~= reservation.commit_sha256 then
+    return nil
+  end
   if not canonical_positive(commit_revision) or not canonical_positive(commit_fence)
       or permit.operation_id ~= commit.operation_id
       or permit.revision ~= commit_revision
       or permit.fencing_token ~= commit_fence
       or permit.permit_id ~= commit.permit_id
       or permit.commit_sha256 ~= reservation.commit_sha256 then return nil end
-  if type(reservation.staged_write_receipt_json) ~= 'string' then return nil end
+  if type(reservation.staged_write_receipt_json) ~= 'string'
+      or sha256_hex(reservation.staged_write_receipt_json)
+        ~= reservation.staged_write_receipt_sha256 then return nil end
   local staged = strict_object(reservation.staged_write_receipt_json,
     'shajra.staged-write-receipt', {schema=true,version=true,operation_id=true,
       revision=true,fencing_token=true,write_set_json=true,write_set_sha256=true})
@@ -414,6 +593,7 @@ local function strict_reservation(raw)
       or not canonical_positive(staged.fencing_token)
       or type(staged.write_set_json) ~= 'string'
       or not valid_digest(staged.write_set_sha256)
+      or sha256_hex(staged.write_set_json) ~= staged.write_set_sha256
       or staged.operation_id ~= permit.operation_id
       or staged.revision ~= permit.revision
       or staged.fencing_token ~= permit.fencing_token then return nil end
@@ -928,6 +1108,7 @@ if not request or request.method ~= 'release'
     or not valid_digest(request.acquisition_id_hmac)
     or not valid_digest(request.request_nonce_hmac)
     or not valid_digest(request.lock_sha256)
+    or sha256_hex(ARGV[1]) ~= ARGV[2]
     or not valid_text(ARGV[3], 512) or not valid_text(ARGV[4], 512) then
   return {'ERR', 'COORDINATION_STATE_CORRUPT'}
 end
@@ -963,7 +1144,9 @@ if retained then
 end
 local current = redis.call('GET', KEYS[1])
 local pttl = redis.call('PTTL', KEYS[1])
-if not current or pttl <= 0 then return {'ERR', 'LEASE_LOST'} end
+if not current then return {'ERR', 'LEASE_LOST'} end
+if pttl == -1 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if pttl <= 0 then return {'ERR', 'LEASE_LOST'} end
 local lock_value = nil
 if request.domain == 'GENERIC' then
   lock_value = strict_object(current, 'shajra.generic-lock', {
@@ -976,8 +1159,34 @@ else
     acquisition_id_hmac=true,fencing_token=true,base_revision=true,
     expires_at_ms=true,ttl_ms=true,renew_deadline_ms=true})
 end
-if not lock_value then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+if not lock_value or lock_value.domain ~= request.domain
+    or lock_value.scope_hmac ~= key_scope_hmac
+    or lock_value.scope_hmac ~= request.scope_hmac
+    or lock_value.acquisition_id_hmac ~= request.acquisition_id_hmac
+    or not valid_digest(lock_value.scope_hmac)
+    or not valid_digest(lock_value.acquisition_id_hmac)
+    or not canonical_positive(lock_value.expires_at_ms)
+    or not canonical_positive(lock_value.ttl_ms)
+    or not decimal_lte(lock_value.ttl_ms, '300000')
+    or not canonical_nonnegative(lock_value.renew_deadline_ms)
+    or decimal_subtract(lock_value.expires_at_ms,
+      lock_value.renew_deadline_ms) ~= '5000'
+    or pttl > tonumber(lock_value.ttl_ms) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+if request.domain == 'GRAPH_COMMIT'
+    and (not canonical_positive(lock_value.fencing_token)
+      or not canonical_nonnegative(lock_value.base_revision)) then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 if current ~= ARGV[5] then return {'ERR', 'LEASE_LOST'} end
+if sha256_hex(ARGV[5]) ~= request.lock_sha256 then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
+local applied_expiry = redis.call('PEXPIRETIME', KEYS[1])
+if applied_expiry <= 0 or tostring(applied_expiry) ~= lock_value.expires_at_ms then
+  return {'ERR', 'COORDINATION_STATE_CORRUPT'}
+end
 local clock = redis.call('TIME')
 local server_ms = redis_time_ms(clock)
 local receipt_expires = server_ms and decimal_add(server_ms, '60000')
