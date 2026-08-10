@@ -584,3 +584,96 @@ Commands were run from `backend/` unless stated otherwise.
   FastAPI's test client. The deterministic fakeredis/Lupa harness executes the
   exact production Lua but, per task constraints, no live Redis compatibility
   call was made.
+
+---
+
+# Task 4 Fix Round 3 Report
+
+## Status And Scope
+
+`STATUS: DONE_WITH_CONCERNS`
+
+- Fix base and starting `HEAD`:
+  `28d45747a959e59d5a3e776025fc99cb7fc481b2`.
+- Branch: `codex/shajra-reliability` in the prescribed linked worktree.
+- Preserved, diagnosed, and completed the inherited uncommitted changes in
+  `backend/coordination/upstash.py`,
+  `backend/tests/unit/coordination/conftest.py`, and
+  `backend/tests/unit/coordination/test_lua_integration.py`.
+- No Redis, Upstash, network, cloud, deployment, push, merge, or `main` action
+  was performed.
+
+## Harness Diagnosis And TDD Evidence
+
+- The first unchanged inherited-patch command ran the smallest exact-production
+  SHA vector slice. All 9 empty, ASCII, block-boundary, multi-block, and
+  `0x00..0x7f` vectors passed in 9.59 seconds, proving the SHA rounds themselves
+  were correct before any further edit.
+- The harness difference is specific and reproducible: fakeredis 2.36.2 defaults
+  to `lupa.lua51`, where loading `lua_modules={"bit"}` reports `module 'bit' not
+  found` and leaves the global nil. Redis exposes Lua BitOp. The production
+  fixture therefore uses `lupa.luajit21` with its native `bit` module, while a
+  separate arithmetic compatibility shim runs the same 9 vectors on fakeredis's
+  default Lua 5.1. A spy regression proves the shipped SHA path invokes native
+  BitOp rather than the shim.
+- RED performance reproduction used the exact production authorization script
+  and realistic many-ID canonical payloads through the arithmetic shim. A
+  10,000-character staged receipt with a 9,297-character write set took 3.453
+  seconds; a 100,000-character staged receipt with a 94,905-character write set
+  took 33.026 seconds.
+- GREEN production-native measurements over the identical script and data path
+  were 0.010 seconds at 10,000 characters, 0.077 seconds at 100,000 characters,
+  and 1.562 seconds for a 1,950,000-character staged receipt containing a
+  1,854,663-character write set. The near-limit case remains below the unchanged
+  2,000,000-character limits and within the practical local script envelope.
+- Seven exact-production-Lua malformed digest/HMAC cases cover short, overlong,
+  uppercase, non-hex, and non-digest values across reservation, permit, commit,
+  staged receipt, and write-set relationships. All return
+  `COORDINATION_STATE_CORRUPT`; complete key-value and `PEXPIRETIME` snapshots are
+  unchanged.
+
+## Implementation
+
+- Replaced every 32-iteration arithmetic XOR/AND hot-path call with Redis-native
+  `bit.bxor`, `bit.band`, `bit.bnot`, `bit.rshift`, and `bit.ror`, normalizing
+  signed BitOp results back to unsigned 32-bit values.
+- Retained exact in-script SHA-256 recomputation for commit JSON, the complete
+  staged receipt, and its embedded write-set JSON. Lowercase 64-hex output,
+  canonical parsing, all accepted round-2 behavior, and the 2,000,000-character
+  limits are unchanged.
+- Added isolated native/default-Lua harness paths, exact vectors, a native-BitOp
+  spy, malformed-digest mutation safety, and realistically large authorization
+  payload generation using many ordinary-sized canonical person IDs.
+
+## Final Verification
+
+Commands were run from `backend/` unless stated otherwise.
+
+- Round-3 SHA/vector, native-path, malformed-digest, and large-payload slice:
+  `29 passed, 148 deselected in 34.75s`.
+- All round-2 focused regressions: `33 passed, 144 deselected in 34.85s`.
+- Exact production Lua: `177 passed in 188.04s`.
+- All coordination: `326 passed in 192.43s`.
+- Configuration: `65 passed in 1.14s`.
+- Ruff scoped check: `All checks passed!`.
+- Ruff scoped format: `12 files already formatted`.
+- Mypy: `Success: no issues found in 7 source files`.
+- Full backend: `773 passed, 1 warning in 199.07s`.
+- Lua syntax: all 14 exported production script constants parsed successfully
+  with `luaparser==3.3.0`.
+- `git diff --check`: clean apart from Git's Windows line-ending notices.
+
+## Changed Files
+
+- `backend/coordination/upstash.py`
+- `backend/tests/unit/coordination/conftest.py`
+- `backend/tests/unit/coordination/test_lua_integration.py`
+- `.superpowers/sdd/2026-08-03-shajra-backend-persistence-and-migration/task-4-report.md`
+
+## Concerns
+
+- The full suite retains the pre-existing FastAPI `StarletteDeprecationWarning`
+  about the deprecated httpx test-client integration.
+- Native Redis BitOp behavior is exercised deterministically through LuaJIT and
+  the exact shipped script. Per task constraints, no live Redis or Upstash call
+  was made.

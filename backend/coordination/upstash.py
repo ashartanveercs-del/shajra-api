@@ -189,48 +189,21 @@ local SHA256_CONSTANTS = {
   0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,
   0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
   0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2}
-local function binary_u32(left, right, operation)
-  left = left % 4294967296
-  right = right % 4294967296
-  local result = 0
-  local place = 1
-  for _ = 1, 32 do
-    local left_bit = left % 2
-    local right_bit = right % 2
-    if operation == 'xor' and left_bit ~= right_bit then result = result + place end
-    if operation == 'and' and left_bit == 1 and right_bit == 1 then
-      result = result + place
-    end
-    left = math.floor(left / 2)
-    right = math.floor(right / 2)
-    place = place * 2
-  end
-  return result
-end
+local SHA256_BIT = bit
 local function xor_u32(...)
-  local result = 0
-  for index = 1, select('#', ...) do
-    result = binary_u32(result, select(index, ...), 'xor')
-  end
-  return result
+  return SHA256_BIT.bxor(...) % 4294967296
 end
 local function and_u32(...)
-  local result = 4294967295
-  for index = 1, select('#', ...) do
-    result = binary_u32(result, select(index, ...), 'and')
-  end
-  return result
+  return SHA256_BIT.band(...) % 4294967296
 end
 local function not_u32(value)
-  return 4294967295 - (value % 4294967296)
+  return SHA256_BIT.bnot(value) % 4294967296
 end
 local function rshift_u32(value, width)
-  return math.floor((value % 4294967296) / (2 ^ width))
+  return SHA256_BIT.rshift(value, width) % 4294967296
 end
 local function ror_u32(value, width)
-  value = value % 4294967296
-  local divisor = 2 ^ width
-  return math.floor(value / divisor) + ((value % divisor) * (2 ^ (32 - width)))
+  return SHA256_BIT.ror(value, width) % 4294967296
 end
 local function add_u32(...)
   local sum = 0
@@ -247,7 +220,12 @@ local function u32_bytes(value)
     value % 256)
 end
 local function sha256_hex(value)
-  if type(value) ~= 'string' then return nil end
+  if type(value) ~= 'string' or type(SHA256_BIT) ~= 'table'
+      or type(SHA256_BIT.bxor) ~= 'function'
+      or type(SHA256_BIT.band) ~= 'function'
+      or type(SHA256_BIT.bnot) ~= 'function'
+      or type(SHA256_BIT.rshift) ~= 'function'
+      or type(SHA256_BIT.ror) ~= 'function' then return nil end
   local bit_length = #value * 8
   local high = math.floor(bit_length / 4294967296)
   local low = bit_length % 4294967296

@@ -2,9 +2,10 @@
 
 import hashlib
 import json
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from collections.abc import Callable, Sequence
+from time import perf_counter
 from typing import Any, Protocol
 
 import pytest
@@ -30,6 +31,7 @@ from coordination.serialization import (
     serialize_graph_lock,
     serialize_reconciled_head_receipt,
     serialize_revocation_entry,
+    serialize_staged_write_receipt,
 )
 from coordination.upstash import (
     AUTHORIZE_COMMIT_LUA,
@@ -51,8 +53,9 @@ from coordination.upstash import (
     UpstashLeaseManager,
     UpstashRateLimiter,
     UpstashRevocationStore,
+    _LUA_DECIMAL_VALIDATION,
 )
-from domain.ids import OperationId
+from domain.ids import OperationId, PersonId
 from repositories import (
     CommitPermit,
     GraphCommit,
@@ -79,6 +82,70 @@ class ProductionLuaHarness(Protocol):
         *,
         nonce_idempotent: bool,
     ) -> list[Any]: ...
+
+
+SHA256_PROBE_LUA = (
+    "-- shajra-test:sha256-probe:v1\n"
+    + _LUA_DECIMAL_VALIDATION
+    + r"""
+if #KEYS ~= 0 or #ARGV ~= 1 then return {'ERR', 'COORDINATION_STATE_CORRUPT'} end
+return {'OK', sha256_hex(ARGV[1])}
+"""
+)
+
+SHA256_VECTORS = (
+    ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+    ("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+    ("a" * 55, "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"),
+    ("a" * 56, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"),
+    ("a" * 63, "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34"),
+    ("a" * 64, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"),
+    ("a" * 65, "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0"),
+    ("a" * 1_000, "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"),
+    (
+        "".join(chr(value) for value in range(0x80)),
+        "471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5",
+    ),
+)
+
+
+@pytest.mark.parametrize(("value", "expected"), SHA256_VECTORS)
+def test_sha256_vectors_use_the_exact_production_lua(
+    production_lua: ProductionLuaHarness,
+    value: str,
+    expected: str,
+) -> None:
+    result = production_lua.eval(SHA256_PROBE_LUA, [], [value], nonce_idempotent=False)
+
+    assert result == ["OK", expected]
+
+
+@pytest.mark.parametrize(("value", "expected"), SHA256_VECTORS)
+def test_sha256_vectors_pass_with_the_arithmetic_compatibility_shim(
+    production_lua_compat: ProductionLuaHarness,
+    value: str,
+    expected: str,
+) -> None:
+    result = production_lua_compat.eval(
+        SHA256_PROBE_LUA, [], [value], nonce_idempotent=False
+    )
+
+    assert result == ["OK", expected]
+
+
+def test_sha256_production_path_invokes_native_bitop(
+    production_lua_bit_spy: ProductionLuaHarness,
+) -> None:
+    result = production_lua_bit_spy.eval(
+        SHA256_PROBE_LUA, [], ["abc"], nonce_idempotent=False
+    )
+    calls = production_lua_bit_spy.client.eval("return __shajra_bit_calls", 0)
+
+    assert result == [
+        "OK",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    ]
+    assert calls > 0
 
 
 def test_harness_executes_the_exact_production_lua_string(
@@ -216,6 +283,72 @@ def _reservation_values(
         lease.scope, "COMMITTING", permit, commit, digest, staged
     )
     return permit, commit, serialize_commit_reservation(reservation, keys, nonce)
+
+
+def _large_reservation_values(
+    keys: RedisKeyBuilder,
+    lease: GraphLease,
+    *,
+    staged_receipt_size: int,
+) -> tuple[str, int, int]:
+    def make_staged(person_ids: tuple[PersonId, ...]) -> tuple[StagedWriteReceipt, str]:
+        write_set_json = canonical_graph_write_set_json(
+            GraphWriteSet(person_tombstones=person_ids)
+        )
+        staged = StagedWriteReceipt(
+            OperationId("op_large_lua"),
+            1,
+            lease.fencing_token,
+            write_set_json,
+            hashlib.sha256(write_set_json.encode("ascii")).hexdigest(),
+        )
+        return staged, serialize_staged_write_receipt(staged)
+
+    _empty_staged, empty_raw = make_staged(())
+    standard_id_size = len("per_" + ("0" * 32))
+    escaped_list_item_size = standard_id_size + 5
+    item_count = max(
+        1, (staged_receipt_size - len(empty_raw) + 1) // escaped_list_item_size
+    )
+    person_ids = tuple(PersonId(f"per_{index:032x}") for index in range(item_count))
+    staged, staged_raw = make_staged(person_ids)
+    filler_size = staged_receipt_size - len(staged_raw)
+    assert 0 <= filler_size < escaped_list_item_size
+    if filler_size:
+        person_ids = (*person_ids[:-1], PersonId(person_ids[-1] + ("a" * filler_size)))
+        staged, staged_raw = make_staged(person_ids)
+    assert len(staged_raw) == staged_receipt_size
+
+    commit = GraphCommit(
+        staged.operation_id,
+        1,
+        lease.fencing_token,
+        "cpr_large_lua",
+        "e" * 64,
+        datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    commit_digest = graph_commit_sha256(commit)
+    permit = CommitPermit(
+        lease.scope,
+        commit.operation_id,
+        commit.revision,
+        commit.fencing_token,
+        commit.permit_id,
+        commit_digest,
+    )
+    proposed_raw = serialize_commit_reservation(
+        CommitReservation(
+            lease.scope,
+            "COMMITTING",
+            permit,
+            commit,
+            commit_digest,
+            staged,
+        ),
+        keys,
+        f"authorize-large-{staged_receipt_size}",
+    )
+    return proposed_raw, len(staged.write_set_json), len(staged_raw)
 
 
 def _redis_time_ms(production_lua: ProductionLuaHarness) -> int:
@@ -550,6 +683,121 @@ def test_authorization_lua_recomputes_every_recovery_payload_digest_before_mutat
 
     assert result == ["ERR", "COORDINATION_STATE_CORRUPT"]
     assert _database_snapshot(production_lua) == before
+
+
+@pytest.mark.parametrize(
+    ("digest_field", "malformed"),
+    (
+        ("scope-hmac", "f" * 63),
+        ("authorization-nonce-hmac", "G" * 64),
+        ("permit-commit", "not-a-digest"),
+        ("commit-semantic", "F" * 64),
+        ("commit-envelope", "0" * 65),
+        ("staged-envelope", "g" * 64),
+        ("write-set", "0" * 63),
+    ),
+)
+def test_authorization_lua_rejects_malformed_digests_before_any_mutation(
+    production_lua: ProductionLuaHarness,
+    digest_field: str,
+    malformed: str,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    _seed_ready_graph(production_lua, keys)
+    coordinator = UpstashCommitCoordinator(production_lua, keys)
+    lease = coordinator.acquire("family", 0, f"acq-malformed-{digest_field}")
+    _permit, _commit, proposed_raw = _reservation_values(
+        keys, lease, revision=1, nonce=f"authorize-malformed-{digest_field}"
+    )
+    proposed = json.loads(proposed_raw)
+
+    if digest_field == "scope-hmac":
+        proposed["scope_hmac"] = malformed
+    elif digest_field == "authorization-nonce-hmac":
+        proposed["authorization_request_nonce_hmac"] = malformed
+    elif digest_field == "permit-commit":
+        proposed["permit"]["commit_sha256"] = malformed
+    elif digest_field == "commit-semantic":
+        commit = json.loads(proposed["commit_json"])
+        commit["semantic_checksum"] = malformed
+        commit_raw = json.dumps(commit, sort_keys=True, separators=(",", ":"))
+        commit_digest = hashlib.sha256(commit_raw.encode("ascii")).hexdigest()
+        proposed["commit_json"] = commit_raw
+        proposed["commit_sha256"] = commit_digest
+        proposed["permit"]["commit_sha256"] = commit_digest
+    elif digest_field == "commit-envelope":
+        proposed["commit_sha256"] = malformed
+    elif digest_field == "staged-envelope":
+        proposed["staged_write_receipt_sha256"] = malformed
+    else:
+        staged = json.loads(proposed["staged_write_receipt_json"])
+        staged["write_set_sha256"] = malformed
+        staged_raw = json.dumps(staged, sort_keys=True, separators=(",", ":"))
+        proposed["staged_write_receipt_json"] = staged_raw
+        proposed["staged_write_receipt_sha256"] = hashlib.sha256(
+            staged_raw.encode("ascii")
+        ).hexdigest()
+
+    proposed_raw = json.dumps(proposed, sort_keys=True, separators=(",", ":"))
+    graph_keys = _core_keys(keys)
+    before = _database_snapshot(production_lua)
+
+    result = production_lua.eval(
+        AUTHORIZE_COMMIT_LUA,
+        graph_keys,
+        [
+            "family",
+            proposed_raw,
+            serialize_graph_lock(lease, keys),
+            *_expected_core_args(production_lua, graph_keys),
+        ],
+        nonce_idempotent=True,
+    )
+
+    assert result == ["ERR", "COORDINATION_STATE_CORRUPT"]
+    assert _database_snapshot(production_lua) == before
+
+
+@pytest.mark.parametrize(
+    ("staged_receipt_size", "maximum_seconds"),
+    ((10_000, 5.0), (100_000, 5.0), (1_950_000, 10.0)),
+)
+def test_authorization_lua_hashes_realistically_large_nested_payloads(
+    production_lua: ProductionLuaHarness,
+    staged_receipt_size: int,
+    maximum_seconds: float,
+) -> None:
+    keys = RedisKeyBuilder("test", "secret")
+    _seed_ready_graph(production_lua, keys)
+    coordinator = UpstashCommitCoordinator(production_lua, keys)
+    lease = coordinator.acquire("family", 0, f"acq-large-{staged_receipt_size}")
+    proposed_raw, write_set_size, actual_staged_size = _large_reservation_values(
+        keys, lease, staged_receipt_size=staged_receipt_size
+    )
+    staged_raw = json.loads(proposed_raw)["staged_write_receipt_json"]
+    assert len(staged_raw) == actual_staged_size == staged_receipt_size
+    assert write_set_size <= 2_000_000
+    assert actual_staged_size <= 2_000_000
+    if staged_receipt_size == 1_950_000:
+        assert write_set_size > 1_800_000
+    graph_keys = _core_keys(keys)
+
+    started = perf_counter()
+    result = production_lua.eval(
+        AUTHORIZE_COMMIT_LUA,
+        graph_keys,
+        [
+            "family",
+            proposed_raw,
+            serialize_graph_lock(lease, keys),
+            *_expected_core_args(production_lua, graph_keys),
+        ],
+        nonce_idempotent=True,
+    )
+    elapsed = perf_counter() - started
+
+    assert result == ["OK", "RESERVATION_CREATED", proposed_raw]
+    assert elapsed < maximum_seconds
 
 
 @pytest.mark.parametrize(
