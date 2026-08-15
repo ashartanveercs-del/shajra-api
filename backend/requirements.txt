@@ -13,3 +13,4 @@ pydantic-settings==2.14.2
 argon2-cffi==25.1.0
 Pillow==12.3.0
 upstash-redis==1.7.0
+httpx==0.28.1
