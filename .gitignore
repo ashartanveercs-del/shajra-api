@@ -1,6 +1,8 @@
 # Environment Variables
 .env
 .env.local
+*.age
+settings.json
 
 # Python
 __pycache__/
@@ -20,8 +22,20 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Local Git worktrees
+.worktrees/
+
 # Render
 .render/
+
+# Local recovery artifacts
+.vercel/
+backups/
+migration-artifacts/
+frontend/playwright-report/
+frontend/test-results/
+backend/.coverage
+backend/htmlcov/
 
 # OS
 .DS_Store

@@ -27,7 +27,7 @@ def run_debug():
         loop = asyncio.get_event_loop()
         res = loop.run_until_complete(direct_submit(payload))
         print("Success:", res)
-    except Exception as e:
+    except Exception:
         print("Exception caught directly:")
         traceback.print_exc()
 

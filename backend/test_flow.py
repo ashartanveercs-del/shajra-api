@@ -1,5 +1,6 @@
 import urllib.request
 import json
+import os
 import time
 
 API_BASE = "http://127.0.0.1:8000"
@@ -22,8 +23,12 @@ def do_request(endpoint, method="GET", data=None, token=None):
         print(f"Exception on {method} {endpoint}: {e}")
         return None
 
+password = os.environ.get("SHAJRA_TEST_ADMIN_PASSWORD")
+if not password:
+    raise RuntimeError("SHAJRA_TEST_ADMIN_PASSWORD is required for this mutating local test flow")
+
 print("1. Admin Login...")
-token_res = do_request("/api/admin/login", method="POST", data={"username": "admin", "password": "shajrasecure123"})
+token_res = do_request("/api/admin/login", method="POST", data={"username": "admin", "password": password})
 if not token_res or "access_token" not in token_res:
     print("Login failed")
     exit(1)
@@ -83,7 +88,7 @@ def search_tree(nodes, name):
     for n in nodes:
         if n.get("FullName") == name:
             return True
-        if "children" in n and n["children"]:
+        if n.get("children"):
             if search_tree(n["children"], name):
                 return True
     return False

@@ -2,29 +2,30 @@
 Shajra System — Main FastAPI Application v2
 """
 import os
-import json
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
-from dotenv import load_dotenv
 
 # Load .env only if it exists (local dev). On Vercel, env vars come from dashboard.
 _env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 if os.path.exists(_env_path):
     load_dotenv(_env_path)
 
-from requests.exceptions import HTTPError
 import cloudinary
 import cloudinary.uploader
+from requests.exceptions import HTTPError
 
 cloudinary.config(secure=True)
 
-import airtable_client as db
 import ai_service
-from settings_manager import get_groq_api_key, set_groq_api_key
-from auth import verify_admin, create_access_token, decode_access_token
+import airtable_client as db
+from auth import create_access_token, decode_access_token, verify_admin
+from config import get_settings
+from write_gates import require_public_writes, require_relationship_writes
 
 app = FastAPI(
     title="Shajra System API",
@@ -35,7 +36,7 @@ app = FastAPI(
 # CORS — allow frontend to call backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
+    allow_origins=get_settings().allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -179,10 +180,6 @@ class ApprovedEmailCreate(BaseModel):
     Name: Optional[str] = ""
     Notes: Optional[str] = ""
 
-class SettingsUpdate(BaseModel):
-    GROQ_API_KEY: str
-
-
 # ══════════════════════════════════════════════════════════════
 #   PUBLIC ENDPOINTS
 # ══════════════════════════════════════════════════════════════
@@ -190,6 +187,30 @@ class SettingsUpdate(BaseModel):
 @app.get("/")
 def root():
     return {"message": "Shajra System API v2 is running", "version": "2.0.0"}
+
+
+@app.get("/api/health/live")
+def health_live():
+    return {"status": "ok"}
+
+
+@app.get("/api/health/ready")
+def health_ready():
+    settings = get_settings()
+    return {
+        "status": "ready",
+        "environment": settings.app_env,
+        "configured": {
+            "airtable": bool(settings.airtable_pat and settings.airtable_base_id),
+            "groq": bool(settings.groq_api_key),
+            "cloudinary": bool(settings.cloudinary_url),
+        },
+        "writes": {
+            "public": settings.public_writes_enabled,
+            "relationships": settings.relationship_writes_enabled,
+        },
+        "normalizedReads": settings.normalized_reads_enabled,
+    }
 
 
 @app.get("/api/members")
@@ -336,7 +357,6 @@ def get_tree():
         m[id_field] = fake_id
 
     for m in members:
-        f_id = get_sid(m.get("FatherRecordId"))
         mo_id = get_sid(m.get("MotherRecordId"))
         # Resolve father (pass mother as other parent for cross-check)
         find_or_create_parent(m, "FatherName", "FatherRecordId", "Male", mo_id)
@@ -575,7 +595,7 @@ def get_comments(member_record_id: str):
 
 
 @app.post("/api/comments")
-def post_comment(comment: CommentCreate):
+def post_comment(comment: CommentCreate, _=Depends(require_public_writes)):
     """Post a comment. Only approved emails can comment."""
     if not db.is_email_approved(comment.AuthorEmail):
         raise HTTPException(
@@ -614,7 +634,7 @@ def get_stories_for_member(member_record_id: str):
 
 
 @app.post("/api/stories")
-def post_story(story: StoryCreate):
+def post_story(story: StoryCreate, _=Depends(require_public_writes)):
     """Submit a new story."""
     fields = {
         "Title": story.Title,
@@ -646,7 +666,7 @@ def get_albums_for_member(member_record_id: str):
 
 
 @app.post("/api/albums")
-def post_album(album: PhotoAlbumCreate):
+def post_album(album: PhotoAlbumCreate, _=Depends(require_public_writes)):
     """Post an album/photo. Uploads to Airtable as an Attachment."""
     fields = album.model_dump(exclude_none=True)
     # Convert string URL into Airtable Attachment array format
@@ -661,7 +681,7 @@ def post_album(album: PhotoAlbumCreate):
 # ══════════════════════════════════════════════════════════════
 
 @app.post("/api/webhook/google-form")
-async def receive_google_form(payload: GoogleFormWebhook):
+async def receive_google_form(payload: GoogleFormWebhook, _=Depends(require_public_writes)):
     """
     Receive data from Google Apps Script, run through AI, store as pending.
     """
@@ -686,7 +706,7 @@ async def receive_google_form(payload: GoogleFormWebhook):
 
 
 @app.post("/api/submit")
-async def direct_submit(payload: DirectSubmission):
+async def direct_submit(payload: DirectSubmission, _=Depends(require_public_writes)):
     """
     Direct submission from the frontend form (same AI pipeline as Google Form).
     Allows submitting without Google Forms.
@@ -715,10 +735,13 @@ async def direct_submit(payload: DirectSubmission):
             "pendingId": result.get("id"),
         }
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error in PendingSubmissions: {e.response.text}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Airtable Schema Error in PendingSubmissions: {e.response.text}",
+        ) from e
 
 @app.post("/api/upload-image")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(file: UploadFile = File(...), _=Depends(require_public_writes)):
     """
     Publicly accessible image uploader for form submissions and admin edits.
     Uploads precisely to Cloudinary and returns the secure public URL perfectly suited for Airtable.
@@ -731,7 +754,7 @@ async def upload_image(file: UploadFile = File(...)):
         res = cloudinary.uploader.upload(file_content, folder="shajra_system")
         return {"url": res.get("secure_url")}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cloudinary Upload Failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Cloudinary upload failed.") from e
 
 
 # ══════════════════════════════════════════════════════════════
@@ -754,51 +777,7 @@ def list_pending(admin=Depends(get_current_admin)):
 
 
 
-def relink_potential_orphans(new_member: dict):
-    """
-    Search for all people who have this member's name as FatherName/MotherName
-    but no RecordId link. Auto-patch them to point to new_member['id'].
-    """
-    all_members = db.get_all_members()
-    updates_made = 0
-    nm_id = new_member["id"]
-    nm_name = (new_member.get("FullName") or "").strip().lower()
-    nm_gender = new_member.get("Gender", "Male")
-
-    for m in all_members:
-        if m["id"] == nm_id:
-            continue
-        update_fields = {}
-        # Match Father
-        if nm_gender == "Male":
-            f_id = m.get("FatherRecordId")
-            f_name = (m.get("FatherName") or "").strip().lower()
-            if not f_id and f_name and (f_name == nm_name or f_name in nm_name or nm_name in f_name):
-                update_fields["FatherRecordId"] = nm_id
-        
-        # Match Mother
-        if nm_gender == "Female":
-            mo_id = m.get("MotherRecordId")
-            mo_name = (m.get("MotherName") or "").strip().lower()
-            if not mo_id and mo_name and (mo_name == nm_name or mo_name in nm_name or nm_name in mo_name):
-                update_fields["MotherRecordId"] = nm_id
-
-        # Match Spouse
-        s_id = m.get("SpouseRecordId")
-        s_name = (m.get("SpouseName") or "").strip().lower()
-        if not s_id and s_name and (s_name == nm_name or s_name in nm_name or nm_name in s_name):
-            update_fields["SpouseRecordId"] = nm_id
-
-        if update_fields:
-            db.update_member(m["id"], update_fields)
-            updates_made += 1
-    
-    return updates_made
-
-
 # ── Change History & Undo System ──────────────────────────────────────
-
-import copy
 
 # In-memory change history (lost on restart — for session undo only)
 _change_history: list = []
@@ -809,7 +788,7 @@ def _snapshot_member(record_id: str) -> dict | None:
     """Take a snapshot of a member before mutation."""
     try:
         return db.get_member_by_id(record_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - Preserve the v1 missing-member snapshot fallback.
         return None
 
 
@@ -827,113 +806,6 @@ def _push_history(action: str, record_id: str, before: dict | None, after: dict 
         _change_history.pop(0)
 
 
-# ── Self-Healing Graph Function ───────────────────────────────────────
-
-def self_heal_graph() -> dict:
-    """
-    Scan all members and auto-fix broken/missing links.
-    Runs after every admin mutation to keep the graph coherent.
-    
-    Returns a summary of fixes applied.
-    """
-    all_members = db.get_all_members()
-    lookup = {m["id"]: m for m in all_members}
-    
-    # Build name index
-    name_index: dict[str, list] = {}
-    for m in all_members:
-        fn = (m.get("FullName") or "").strip().lower()
-        if fn:
-            name_index.setdefault(fn, []).append(m)
-    
-    fixes = []
-    
-    def fuzzy_match(name: str, target: str) -> bool:
-        """Check if two names refer to the same person."""
-        if not name or not target:
-            return False
-        n, t = name.lower().strip(), target.lower().strip()
-        return n == t or n in t or t in n
-    
-    for m in all_members:
-        mid = m["id"]
-        update_fields = {}
-        
-        # ── Fix 1: FatherName set but FatherRecordId missing ──
-        f_name = (m.get("FatherName") or "").strip()
-        f_id = (m.get("FatherRecordId") or "").strip()
-        if f_name and not f_id:
-            for fn_lower, candidates in name_index.items():
-                if fuzzy_match(f_name, fn_lower):
-                    for c in candidates:
-                        if c["id"] != mid and c.get("Gender") == "Male":
-                            update_fields["FatherRecordId"] = c["id"]
-                            fixes.append(f"Linked {m.get('FullName')}'s Father → {c.get('FullName')}")
-                            break
-                if "FatherRecordId" in update_fields:
-                    break
-        
-        # ── Fix 2: MotherName set but MotherRecordId missing ──
-        mo_name = (m.get("MotherName") or "").strip()
-        mo_id = (m.get("MotherRecordId") or "").strip()
-        if mo_name and not mo_id:
-            # First check: is mother the spouse of the linked father?
-            father_id = update_fields.get("FatherRecordId") or f_id
-            if father_id and father_id in lookup:
-                father = lookup[father_id]
-                spouse_id = (father.get("SpouseRecordId") or "").strip()
-                if spouse_id and spouse_id in lookup:
-                    spouse = lookup[spouse_id]
-                    if fuzzy_match(mo_name, spouse.get("FullName", "")):
-                        update_fields["MotherRecordId"] = spouse_id
-                        fixes.append(f"Linked {m.get('FullName')}'s Mother → {spouse.get('FullName')} (via father's spouse)")
-            
-            if "MotherRecordId" not in update_fields:
-                for fn_lower, candidates in name_index.items():
-                    if fuzzy_match(mo_name, fn_lower):
-                        for c in candidates:
-                            if c["id"] != mid and c.get("Gender") == "Female":
-                                update_fields["MotherRecordId"] = c["id"]
-                                fixes.append(f"Linked {m.get('FullName')}'s Mother → {c.get('FullName')}")
-                                break
-                    if "MotherRecordId" in update_fields:
-                        break
-        
-        # ── Fix 3: SpouseName set but SpouseRecordId missing ──
-        s_name = (m.get("SpouseName") or "").strip()
-        s_id = (m.get("SpouseRecordId") or "").strip()
-        if s_name and not s_id:
-            for fn_lower, candidates in name_index.items():
-                if fuzzy_match(s_name, fn_lower):
-                    for c in candidates:
-                        if c["id"] != mid:
-                            update_fields["SpouseRecordId"] = c["id"]
-                            fixes.append(f"Linked {m.get('FullName')}'s Spouse → {c.get('FullName')}")
-                            # Also set reciprocal if missing
-                            if not (c.get("SpouseRecordId") or "").strip():
-                                db.update_member(c["id"], {"SpouseRecordId": mid})
-                                fixes.append(f"Reciprocal: Linked {c.get('FullName')}'s Spouse → {m.get('FullName')}")
-                            break
-                if "SpouseRecordId" in update_fields:
-                    break
-        
-        # ── Fix 4: Broken references (pointing to deleted records) ──
-        for field in ["FatherRecordId", "MotherRecordId", "SpouseRecordId"]:
-            ref_id = (m.get(field) or "").strip()
-            if ref_id and ref_id not in lookup:
-                update_fields[field] = ""
-                fixes.append(f"Cleared broken {field} on {m.get('FullName')} (record {ref_id} not found)")
-        
-        # Apply fixes
-        if update_fields:
-            try:
-                db.update_member(mid, update_fields)
-            except Exception as e:
-                fixes.append(f"⚠️ Failed to update {m.get('FullName')}: {str(e)}")
-    
-    return {"fixes_applied": len(fixes), "details": fixes}
-
-
 @app.get("/api/admin/pending/status/{status}")
 def list_pending_by_status(status: str, admin=Depends(get_current_admin)):
     """Get pending submissions filtered by status."""
@@ -941,7 +813,11 @@ def list_pending_by_status(status: str, admin=Depends(get_current_admin)):
 
 
 @app.post("/api/admin/approve/{record_id}")
-def approve_submission(record_id: str, admin=Depends(get_current_admin)):
+def approve_submission(
+    record_id: str,
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+):
     """
     Approve a pending submission: create an approved member, mark submission as approved.
     """
@@ -986,29 +862,21 @@ def approve_submission(record_id: str, admin=Depends(get_current_admin)):
 
     new_member = db.create_member(member_fields)
     db.update_pending(record_id, {"Status": "Approved"})
-    
-    # Auto-Snap: Link to any orphans
-    relink_potential_orphans(new_member)
-    
-    # Self-heal the entire graph
-    heal_result = self_heal_graph()
-    
+
     # Record in history
     _push_history("approve", new_member["id"], None, new_member)
-    
-    return {"status": "approved", "member": new_member, "heal": heal_result}
+
+    return {"status": "approved", "member": new_member}
 
 
-@app.get("/api/admin/settings")
-def get_admin_settings(admin=Depends(get_current_admin)):
-    """Retrieve dynamic settings like GROQ_API_KEY."""
-    return {"GROQ_API_KEY": get_groq_api_key()}
-
-@app.post("/api/admin/settings")
-def update_admin_settings(payload: SettingsUpdate, admin=Depends(get_current_admin)):
-    """Update dynamic settings."""
-    set_groq_api_key(payload.GROQ_API_KEY)
-    return {"status": "success", "message": "Settings updated"}
+@app.get("/api/admin/integrations")
+def admin_integrations(admin=Depends(get_current_admin)):
+    settings = get_settings()
+    return {
+        "groqConfigured": bool(settings.groq_api_key),
+        "cloudinaryConfigured": bool(settings.cloudinary_url),
+        "coordinationConfigured": False,
+    }
 
 @app.post("/api/admin/reject/{record_id}")
 def reject_submission(record_id: str, admin=Depends(get_current_admin)):
@@ -1018,34 +886,44 @@ def reject_submission(record_id: str, admin=Depends(get_current_admin)):
 
 
 @app.post("/api/admin/members")
-def admin_create_member(member: MemberCreate, admin=Depends(get_current_admin)):
-    """Admin directly creates an approved member. Self-heals graph after."""
+def admin_create_member(
+    member: MemberCreate,
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+):
+    """Admin directly creates an approved member."""
     try:
         fields = member.model_dump(exclude_none=True)
         new_member = db.create_member(fields)
-        relink_potential_orphans(new_member)
-        heal_result = self_heal_graph()
         _push_history("create", new_member["id"], None, new_member)
-        return {**new_member, "_heal": heal_result}
+        return new_member
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}")
+        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}") from e
 
 @app.put("/api/admin/members/{record_id}")
-def admin_update_member(record_id: str, member: MemberUpdate, admin=Depends(get_current_admin)):
-    """Admin updates an approved member. Snapshots before, self-heals after."""
+def admin_update_member(
+    record_id: str,
+    member: MemberUpdate,
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+):
+    """Admin updates an approved member."""
     try:
         before = _snapshot_member(record_id)
         fields = member.model_dump(exclude_none=True)
         result = db.update_member(record_id, fields)
-        heal_result = self_heal_graph()
         _push_history("update", record_id, before, result)
-        return {**result, "_heal": heal_result}
+        return result
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}")
+        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}") from e
 
 
 @app.delete("/api/admin/members/{record_id}")
-def admin_delete_member(record_id: str, admin=Depends(get_current_admin)):
+def admin_delete_member(
+    record_id: str,
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+):
     """Admin deletes an approved member. Snapshots before for undo."""
     before = _snapshot_member(record_id)
     db.delete_member(record_id)
@@ -1061,7 +939,9 @@ def get_change_history(admin=Depends(get_current_admin)):
     return list(reversed(_change_history))
 
 @app.post("/api/admin/undo")
-def undo_last_change(admin=Depends(get_current_admin)):
+def undo_last_change(
+    admin=Depends(get_current_admin), _=Depends(require_relationship_writes)
+):
     """Undo the most recent admin change."""
     if not _change_history:
         raise HTTPException(status_code=404, detail="No changes to undo")
@@ -1075,7 +955,7 @@ def undo_last_change(admin=Depends(get_current_admin)):
         if action == "create":
             # Undo create → delete the record
             db.delete_member(record_id)
-            return {"status": "undone", "action": f"Deleted created member", "record_id": record_id}
+            return {"status": "undone", "action": "Deleted created member", "record_id": record_id}
         
         elif action == "update":
             # Undo update → restore previous fields
@@ -1099,16 +979,20 @@ def undo_last_change(admin=Depends(get_current_admin)):
     except Exception as e:
         # Put entry back if undo failed
         _change_history.append(entry)
-        raise HTTPException(status_code=500, detail=f"Undo failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Undo failed.") from e
 
 
 # ── Manual Heal Endpoint ──────────────────────────────────────────────
 
 @app.post("/api/admin/heal")
 def manual_heal(admin=Depends(get_current_admin)):
-    """Manually trigger a full self-heal scan of the family graph."""
-    result = self_heal_graph()
-    return result
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "SELF_HEAL_REMOVED",
+            "message": "Automatic graph healing has been removed.",
+        },
+    )
 
 
 # ── Admin: Approved Emails ────────────────────────────────────────

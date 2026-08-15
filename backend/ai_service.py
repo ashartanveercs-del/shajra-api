@@ -3,12 +3,21 @@ Shajra System — AI Processing Service
 Parses raw form submissions into clean, structured data and matches relationships.
 """
 import json
-from groq import Groq
+
 import airtable_client as db
-from settings_manager import get_groq_api_key
+from config import get_settings
+from fastapi import HTTPException
+from groq import Groq
+
 
 def get_client() -> Groq:
-    return Groq(api_key=get_groq_api_key())
+    groq_api_key = get_settings().groq_api_key
+    if groq_api_key is None or not groq_api_key.get_secret_value().strip():
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "AI_NOT_CONFIGURED", "message": "AI processing is not configured."},
+        )
+    return Groq(api_key=groq_api_key.get_secret_value())
 
 SYSTEM_PROMPT = """You are a family genealogy data processing assistant. Your job is to take raw, unstructured form submissions about family members and return clean, standardized JSON.
 
@@ -64,11 +73,39 @@ def get_existing_members_context():
             lines.append(f"- {name} (ID: {rec_id}, Father: {father}, Mother: {mother}, Spouse: {spouse}, Gender: {gender}, City: {city})")
 
         return "Existing family members (Use these IDs for ALL relationship matches):\n" + "\n".join(lines)
-    except Exception as e:
-        return f"Could not fetch existing members: {str(e)}"
+    except Exception:  # noqa: BLE001 - Preserve the v1 external datastore context fallback.
+        return "Existing member context is temporarily unavailable."
+
+
+def _raw_submission_fallback(raw_data: dict, notes: str) -> dict:
+    return {
+        "CleanFullName": raw_data.get("RawFullName", ""),
+        "CleanFatherName": raw_data.get("RawFatherName", ""),
+        "CleanMotherName": raw_data.get("RawMotherName", ""),
+        "CleanSpouseName": raw_data.get("RawSpouseName", ""),
+        "CleanDOB": raw_data.get("RawDateOfBirth", ""),
+        "CleanDOD": raw_data.get("RawDateOfDeath", ""),
+        "CleanCity": "",
+        "CleanCountry": "",
+        "CleanBurialLocation": raw_data.get("RawBurialLocation", ""),
+        "CleanGender": raw_data.get("RawGender", "Other"),
+        "CleanEmail": raw_data.get("RawEmail", ""),
+        "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
+        "CleanProfileImage": raw_data.get("RawProfileImage", ""),
+        "Confidence": 0.0,
+        "Notes": notes,
+        "IsDuplicate": False,
+    }
 
 
 def process_submission(raw_data: dict) -> dict:
+    try:
+        client = get_client()
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
+        return _raw_submission_fallback(raw_data, "AI processing failed. Using raw data.")
+
     existing_context = get_existing_members_context()
 
     user_message = f"""Here is a raw family member submission:
@@ -92,8 +129,6 @@ Biography/Notes: {raw_data.get('RawBiography', '')}
 Please clean and standardize this data, handle cousin linkages properly, and suggest relationship matches. Return ONLY valid JSON."""
 
     try:
-        client = get_client()
-
         # The parameters exactly as requested
         completion_stream = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -127,7 +162,9 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
         result = json.loads(response_text)
         return result
 
-    except json.JSONDecodeError as e:
+    except HTTPException:
+        raise
+    except json.JSONDecodeError:
         return {
             "CleanFullName": raw_data.get("RawFullName", ""),
             "CleanFatherName": raw_data.get("RawFatherName", ""),
@@ -143,28 +180,11 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
             "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
             "CleanProfileImage": raw_data.get("RawProfileImage", ""),
             "Confidence": 0.0,
-            "Notes": f"AI JSON parsing failed: {str(e)}. Using raw data.",
+            "Notes": "AI response could not be parsed. Using raw data.",
             "IsDuplicate": False,
         }
-    except Exception as e:
-        return {
-            "CleanFullName": raw_data.get("RawFullName", ""),
-            "CleanFatherName": raw_data.get("RawFatherName", ""),
-            "CleanMotherName": raw_data.get("RawMotherName", ""),
-            "CleanSpouseName": raw_data.get("RawSpouseName", ""),
-            "CleanDOB": raw_data.get("RawDateOfBirth", ""),
-            "CleanDOD": raw_data.get("RawDateOfDeath", ""),
-            "CleanCity": "",
-            "CleanCountry": "",
-            "CleanBurialLocation": raw_data.get("RawBurialLocation", ""),
-            "CleanGender": raw_data.get("RawGender", "Other"),
-            "CleanEmail": raw_data.get("RawEmail", ""),
-            "CleanPhoneNumber": raw_data.get("RawPhoneNumber", ""),
-            "CleanProfileImage": raw_data.get("RawProfileImage", ""),
-            "Confidence": 0.0,
-            "Notes": f"AI service error: {str(e)}. Using raw data.",
-            "IsDuplicate": False,
-        }
+    except Exception:  # noqa: BLE001 - Preserve the v1 external AI fallback to raw submission data.
+        return _raw_submission_fallback(raw_data, "AI processing failed. Using raw data.")
 
 
 def process_and_store_submission(raw_data: dict) -> dict:
