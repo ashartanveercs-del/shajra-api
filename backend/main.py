@@ -2,6 +2,8 @@
 Shajra System — Main FastAPI Application v2
 """
 import os
+import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -239,9 +241,11 @@ def search_members(q: str = ""):
 @app.get("/api/tree")
 def get_tree():
     """Build hierarchical tree data with Marital Grouping (no duplicates).
-    
-    v3: Smart Phase 0 prevents phantom duplicates by checking spouse of linked parent.
-        Full spouse data returned (not slim copies) for full-identity rendering.
+
+    v4: Normalized name matching (casefold + diacritics + trailing-word strip,
+        never first-name-only), spouse nodes created from name text with their
+        exact name (no '(Unknown)' phantom placeholders), and always-reciprocal
+        spouse links.
     """
     members = db.get_all_members()
     lookup = {m["id"]: m for m in members}
@@ -269,142 +273,171 @@ def get_tree():
 
     # Helper to get string ID from possible list/string field
     def get_sid(field_val):
-        if not field_val: return ""
+        if not field_val:
+            return ""
         if isinstance(field_val, list) and len(field_val) > 0:
             return str(field_val[0]).strip()
         return str(field_val).strip()
 
-    # Build a name->member index for smart matching
-    name_index = {}
-    for m in members:
-        fn = (m.get("FullName") or "").strip().lower()
-        if fn:
-            name_index.setdefault(fn, []).append(m)
-
-    # ── Phase 0: Smart placeholder creation ───────────────────────────────
-    # Before creating a placeholder, check:
-    #   1. Does a real member with that name already exist? → link directly
-    #   2. Is this name the spouse of the other linked parent? → reuse that person
-    #   3. Has a placeholder for this name already been created? → reuse
-    #   4. Only then create a new placeholder
-    placeholders = {}
-
-    def find_or_create_parent(m, name_field, id_field, gender, other_parent_id):
-        """Smart parent resolution: tries name matching before creating placeholders."""
-        rec_id = get_sid(m.get(id_field))
-        if rec_id:
-            return  # already linked
-
-        name = (m.get(name_field) or "").strip()
+    # ── Name normalization ────────────────────────────────────────────
+    def normalize_name(name) -> str:
+        """Casefold, strip diacritics, collapse whitespace."""
         if not name:
-            return  # no name to work with
+            return ""
+        s = unicodedata.normalize("NFKD", str(name))
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        return re.sub(r"\s+", " ", s.casefold().strip())
 
-        name_lower = name.lower()
+    def name_keys(name) -> list:
+        """Matching keys from most-specific to least-specific.
 
-        # Strategy 1: Check if other parent's spouse matches this name
-        if other_parent_id:
-            other_parent = lookup.get(other_parent_id)
-            if other_parent:
-                spouse_name = (other_parent.get("SpouseName") or "").strip().lower()
-                spouse_id = get_sid(other_parent.get("SpouseRecordId"))
-                # If the other parent has a spouse record, and the spouse's name matches
-                if spouse_id and spouse_id in lookup:
-                    spouse_member = lookup[spouse_id]
-                    sfn = (spouse_member.get("FullName") or "").strip().lower()
-                    if sfn == name_lower or name_lower in sfn or sfn in name_lower:
-                        m[id_field] = spouse_id
-                        return
-                # If other parent's SpouseName text matches
-                if spouse_name and (spouse_name == name_lower or name_lower in spouse_name or spouse_name in name_lower):
-                    if spouse_id and spouse_id in lookup:
-                        m[id_field] = spouse_id
-                        return
+        Progressively strips trailing words but never drops below two words,
+        so a bare first name can never match (avoids false positives).
+        Single-word names only ever match on the full name.
+        """
+        n = normalize_name(name)
+        if not n:
+            return []
+        words = n.split()
+        if len(words) <= 2:
+            return [n]
+        keys = []
+        while len(words) >= 2:
+            keys.append(" ".join(words))
+            words = words[:-1]
+        return keys
 
-        # Strategy 2: Direct name match against existing members
-        matches = name_index.get(name_lower, [])
-        for match in matches:
-            if match["id"] != m["id"] and match.get("Gender", "") == gender:
-                m[id_field] = match["id"]
-                return
+    # Build a normalized name -> member index for smart matching
+    name_index: dict[str, list] = {}
+    for m in members:
+        for key in name_keys(m.get("FullName")):
+            name_index.setdefault(key, []).append(m)
 
-        # Strategy 3: Fuzzy - check if existing member name contains this name
-        for fn_lower, candidates in name_index.items():
-            if name_lower in fn_lower or fn_lower in name_lower:
-                for match in candidates:
-                    if match["id"] != m["id"] and match.get("Gender", "") == gender:
-                        m[id_field] = match["id"]
-                        return
+    # Registry of name-derived nodes (created from name text), keyed by
+    # normalized name so the same person referenced from multiple places
+    # resolves to a single node.
+    name_nodes: dict[str, dict] = {}
 
-        # Strategy 4: Reuse existing placeholder
-        if name in placeholders:
-            m[id_field] = placeholders[name]["id"]
-            return
+    def find_member_by_name(name, exclude_id=None, gender=None):
+        for key in name_keys(name):
+            for cand in name_index.get(key, []):
+                if exclude_id and cand["id"] == exclude_id:
+                    continue
+                if gender and cand.get("Gender") and cand.get("Gender") != gender:
+                    continue
+                return cand
+        return None
 
-        # Strategy 5: Create new placeholder
-        prefix = "f" if gender == "Male" else "m"
-        fake_id = f"__ph_{prefix}__{name.replace(' ', '_')}"
-        ph = {
-            "id": fake_id, "FullName": f"{name} (Unknown)", "Gender": gender,
-            "IsAlive": False, "ProfileImageUrl": "", "DateOfBirth": "", "DateOfDeath": "",
-            "Generation": max(1, (m.get("Generation") or 2) - 1),
+    def make_name_node(name, gender) -> dict:
+        """Create (or reuse) a node for a person known only by name text.
+
+        The node carries the exact name — never an '(Unknown)' suffix — so a
+        spouse/parent referenced by name renders with their real name.
+        """
+        n_key = normalize_name(name)
+        if n_key in name_nodes:
+            return name_nodes[n_key]
+        fake_id = f"__name__{n_key.replace(' ', '_')}"
+        node = {
+            "id": fake_id, "FullName": name.strip(), "Gender": gender,
+            "IsAlive": False, "ProfileImageUrl": "", "DateOfBirth": "",
+            "DateOfDeath": "", "Generation": 99,
             "FatherRecordId": "", "MotherRecordId": "", "SpouseRecordId": "",
             "FatherName": "", "MotherName": "", "SpouseName": "",
             "CurrentCity": "", "CurrentCountry": "", "Biography": "",
-            "children": [], "Spouse": None, "IsPlaceholder": True
+            "children": [], "Spouse": None, "IsPlaceholder": True,
         }
-        placeholders[name] = ph
-        lookup[fake_id] = ph
-        m[id_field] = fake_id
+        name_nodes[n_key] = node
+        lookup[fake_id] = node
+        return node
 
-    for m in members:
-        mo_id = get_sid(m.get("MotherRecordId"))
-        # Resolve father (pass mother as other parent for cross-check)
-        find_or_create_parent(m, "FatherName", "FatherRecordId", "Male", mo_id)
-        # Resolve mother (pass father as other parent for cross-check)
-        f_id_after = get_sid(m.get("FatherRecordId"))  # may have been set above
-        find_or_create_parent(m, "MotherName", "MotherRecordId", "Female", f_id_after)
+    def resolve_by_name(name, gender, exclude_id=None):
+        if not name or not name.strip():
+            return None
+        m = find_member_by_name(name, exclude_id=exclude_id, gender=gender)
+        if m:
+            return m
+        return make_name_node(name, gender)
 
-    members.extend(placeholders.values())
+    def opposite_gender(gender):
+        if gender == "Male":
+            return "Female"
+        if gender == "Female":
+            return "Male"
+        return ""
 
-    # Phase 1: Infer spousal links from shared children
-    for m in members:
-        father_id = get_sid(m.get("FatherRecordId"))
-        mother_id = get_sid(m.get("MotherRecordId"))
-        
-        if father_id and mother_id and father_id in lookup and mother_id in lookup:
-            father = lookup[father_id]
-            mother = lookup[mother_id]
-            if not father["Spouse"]: father["Spouse"] = spouse_snapshot(mother)
-            if not mother["Spouse"]: mother["Spouse"] = spouse_snapshot(father)
+    def link_spouses(a, b):
+        """Reciprocally link two people as spouses (never one-sided)."""
+        if not a.get("Spouse"):
+            a["Spouse"] = spouse_snapshot(b)
+        if not b.get("Spouse"):
+            b["Spouse"] = spouse_snapshot(a)
 
-    # Phase 2: Spouse linking (Reciprocal & Cross-verified)
-    for m in members:
-        spouse_id = get_sid(m.get("SpouseRecordId"))
-        if spouse_id and spouse_id in lookup:
-            if not m.get("Spouse"): m["Spouse"] = spouse_snapshot(lookup[spouse_id])
-            target_spouse = lookup[spouse_id]
-            if not target_spouse.get("Spouse"):
-                target_spouse["Spouse"] = spouse_snapshot(m)
-
-    # Phase 2b: Infer spouse from SpouseName text if no SpouseRecordId
+    # ── Phase 0: Spouse linking (record id, then name text) ───────────
+    # Resolved first so parent resolution can cross-reference spouses.
     for m in members:
         if m.get("Spouse"):
             continue
-        spouse_name = (m.get("SpouseName") or "").strip().lower()
+        spouse_id = get_sid(m.get("SpouseRecordId"))
+        if spouse_id and spouse_id in lookup:
+            link_spouses(m, lookup[spouse_id])
+            continue
+        spouse_name = (m.get("SpouseName") or "").strip()
         if not spouse_name:
             continue
-        # Try to find a matching member
-        for fn_lower, candidates in name_index.items():
-            if spouse_name == fn_lower or spouse_name in fn_lower or fn_lower in spouse_name:
-                for candidate in candidates:
-                    if candidate["id"] != m["id"] and not candidate.get("Spouse"):
-                        m["Spouse"] = spouse_snapshot(candidate)
-                        candidate["Spouse"] = spouse_snapshot(m)
-                        break
-                if m.get("Spouse"):
-                    break
+        spouse_node = resolve_by_name(
+            spouse_name, opposite_gender(m.get("Gender", "")), exclude_id=m["id"]
+        )
+        if spouse_node:
+            link_spouses(m, spouse_node)
 
-    # ── Phase 3: Build parent-child hierarchy ─────────────────────────────
+    # Add name-derived nodes to the member set for hierarchy building
+    members.extend(name_nodes.values())
+
+    # ── Phase 1: Parent resolution (name match + spouse cross-check) ──
+    def resolve_parent(m, name_field, id_field, gender, other_parent_id):
+        rec_id = get_sid(m.get(id_field))
+        if rec_id and rec_id in lookup:
+            return rec_id
+        name = (m.get(name_field) or "").strip()
+        if not name:
+            return rec_id or ""
+        # Cross-check: if the other parent's spouse matches this name, reuse it
+        if other_parent_id and other_parent_id in lookup:
+            other = lookup[other_parent_id]
+            osp = other.get("Spouse")
+            if osp:
+                osid = get_sid(osp.get("id"))
+                osname = (osp.get("FullName") or "").strip()
+                if osid and osname and name_keys(name) and (
+                    set(name_keys(name)) & set(name_keys(osname))
+                ):
+                    return osid
+        node = resolve_by_name(name, gender, exclude_id=m["id"])
+        if node:
+            return node["id"]
+        return rec_id or ""
+
+    for m in members:
+        mo_id = get_sid(m.get("MotherRecordId"))
+        m["FatherRecordId"] = resolve_parent(m, "FatherName", "FatherRecordId", "Male", mo_id)
+        fa_id = get_sid(m.get("FatherRecordId"))
+        m["MotherRecordId"] = resolve_parent(m, "MotherName", "MotherRecordId", "Female", fa_id)
+
+    # Any name nodes created during parent resolution need to be included too
+    existing_ids = {m["id"] for m in members}
+    for node in name_nodes.values():
+        if node["id"] not in existing_ids:
+            members.append(node)
+
+    # ── Phase 2: Infer spousal links from shared children ─────────────
+    for m in members:
+        father_id = get_sid(m.get("FatherRecordId"))
+        mother_id = get_sid(m.get("MotherRecordId"))
+        if father_id and mother_id and father_id in lookup and mother_id in lookup:
+            link_spouses(lookup[father_id], lookup[mother_id])
+
+    # ── Phase 3: Build parent-child hierarchy ─────────────────────────
     for m in members:
         father_id = get_sid(m.get("FatherRecordId"))
         mother_id = get_sid(m.get("MotherRecordId"))
@@ -413,7 +446,7 @@ def get_tree():
         elif mother_id and mother_id in lookup:
             lookup[mother_id]["children"].append(m)
 
-    # ── Phase 4: Merge spouse children into primary member ────────────────
+    # ── Phase 4: Merge spouse children into primary member ────────────
     def merge_spouse_children(node, visited=None):
         if visited is None:
             visited = set()
@@ -425,14 +458,14 @@ def get_tree():
             spouse_id = node["Spouse"]["id"]
             if spouse_id in lookup:
                 spouse_full = lookup[spouse_id]
-                existing_ids = {c["id"] for c in node["children"]}
+                existing = {c["id"] for c in node["children"]}
                 for child in spouse_full.get("children", []):
-                    if child["id"] not in existing_ids:
+                    if child["id"] not in existing:
                         node["children"].append(child)
         for child in node["children"]:
             merge_spouse_children(child, visited)
 
-    # ── Phase 5: Identify true roots ──────────────────────────────────────
+    # ── Phase 5: Identify true roots ──────────────────────────────────
     final_roots = []
     processed_root_ids = set()
 
