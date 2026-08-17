@@ -91,3 +91,20 @@ def test_vercel_allowlist_must_start_by_ignoring_project_root(tmp_path: Path) ->
     violations = module.validate_repository(tmp_path, tracked_files=[])
 
     assert violations[0] == "frontend/.vercelignore must start with /*"
+
+
+def test_directory_allowlist_uses_vercel_documented_project_root_syntax() -> None:
+    module = _load_module()
+
+    assert "!public" in module.FRONTEND_VERCEL_PATTERNS
+    assert "!src" in module.FRONTEND_VERCEL_PATTERNS
+    assert "!api" in module.BACKEND_VERCEL_PATTERNS
+    assert "!coordination" in module.BACKEND_VERCEL_PATTERNS
+    assert all(
+        not pattern.startswith("!/") and not pattern.endswith("/")
+        for patterns in (
+            module.FRONTEND_VERCEL_PATTERNS,
+            module.BACKEND_VERCEL_PATTERNS,
+        )
+        for pattern in patterns[1:]
+    )

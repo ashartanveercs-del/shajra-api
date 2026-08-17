@@ -1,9 +1,9 @@
 /*
-!/public/
-!/src/
-!/eslint.config.mjs
-!/next.config.ts
-!/package-lock.json
-!/package.json
-!/postcss.config.mjs
-!/tsconfig.json
+!public
+!src
+!eslint.config.mjs
+!next.config.ts
+!package-lock.json
+!package.json
+!postcss.config.mjs
+!tsconfig.json
