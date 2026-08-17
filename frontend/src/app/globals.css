@@ -145,6 +145,16 @@ body {
   animation: fadeInUp 0.6s ease-out forwards;
 }
 
+/* Creator (Ashar Tanveer) gold glow */
+@keyframes creatorGlow {
+  0%, 100% { box-shadow: 0 0 22px rgba(231, 166, 26, 0.45), 0 0 0 2px rgba(251, 191, 36, 0.35); }
+  50% { box-shadow: 0 0 40px rgba(231, 166, 26, 0.75), 0 0 0 3px rgba(251, 191, 36, 0.6); }
+}
+
+.creator-glow {
+  animation: creatorGlow 2.2s ease-in-out infinite;
+}
+
 /* Stagger children */
 .stagger-children > * {
   opacity: 0;
@@ -156,6 +166,100 @@ body {
 .stagger-children > *:nth-child(4) { animation-delay: 0.2s; }
 .stagger-children > *:nth-child(5) { animation-delay: 0.25s; }
 .stagger-children > *:nth-child(6) { animation-delay: 0.3s; }
+
+/* ── UI/UX enhancements ─────────────────────────────────────────── */
+
+/* Gentle floating motion for hero ornaments */
+@keyframes float {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-16px) rotate(1.5deg); }
+}
+.animate-float {
+  animation: float 7s ease-in-out infinite;
+}
+.animate-float-slow {
+  animation: float 11s ease-in-out infinite;
+}
+
+/* Soft radial glow behind the hero */
+.hero-glow {
+  background:
+    radial-gradient(60% 50% at 50% 0%, rgba(196, 149, 106, 0.10), transparent 70%),
+    radial-gradient(40% 40% at 85% 20%, rgba(139, 111, 71, 0.08), transparent 70%);
+}
+
+/* Shine sweep across primary buttons on hover */
+.btn-primary {
+  position: relative;
+  overflow: hidden;
+}
+.btn-primary::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -120%;
+  width: 60%;
+  height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.28), transparent);
+  transform: skewX(-20deg);
+  transition: left 0.6s ease;
+  pointer-events: none;
+}
+.btn-primary:hover::after {
+  left: 130%;
+}
+
+/* Spotlight border glow on heritage cards */
+.heritage-card {
+  position: relative;
+}
+.heritage-card.spotlight::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  background: radial-gradient(320px circle at var(--spot-x, 50%) var(--spot-y, 0%), rgba(196, 149, 106, 0.12), transparent 65%);
+  pointer-events: none;
+}
+.heritage-card.spotlight:hover::before {
+  opacity: 1;
+}
+
+/* 3D tilt card glare */
+.tilt-card {
+  position: relative;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+.tilt-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  background: radial-gradient(260px circle at var(--glare-x, 50%) var(--glare-y, 50%), rgba(255, 255, 255, 0.35), transparent 60%);
+  pointer-events: none;
+}
+.tilt-card:hover::after {
+  opacity: 1;
+}
+
+/* Respect reduced motion globally */
+@media (prefers-reduced-motion: reduce) {
+  .animate-float,
+  .animate-float-slow,
+  .animate-fadeInUp,
+  .stagger-children > *,
+  .creator-glow {
+    animation: none !important;
+  }
+  .stagger-children > * {
+    opacity: 1;
+  }
+}
 
 /* Leaflet fixes */
 .leaflet-container {

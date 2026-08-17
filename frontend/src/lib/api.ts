@@ -141,6 +141,12 @@ export interface MapData {
   arcs: MapArc[];
 }
 
+export interface SearchFilters {
+  city?: string;
+  branch?: string;
+  generation?: string;
+}
+
 export interface ImageUpload {
   url: string;
 }
@@ -167,8 +173,16 @@ export function fetchMapMarkers(): Promise<MapData> {
   return requestJson<MapData>("/api/map-markers", { cache: "no-store" });
 }
 
-export function searchMembers(query: string): Promise<Member[]> {
-  return requestJson<Member[]>(`/api/search?q=${encodeURIComponent(query)}`, {
+export function searchMembers(
+  query: string,
+  filters: SearchFilters = {},
+): Promise<Member[]> {
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (filters.city) params.set("city", filters.city);
+  if (filters.branch) params.set("branch", filters.branch);
+  if (filters.generation) params.set("generation", filters.generation);
+  return requestJson<Member[]>(`/api/search?${params.toString()}`, {
     cache: "no-store",
   });
 }

@@ -302,6 +302,7 @@ function memberDraft(member: Member): Partial<Member> {
     FatherName: member.FatherName,
     MotherName: member.MotherName,
     SpouseName: member.SpouseName,
+    SpouseRecordId: member.SpouseRecordId,
     DateOfBirth: member.DateOfBirth,
     DateOfDeath: member.DateOfDeath,
     Gender: member.Gender,
@@ -415,6 +416,17 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     setActionError("");
     try {
       await adminUpdateMember(token, memberId, editForm);
+      // Make the marriage reciprocal in the underlying data (the tree renders
+      // it correctly either way, but keeping both sides consistent prevents
+      // stale one-sided links from confusing later edits).
+      const newSpouseId = editForm.SpouseRecordId;
+      const oldSpouseId = member.SpouseRecordId;
+      if (newSpouseId && newSpouseId !== oldSpouseId) {
+        await adminUpdateMember(token, newSpouseId, { SpouseRecordId: memberId });
+      }
+      if (!newSpouseId && oldSpouseId && !oldSpouseId.startsWith("__name__")) {
+        await adminUpdateMember(token, oldSpouseId, { SpouseRecordId: "", SpouseName: "" });
+      }
       if (!modalIsCurrent(generation, memberId)) return;
       closeEditor();
       refreshAfterWrite();
@@ -428,13 +440,21 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
   };
 
   const handleUnlinkMember = async (id: string) => {
+    const target = allMembers.find((member) => member.id === id);
+    const spouseId = target?.Spouse?.id;
     setActionLoading(true);
     setActionError("");
     try {
-      await adminUpdateMember(token, id, { FatherRecordId: "", MotherRecordId: "" });
+      // Unlink the marriage: clear this member's spouse link, and clear the
+      // reciprocal link on the spouse (when it's a real record — name-only
+      // placeholder nodes have no record to update).
+      await adminUpdateMember(token, id, { SpouseRecordId: "", SpouseName: "" });
+      if (spouseId && !spouseId.startsWith("__name__")) {
+        await adminUpdateMember(token, spouseId, { SpouseRecordId: "", SpouseName: "" });
+      }
       refreshAfterWrite();
     } catch (error: unknown) {
-      setActionError(asApiProblem(error, "The family connection could not be removed.").message);
+      setActionError(asApiProblem(error, "The marriage could not be removed.").message);
     } finally {
       setActionLoading(false);
     }
@@ -474,6 +494,11 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
       ProfileImageUrl: "",
       ...(parent ? { Generation: (parent.Generation || 1) + 1 } : {}),
       ...(parent ? legacyParentRelationship(parent) : {}),
+      ...(parent
+        ? parent.Gender === "Female"
+          ? { MotherName: parent.FullName, FatherName: parent.Spouse?.FullName || "" }
+          : { FatherName: parent.FullName, MotherName: parent.Spouse?.FullName || "" }
+        : {}),
     };
     openEditor({ id: "new", FullName: "" }, draft, invoker);
   };
@@ -667,6 +692,22 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
                     ))}
                   </select>
                 </div>
+              </div>
+
+              <div className="rounded-lg border border-amber/25 bg-amber/5 p-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <label htmlFor="editor-spouse" className="text-xs font-bold uppercase text-amber">
+                    Spouse (link to existing member)
+                    <select id="editor-spouse" value={editForm.SpouseRecordId || ""} onChange={(event) => setEditForm((current) => ({ ...current, SpouseRecordId: event.target.value }))} className="input-heritage mt-1.5 w-full bg-white">
+                      <option value="">No spouse</option>
+                      {allMembers.filter((member) => member.id !== editingMember.id && !member.id.startsWith("__name__")).map((member) => (
+                        <option key={member.id} value={member.id}>{member.FullName}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <EditorInput id="editor-spouse-name" label="Spouse Name (if not in tree)" value={editForm.SpouseName} onChange={(SpouseName) => setEditForm((current) => ({ ...current, SpouseName }))} />
+                </div>
+                <p className="mt-2 text-[11px] leading-relaxed text-text-muted">Pick an existing member to link a marriage, or type a name for a spouse not yet in the tree.</p>
               </div>
 
               <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">

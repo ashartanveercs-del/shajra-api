@@ -89,3 +89,40 @@ def test_ai_client_constructor_failure_falls_back_before_database_access(monkeyp
     assert result["Notes"] == "AI processing failed. Using raw data."
     assert synthetic_exception not in result["Notes"]
     assert calls == 0
+
+
+def test_match_member_id_resolves_unique_names():
+    ai_service = importlib.import_module("ai_service")
+    members = [
+        {"id": "rec_salman", "FullName": "Salman Habib", "Gender": "Male"},
+        {"id": "rec_aiemen", "FullName": "Aiemen Aslam", "Gender": "Female"},
+        {"id": "rec_sobia", "FullName": "Sobia Alamgir", "Gender": "Female"},
+        {"id": "rec_aftab", "FullName": "Aftab Alamgir", "Gender": "Male"},
+        {"id": "rec_tanveer", "FullName": "Tanveer Kamal", "Gender": "Male"},
+        {"id": "rec_khushaar", "FullName": "Khushaar Tanveer", "Gender": "Female"},
+    ]
+
+    # Correct unique matches (these were the exact LLM-hallucination failures).
+    assert ai_service._match_member_id("Aiemen Aslam", members, gender="Female") == "rec_aiemen"
+    assert ai_service._match_member_id("Tanveer Kamal Rasheed", members, gender="Male") == "rec_tanveer"
+    assert ai_service._match_member_id("Aftab Alamgir", members, gender="Male") == "rec_aftab"
+    assert ai_service._match_member_id("Sobia Alamgir", members, gender="Female") == "rec_sobia"
+    assert ai_service._match_member_id("Salman Habib", members, gender="Male") == "rec_salman"
+
+    # Name-only / unknown people never match a record.
+    assert ai_service._match_member_id("Hashir Tihami", members, gender="Male") == ""
+    assert ai_service._match_member_id("", members, gender="Male") == ""
+    assert ai_service._match_member_id("Someone Else", members, gender="Male") == ""
+
+    # Gender mismatch must not match.
+    assert ai_service._match_member_id("Salman Habib", members, gender="Female") == ""
+
+
+def test_match_member_id_never_guesses_ambiguous_names():
+    ai_service = importlib.import_module("ai_service")
+    # Two people share a surname key; a bare-name reference must NOT pick either.
+    members = [
+        {"id": "rec_a", "FullName": "Muhammad Ali", "Gender": "Male"},
+        {"id": "rec_b", "FullName": "Ali Raza", "Gender": "Male"},
+    ]
+    assert ai_service._match_member_id("Ali", members, gender="Male") == ""

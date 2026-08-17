@@ -231,11 +231,33 @@ def get_member(record_id: str):
 
 
 @app.get("/api/search")
-def search_members(q: str = ""):
-    """Search members by name."""
-    if not q or len(q) < 2:
-        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
-    return db.search_members(q)
+def search_members(q: str = "", city: str = "", branch: str = "", generation: str = ""):
+    """Search members by name, with optional city/branch/generation filters.
+
+    Name search is delegated to Airtable when a query is supplied; otherwise all
+    members are loaded and filtered server-side.
+    """
+    q = (q or "").strip()
+    city = (city or "").strip()
+    branch = (branch or "").strip()
+    generation = (generation or "").strip()
+
+    if len(q) >= 2:
+        members = db.search_members(q)
+    else:
+        members = db.get_all_members()
+
+    results = []
+    for m in members:
+        if city and (m.get("CurrentCity") or "").strip() != city:
+            continue
+        if branch and (m.get("Branch") or "").strip() != branch:
+            continue
+        if generation and str(m.get("Generation") or "") != generation:
+            continue
+        results.append(m)
+
+    return results
 
 
 @app.get("/api/tree")
@@ -319,13 +341,19 @@ def get_tree():
     name_nodes: dict[str, dict] = {}
 
     def find_member_by_name(name, exclude_id=None, gender=None):
+        # Iterate most-specific → least-specific keys. Only link when a key
+        # matches EXACTLY ONE candidate; multiple candidates is ambiguous and
+        # must never be guessed (avoids attaching the wrong same-name relative).
         for key in name_keys(name):
-            for cand in name_index.get(key, []):
-                if exclude_id and cand["id"] == exclude_id:
-                    continue
-                if gender and cand.get("Gender") and cand.get("Gender") != gender:
-                    continue
-                return cand
+            candidates = [
+                c for c in name_index.get(key, [])
+                if not (exclude_id and c["id"] == exclude_id)
+                and not (gender and c.get("Gender") and c.get("Gender") != gender)
+            ]
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) > 1:
+                return None
         return None
 
     def make_name_node(name, gender) -> dict:
@@ -437,6 +465,37 @@ def get_tree():
         if father_id and mother_id and father_id in lookup and mother_id in lookup:
             link_spouses(lookup[father_id], lookup[mother_id])
 
+    # ── Phase 2.5: Break parent-link cycles ─────────────────────────────
+    # A parent-link cycle (e.g. A.FatherRecordId=B and B.FatherRecordId=A) would
+    # otherwise make every member in the cycle "dependent", so phase 5 silently
+    # drops them all. Break the back-edge so no member ever vanishes: the
+    # cycle-member becomes a root (or stays under a real ancestor) instead.
+    def _parent_record_ids(m):
+        pids = []
+        for pid in (get_sid(m.get("FatherRecordId")), get_sid(m.get("MotherRecordId"))):
+            if pid and pid in lookup:
+                pids.append(pid)
+        return pids
+
+    def _in_parent_cycle(mid):
+        # Is `mid` reachable from itself by walking up parent record links?
+        seen = set()
+        stack = [p for p in _parent_record_ids(lookup.get(mid) or {})]
+        while stack:
+            cur = stack.pop()
+            if cur == mid:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(_parent_record_ids(lookup.get(cur) or {}))
+        return False
+
+    for m in members:
+        if _in_parent_cycle(m["id"]):
+            m["FatherRecordId"] = ""
+            m["MotherRecordId"] = ""
+
     # ── Phase 3: Build parent-child hierarchy ─────────────────────────
     for m in members:
         father_id = get_sid(m.get("FatherRecordId"))
@@ -478,7 +537,8 @@ def get_tree():
                 processed_root_ids.add(m["Spouse"]["id"])
 
     def sort_key(m):
-        gen = m.get("Generation", 99)
+        gen_val = m.get("Generation")
+        gen = gen_val if isinstance(gen_val, (int, float)) else 99
         has_parents = 0 if (m.get("FatherRecordId") or m.get("MotherRecordId")) else 1
         return (gen, has_parents)
 
@@ -529,81 +589,148 @@ def get_map_markers():
 
     # Helper to get string ID from possible list/string field
     def get_sid(field_val):
-        if not field_val: return ""
+        if not field_val:
+            return ""
         if isinstance(field_val, list) and len(field_val) > 0:
             return str(field_val[0]).strip()
         return str(field_val).strip()
 
+    def normalize_name(name) -> str:
+        """Casefold, strip diacritics, collapse whitespace for name matching."""
+        if not name:
+            return ""
+        s = unicodedata.normalize("NFKD", str(name))
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        return re.sub(r"\s+", " ", s.casefold().strip())
+
+    def normalize_city(value) -> str:
+        """Strip everything after the first comma, e.g. 'Karachi, Pakistan' -> 'Karachi'."""
+        if not value:
+            return ""
+        return str(value).split(",")[0].strip().title()
+
     member_lookup = {m["id"]: m for m in members}
 
-    def get_member_coords(member):
-        # 1. Direct Coords
-        if member.get("Latitude") and member.get("Longitude"):
-            return float(member["Latitude"]), float(member["Longitude"])
-        
-        # 2. City Fallback
-        city = member.get("CurrentCity", "").strip().title()
+    # Name -> member index used to resolve parents by name when record IDs are missing.
+    name_index = {}
+    for m in members:
+        key = normalize_name(m.get("FullName"))
+        if key:
+            name_index.setdefault(key, []).append(m)
+
+    def city_coords(city_value):
+        city = normalize_city(city_value)
         if city in CITY_GEODATA:
             return CITY_GEODATA[city]["lat"], CITY_GEODATA[city]["lng"]
-        
-        return None, None
+        return None
+
+    def get_burial_coords(member):
+        if member.get("BurialLatitude") and member.get("BurialLongitude"):
+            return float(member["BurialLatitude"]), float(member["BurialLongitude"])
+        return city_coords(member.get("BurialLocation")) or (None, None)
+
+    def get_member_coords(member):
+        # 1. Direct coordinates
+        if member.get("Latitude") and member.get("Longitude"):
+            return float(member["Latitude"]), float(member["Longitude"])
+        # 2. Residence city (normalized) fallback
+        coords = city_coords(member.get("CurrentCity"))
+        if coords:
+            return coords
+        # 3. Burial coordinates fallback (deceased member's resting place)
+        if member.get("BurialLatitude") and member.get("BurialLongitude"):
+            return float(member["BurialLatitude"]), float(member["BurialLongitude"])
+        return city_coords(member.get("BurialLocation")) or (None, None)
+
+    def resolve_parent(m, name_field, id_field, gender):
+        """Resolve a parent by record ID, falling back to a name match against FullName."""
+        pid = get_sid(m.get(id_field))
+        if pid and pid in member_lookup:
+            return member_lookup[pid]
+        name = normalize_name(m.get(name_field))
+        if not name:
+            return None
+        # Exact normalized name match
+        for cand in name_index.get(name, []):
+            if cand["id"] != m["id"] and (not gender or cand.get("Gender", "") == gender):
+                return cand
+        # Partial / contained match (e.g. missing middle name)
+        for key, cands in name_index.items():
+            if name in key or key in name:
+                for cand in cands:
+                    if cand["id"] != m["id"] and (not gender or cand.get("Gender", "") == gender):
+                        return cand
+        return None
 
     for m in members:
         mid = m["id"]
         name = m.get("FullName", "")
-        lat, lng = get_member_coords(m)
+
+        # Residence coordinates (direct -> normalized city)
+        res_lat = res_lng = None
+        if m.get("Latitude") and m.get("Longitude"):
+            res_lat, res_lng = float(m["Latitude"]), float(m["Longitude"])
+        else:
+            rc = city_coords(m.get("CurrentCity"))
+            if rc:
+                res_lat, res_lng = rc
+
+        # Burial coordinates (direct -> normalized city)
+        bur_lat, bur_lng = get_burial_coords(m)
+
+        # Coordinates used for relationship arcs: residence first, burial fallback.
+        arc_lat, arc_lng = (res_lat, res_lng) if (res_lat and res_lng) else (bur_lat, bur_lng)
 
         # Residence marker
-        if lat and lng:
+        if res_lat and res_lng:
             markers.append({
                 "id": mid,
                 "name": name,
                 "type": "residence",
-                "lat": lat,
-                "lng": lng,
+                "lat": res_lat,
+                "lng": res_lng,
                 "city": m.get("CurrentCity", ""),
                 "country": m.get("CurrentCountry", ""),
                 "gender": m.get("Gender", ""),
                 "isAlive": m.get("IsAlive", True),
             })
 
-            # Build arc: connect child to parents if they have coords
-            parents = [get_sid(m.get("FatherRecordId")), get_sid(m.get("MotherRecordId"))]
-            for pid in parents:
-                if pid and pid in member_lookup:
-                    parent = member_lookup[pid]
-                    p_lat, p_lng = get_member_coords(parent)
-                    if p_lat and p_lng:
-                        # Only create arc if locations are different (to avoid dots)
-                        if abs(lat - p_lat) > 0.05 or abs(lng - p_lng) > 0.05:
-                            arcs.append({
-                                "startLat": lat,
-                                "startLng": lng,
-                                "endLat": p_lat,
-                                "endLng": p_lng,
-                                "label": f"{name} → {parent.get('FullName', '')}",
-                                "color": "#c9956c" if parent.get("Gender") == "Male" else "#d9819a",
-                            })
-
-        # Burial marker (only if exact coords or city is available)
-        b_lat, b_lng = None, None
-        if m.get("BurialLatitude") and m.get("BurialLongitude"):
-            b_lat, b_lng = float(m["BurialLatitude"]), float(m["BurialLongitude"])
-        elif m.get("BurialLocation", "").strip().title() in CITY_GEODATA:
-            city = m.get("BurialLocation", "").strip().title()
-            b_lat, b_lng = CITY_GEODATA[city]["lat"], CITY_GEODATA[city]["lng"]
-
-        if b_lat and b_lng:
+        # Burial marker
+        if bur_lat and bur_lng:
             markers.append({
                 "id": mid,
                 "name": name,
                 "type": "burial",
-                "lat": b_lat,
-                "lng": b_lng,
+                "lat": bur_lat,
+                "lng": bur_lng,
                 "location": m.get("BurialLocation", ""),
                 "gender": m.get("Gender", ""),
                 "isAlive": False,
             })
+
+        # Build arcs: connect child to resolved parents (ID or name) if both have coords.
+        if arc_lat and arc_lng:
+            seen_parents = set()
+            for id_field, name_field, gender in (
+                ("FatherRecordId", "FatherName", "Male"),
+                ("MotherRecordId", "MotherName", "Female"),
+            ):
+                parent = resolve_parent(m, name_field, id_field, gender)
+                if not parent or parent["id"] == mid or parent["id"] in seen_parents:
+                    continue
+                seen_parents.add(parent["id"])
+                p_lat, p_lng = get_member_coords(parent)
+                if p_lat and p_lng:
+                    # Only create arc if locations are different (to avoid dots)
+                    if abs(arc_lat - p_lat) > 0.05 or abs(arc_lng - p_lng) > 0.05:
+                        arcs.append({
+                            "startLat": arc_lat,
+                            "startLng": arc_lng,
+                            "endLat": p_lat,
+                            "endLng": p_lng,
+                            "label": f"{name} → {parent.get('FullName', '')}",
+                            "color": "#c9956c" if parent.get("Gender") == "Male" else "#d9819a",
+                        })
 
     return {"markers": markers, "arcs": arcs}
 
@@ -845,6 +972,25 @@ def list_pending_by_status(status: str, admin=Depends(get_current_admin)):
     return db.get_pending_by_status(status)
 
 
+def _link_spouse_reciprocal(member: dict) -> None:
+    """Store the marriage on BOTH sides of the relationship.
+
+    When a member is created/approved with a SpouseRecordId, update that spouse's
+    SpouseRecordId to point back at this member. Best-effort: a failure here
+    (e.g. the spouse is a name-only placeholder with no real record) must never
+    fail the whole create/approve operation — get_tree() also links spouses at
+    read time, so this only improves data integrity.
+    """
+    spouse_id = (member.get("SpouseRecordId") or "").strip()
+    member_id = member.get("id")
+    if not spouse_id or not member_id or spouse_id == member_id:
+        return
+    try:
+        db.update_member(spouse_id, {"SpouseRecordId": member_id})
+    except Exception:  # noqa: BLE001 - best-effort reciprocal link.
+        pass
+
+
 @app.post("/api/admin/approve/{record_id}")
 def approve_submission(
     record_id: str,
@@ -896,6 +1042,10 @@ def approve_submission(
     new_member = db.create_member(member_fields)
     db.update_pending(record_id, {"Status": "Approved"})
 
+    # Reciprocally link the spouse so the marriage unit is stored on BOTH
+    # sides of the relationship (not just the new member -> spouse).
+    _link_spouse_reciprocal(new_member)
+
     # Record in history
     _push_history("approve", new_member["id"], None, new_member)
 
@@ -928,6 +1078,7 @@ def admin_create_member(
     try:
         fields = member.model_dump(exclude_none=True)
         new_member = db.create_member(fields)
+        _link_spouse_reciprocal(new_member)
         _push_history("create", new_member["id"], None, new_member)
         return new_member
     except HTTPError as e:

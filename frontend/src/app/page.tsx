@@ -5,6 +5,8 @@ import Link from "next/link";
 import { fetchMembers, type Member } from "@/lib/api";
 import AsyncState from "@/components/feedback/AsyncState";
 import { asApiProblem, type Loadable } from "@/lib/loadable";
+import Reveal from "@/components/ui/Reveal";
+import AnimatedCounter from "@/components/ui/AnimatedCounter";
 import {
   TreePine,
   Users,
@@ -49,6 +51,13 @@ export default function HomePage() {
     loadMembers();
   };
 
+  // Mouse-follow spotlight for heritage cards
+  const handleSpotlight = (event: React.MouseEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    event.currentTarget.style.setProperty("--spot-x", `${event.clientX - rect.left}px`);
+    event.currentTarget.style.setProperty("--spot-y", `${event.clientY - rect.top}px`);
+  };
+
   const members = "data" in memberState ? memberState.data : [];
   const hasMemberData = memberState.status === "ready" || memberState.status === "empty";
 
@@ -64,6 +73,7 @@ export default function HomePage() {
       {/* Hero */}
       <section className="relative overflow-hidden bg-bg-secondary">
         <div className="absolute inset-0 texture-grain" />
+        <div className="absolute inset-0 hero-glow" />
         <div className="relative mx-auto max-w-6xl px-5 sm:px-8 pt-16 sm:pt-24 pb-20 sm:pb-28">
           <div className="max-w-2xl animate-fadeInUp">
             <p className="inline-flex items-center gap-2 text-accent text-sm font-medium mb-5 tracking-wide uppercase">
@@ -98,10 +108,12 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* Decorative element */}
-        <div className="absolute right-0 top-1/2 -translate-y-1/2 w-[400px] h-[400px] opacity-[0.04] hidden lg:block">
+        {/* Decorative floating elements */}
+        <div className="absolute right-[6%] top-1/2 -translate-y-1/2 w-[380px] h-[380px] opacity-[0.05] hidden lg:block animate-float-slow">
           <TreePine className="w-full h-full text-accent" strokeWidth={0.5} />
         </div>
+        <div className="absolute left-[8%] top-[18%] w-24 h-24 rounded-full bg-accent-warm/10 blur-2xl animate-float hidden lg:block" />
+        <div className="absolute right-[16%] bottom-[12%] w-16 h-16 rounded-full bg-accent/10 blur-xl animate-float-slow hidden lg:block" />
       </section>
 
       {/* Stats */}
@@ -119,7 +131,11 @@ export default function HomePage() {
               </div>
               <div>
                 <div className="text-2xl font-bold text-text-primary font-serif">
-                  {stat.value}
+                  {typeof stat.value === "number" ? (
+                    <AnimatedCounter to={stat.value} />
+                  ) : (
+                    stat.value
+                  )}
                 </div>
                 <div className="text-xs text-text-muted font-medium">{stat.label}</div>
               </div>
@@ -167,7 +183,7 @@ export default function HomePage() {
           </h2>
         </div>
 
-        <div className="grid md:grid-cols-3 gap-6 stagger-children">
+        <div className="grid md:grid-cols-3 gap-6">
           {[
             {
               title: "Interactive Tree",
@@ -196,26 +212,28 @@ export default function HomePage() {
               accent: "bg-sky-light",
               iconColor: "text-sky",
             },
-          ].map((card) => (
-            <Link key={card.title} href={card.href} className="group">
-              <div className="heritage-card p-7 h-full">
-                <div
-                  className={`w-12 h-12 rounded-xl ${card.accent} flex items-center justify-center mb-5 group-hover:scale-105 transition-heritage`}
-                >
-                  <card.icon className={`w-5 h-5 ${card.iconColor}`} />
+          ].map((card, index) => (
+            <Reveal key={card.title} delay={index * 90} className="h-full">
+              <Link href={card.href} className="group block h-full">
+                <div className="heritage-card spotlight p-7 h-full" onMouseMove={handleSpotlight}>
+                  <div
+                    className={`w-12 h-12 rounded-xl ${card.accent} flex items-center justify-center mb-5 group-hover:scale-105 transition-heritage`}
+                  >
+                    <card.icon className={`w-5 h-5 ${card.iconColor}`} />
+                  </div>
+                  <h3 className="font-serif text-xl font-semibold mb-2.5 text-text-primary">
+                    {card.title}
+                  </h3>
+                  <p className="text-text-muted text-sm leading-relaxed mb-5">
+                    {card.description}
+                  </p>
+                  <span className="inline-flex items-center gap-1.5 text-accent text-sm font-medium group-hover:gap-2.5 transition-all">
+                    Explore
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </span>
                 </div>
-                <h3 className="font-serif text-xl font-semibold mb-2.5 text-text-primary">
-                  {card.title}
-                </h3>
-                <p className="text-text-muted text-sm leading-relaxed mb-5">
-                  {card.description}
-                </p>
-                <span className="inline-flex items-center gap-1.5 text-accent text-sm font-medium group-hover:gap-2.5 transition-all">
-                  Explore
-                  <ArrowRight className="w-3.5 h-3.5" />
-                </span>
-              </div>
-            </Link>
+              </Link>
+            </Reveal>
           ))}
         </div>
       </section>
@@ -233,25 +251,27 @@ export default function HomePage() {
               </h2>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 stagger-children">
-              {members.slice(0, 10).map((member) => (
-                <Link key={member.id} href={`/member/${member.id}`} className="group">
-                  <div className="heritage-card p-5 text-center">
-                    <div className="w-14 h-14 mx-auto mb-3 rounded-full bg-bg-secondary flex items-center justify-center text-lg font-serif font-bold text-accent group-hover:bg-accent group-hover:text-white transition-heritage">
-                      {(member.FullName || "?")[0]}
+            <Reveal>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+                {members.slice(0, 10).map((member) => (
+                  <Link key={member.id} href={`/member/${member.id}`} className="group">
+                    <div className="heritage-card spotlight p-5 text-center" onMouseMove={handleSpotlight}>
+                      <div className="w-14 h-14 mx-auto mb-3 rounded-full bg-bg-secondary flex items-center justify-center text-lg font-serif font-bold text-accent group-hover:bg-accent group-hover:text-white transition-heritage">
+                        {(member.FullName || "?")[0]}
+                      </div>
+                      <div className="font-medium text-sm text-text-primary truncate">
+                        {member.FullName || "Unknown"}
+                      </div>
+                      <div className="text-xs text-text-muted mt-1 truncate">
+                        {member.CurrentCity || ""}
+                        {member.CurrentCity && member.CurrentCountry ? ", " : ""}
+                        {member.CurrentCountry || ""}
+                      </div>
                     </div>
-                    <div className="font-medium text-sm text-text-primary truncate">
-                      {member.FullName || "Unknown"}
-                    </div>
-                    <div className="text-xs text-text-muted mt-1 truncate">
-                      {member.CurrentCity || ""}
-                      {member.CurrentCity && member.CurrentCountry ? ", " : ""}
-                      {member.CurrentCountry || ""}
-                    </div>
-                  </div>
-                </Link>
-              ))}
-            </div>
+                  </Link>
+                ))}
+              </div>
+            </Reveal>
 
             {members.length > 10 && (
               <div className="text-center mt-10">

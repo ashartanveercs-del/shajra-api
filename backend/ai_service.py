@@ -3,6 +3,8 @@ Shajra System — AI Processing Service
 Parses raw form submissions into clean, structured data and matches relationships.
 """
 import json
+import re
+import unicodedata
 
 import airtable_client as db
 from config import get_settings
@@ -27,7 +29,7 @@ You must:
 3. Standardize locations: extract city and country separately. Use full country names (e.g., "Pakistan" not "PK").
 4. Determine gender from context clues.
 5. Extract contact info (Email and Phone Number) and Profile Picture URL if provided in the input (often trapped in Biography notes).
-6. CRITICAL - RELATIONSHIP MATCHING & DUAL PARENTS: Every child has a Father AND a Mother. You MUST identify both. Even for cousin marriages, identify both existing record IDs.
+6. CRITICAL - RELATIONSHIP MATCHING & DUAL PARENTS: Every child has a Father AND a Mother. You MUST identify both. Even for cousin marriages, identify both parent names. IMPORTANT: only extract the parent/spouse NAMES — record-ID matching is handled separately and deterministically by the system, so do NOT attempt to guess or return record IDs.
 
 Return ONLY valid JSON. It must match these exact fields:
 {
@@ -44,11 +46,8 @@ Return ONLY valid JSON. It must match these exact fields:
     "CleanEmail": "string or empty",
     "CleanPhoneNumber": "string or empty",
     "CleanProfileImage": "string or empty",
-    "PossibleFatherMatch": "record_id or empty",
-    "PossibleMotherMatch": "record_id or empty",
-    "PossibleSpouseMatch": "record_id or empty",
     "IsDuplicate": true/false,
-    "DuplicateOfId": "record_id or empty - if this is a literal duplicate submission of an existing member",
+    "DuplicateOfName": "FullName string or empty - if this is a literal duplicate submission of an existing member",
     "Confidence": 0.0 to 1.0,
     "Notes": "any observations about data quality or complex relationship logic (e.g. cousin marriage identified)"
 }"""
@@ -72,9 +71,69 @@ def get_existing_members_context():
             city = m.get("CurrentCity", "")
             lines.append(f"- {name} (ID: {rec_id}, Father: {father}, Mother: {mother}, Spouse: {spouse}, Gender: {gender}, City: {city})")
 
-        return "Existing family members (Use these IDs for ALL relationship matches):\n" + "\n".join(lines)
+        return "Existing family members (for reference and duplicate detection):\n" + "\n".join(lines)
     except Exception:  # noqa: BLE001 - Preserve the v1 external datastore context fallback.
         return "Existing member context is temporarily unavailable."
+
+
+def _normalize_name(name) -> str:
+    """Casefold, strip diacritics, collapse whitespace."""
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", str(name))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", s.casefold().strip())
+
+
+def _name_keys(name) -> list:
+    """Matching keys from most-specific to least-specific.
+
+    Progressively strips trailing words but never drops below two words, so a
+    bare first name can never match (avoids false positives). Single-word names
+    only ever match on the full name.
+    """
+    n = _normalize_name(name)
+    if not n:
+        return []
+    words = n.split()
+    if len(words) <= 2:
+        return [n]
+    keys = []
+    while len(words) >= 2:
+        keys.append(" ".join(words))
+        words = words[:-1]
+    return keys
+
+
+def _build_name_index(members) -> dict:
+    index = {}
+    for m in members:
+        for key in _name_keys(m.get("FullName", "")):
+            index.setdefault(key, []).append(m)
+    return index
+
+
+def _match_member_id(name, members, gender=None) -> str:
+    """Deterministic, ambiguity-safe name -> member record ID.
+
+    Returns the matched record ID, or "" when there is no unique match. A name
+    is only linked when a key matches EXACTLY ONE candidate; any ambiguity
+    resolves to "" so the wrong same-name relative is never linked. This
+    replaces the LLM's unreliable ID guessing.
+    """
+    if not name or not name.strip():
+        return ""
+    name_index = _build_name_index(members)
+    for key in _name_keys(name):
+        candidates = [
+            c for c in name_index.get(key, [])
+            if not (gender and c.get("Gender") and c.get("Gender") != gender)
+        ]
+        if len(candidates) == 1:
+            return candidates[0].get("id", "")
+        if len(candidates) > 1:
+            return ""
+    return ""
 
 
 def _raw_submission_fallback(raw_data: dict, notes: str) -> dict:
@@ -190,6 +249,26 @@ Please clean and standardize this data, handle cousin linkages properly, and sug
 def process_and_store_submission(raw_data: dict) -> dict:
     ai_result = process_submission(raw_data)
 
+    # Deterministic relationship matching. The LLM must NOT be trusted to return
+    # record IDs (it hallucinated mismatches, e.g. attaching Sobia's ID as the
+    # mother of Aiemen's children). Match cleaned names against existing members
+    # here instead, using the same ambiguity-safe rules as get_tree().
+    try:
+        members = db.get_all_members()
+    except Exception:  # noqa: BLE001 - degrade to no record links if the store is unavailable.
+        members = []
+
+    subject_gender = ai_result.get("CleanGender", "")
+    spouse_gender = ""
+    if subject_gender == "Male":
+        spouse_gender = "Female"
+    elif subject_gender == "Female":
+        spouse_gender = "Male"
+
+    matched_father = _match_member_id(ai_result.get("CleanFatherName"), members, gender="Male")
+    matched_mother = _match_member_id(ai_result.get("CleanMotherName"), members, gender="Female")
+    matched_spouse = _match_member_id(ai_result.get("CleanSpouseName"), members, gender=spouse_gender)
+
     pending_record = {
         "RawFullName": raw_data.get("RawFullName", ""),
         "RawFatherName": raw_data.get("RawFatherName", ""),
@@ -220,9 +299,9 @@ def process_and_store_submission(raw_data: dict) -> dict:
         "CleanPhoneNumber": ai_result.get("CleanPhoneNumber", ""),
         "CleanProfileImage": ai_result.get("CleanProfileImage", ""),
 
-        "AIMatchedFatherId": ai_result.get("PossibleFatherMatch", ""),
-        "AIMatchedMotherId": ai_result.get("PossibleMotherMatch", ""),
-        "AIMatchedSpouseId": ai_result.get("PossibleSpouseMatch", ""),
+        "AIMatchedFatherId": matched_father,
+        "AIMatchedMotherId": matched_mother,
+        "AIMatchedSpouseId": matched_spouse,
         "AIConfidence": ai_result.get("Confidence", 0.0),
         "AIDuplicateFlag": ai_result.get("IsDuplicate", False),
         "AINotes": ai_result.get("Notes", ""),

@@ -114,6 +114,11 @@ def get_member_by_id(record_id: str) -> dict[str, object] | None:
 
 def create_member(fields: dict[str, object]) -> dict[str, object]:
     """Legacy, feature-gated mutation export for existing v1 routes."""
+    # Airtable rejects unknown field names; the Pydantic schemas carry extra
+    # optional fields (CardStyle, DateOfDeath, Branch, ...) that don't exist in
+    # the Airtable Members table. Drop empty/None values so only real, known
+    # fields are written. (create only — update keeps empties to allow clearing.)
+    fields = {k: v for k, v in fields.items() if v is not None and v != ""}
     return _create_legacy(members_table, fields)
 
 

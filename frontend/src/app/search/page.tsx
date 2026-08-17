@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchMembers, type Member } from "@/lib/api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { searchMembers, type Member, type SearchFilters } from "@/lib/api";
+import TiltCard from "@/components/ui/TiltCard";
 import AsyncState from "@/components/feedback/AsyncState";
 import { asApiProblem, type Loadable } from "@/lib/loadable";
 import Link from "next/link";
@@ -12,79 +13,97 @@ import {
   Filter,
   X,
   Heart,
+  Mail,
+  MessageCircle,
 } from "lucide-react";
 
+const DEBOUNCE_MS = 300;
+
+/** Normalize a phone number into a wa.me-friendly digits string. */
+function whatsappHref(phone: string | undefined): string {
+  if (!phone) return "";
+  let digits = phone.replace(/[^\d]/g, "");
+  if (digits.startsWith("0")) digits = "92" + digits.slice(1);
+  return `https://wa.me/${digits}`;
+}
+
 export default function SearchPage() {
-  const [memberState, setMemberState] = useState<Loadable<Member[]>>({ status: "loading" });
-  const memberRequest = useRef(0);
+  // Full member list used only to populate the filter dropdown options.
+  const [facets, setFacets] = useState<Member[]>([]);
+  const [resultState, setResultState] = useState<Loadable<Member[]>>({ status: "loading" });
+  const resultRequest = useRef(0);
+
   const [query, setQuery] = useState("");
   const [filterCity, setFilterCity] = useState("");
   const [filterBranch, setFilterBranch] = useState("");
   const [filterGeneration, setFilterGeneration] = useState("");
+  const [retryNonce, setRetryNonce] = useState(0);
 
-  const loadMembers = useCallback(() => {
-    const request = ++memberRequest.current;
-    fetchMembers().then(
+  const filters = useMemo<SearchFilters>(
+    () => ({ city: filterCity, branch: filterBranch, generation: filterGeneration }),
+    [filterCity, filterBranch, filterGeneration],
+  );
+
+  // Debounce the free-text query so we only hit /api/search once the user pauses.
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedQuery(query), DEBOUNCE_MS);
+    return () => clearTimeout(handle);
+  }, [query]);
+
+  // Run the search whenever the debounced query or a filter changes. The very
+  // first run (empty query, no filters) also seeds the filter dropdown options.
+  useEffect(() => {
+    const request = ++resultRequest.current;
+    setResultState({ status: "loading" });
+    searchMembers(debouncedQuery, filters).then(
       (data) => {
-        if (request !== memberRequest.current) return;
-        setMemberState(data.length > 0 ? { status: "ready", data } : { status: "empty", data });
+        if (request !== resultRequest.current) return;
+        if (!debouncedQuery && !filters.city && !filters.branch && !filters.generation) {
+          setFacets(data);
+        }
+        setResultState(data.length > 0 ? { status: "ready", data } : { status: "empty", data });
       },
       (error: unknown) => {
-        if (request !== memberRequest.current) return;
-        setMemberState({
+        if (request !== resultRequest.current) return;
+        setResultState({
           status: "error",
           problem: asApiProblem(error, "The family directory could not be loaded."),
         });
       },
     );
-  }, []);
-
-  useEffect(() => {
-    loadMembers();
     return () => {
-      memberRequest.current += 1;
+      resultRequest.current += 1;
     };
-  }, [loadMembers]);
+  }, [debouncedQuery, filters, retryNonce]);
 
   const retryMembers = () => {
-    setMemberState({ status: "loading" });
-    loadMembers();
+    setResultState({ status: "loading" });
+    setRetryNonce((n) => n + 1);
   };
 
   const members = useMemo(
-    () => ("data" in memberState ? memberState.data : []),
-    [memberState],
+    () => ("data" in resultState ? resultState.data : []),
+    [resultState],
   );
 
   const cities = useMemo(
-    () => [...new Set(members.map((m) => m.CurrentCity).filter(Boolean))].sort(),
-    [members]
+    () => [...new Set(facets.map((m) => m.CurrentCity).filter(Boolean))].sort(),
+    [facets],
   );
   const branches = useMemo(
-    () => [...new Set(members.map((m) => m.Branch).filter(Boolean))].sort(),
-    [members]
+    () => [...new Set(facets.map((m) => m.Branch).filter(Boolean))].sort(),
+    [facets],
   );
   const generations = useMemo(
     () =>
-      [...new Set(members.map((m) => m.Generation).filter((g) => g !== undefined && g !== null))]
+      [...new Set(facets.map((m) => m.Generation).filter((g) => g !== undefined && g !== null))]
         .sort((a, b) => (a as number) - (b as number)),
-    [members]
+    [facets],
   );
 
-  const filtered = useMemo(() => {
-    return members.filter((m) => {
-      const matchesQuery =
-        !query ||
-        (m.FullName || "").toLowerCase().includes(query.toLowerCase()) ||
-        (m.FatherName || "").toLowerCase().includes(query.toLowerCase());
-      const matchesCity = !filterCity || m.CurrentCity === filterCity;
-      const matchesBranch = !filterBranch || m.Branch === filterBranch;
-      const matchesGen = !filterGeneration || String(m.Generation) === filterGeneration;
-      return matchesQuery && matchesCity && matchesBranch && matchesGen;
-    });
-  }, [members, query, filterCity, filterBranch, filterGeneration]);
-
-  const hasFilters = filterCity || filterBranch || filterGeneration;
+  const hasFilters = Boolean(filterCity || filterBranch || filterGeneration);
+  const hasActiveQuery = query.trim().length >= 2;
 
   return (
     <div className="mx-auto max-w-4xl px-5 sm:px-8 py-12 sm:py-16">
@@ -175,27 +194,27 @@ export default function SearchPage() {
         )}
 
         <span className="ml-auto text-xs text-text-light">
-          {memberState.status === "ready" || memberState.status === "empty"
-            ? `${filtered.length} result${filtered.length !== 1 ? "s" : ""}`
+          {resultState.status === "ready" || resultState.status === "empty"
+            ? `${members.length} result${members.length !== 1 ? "s" : ""}`
             : "Results unavailable"}
         </span>
       </div>
 
-      {memberState.status === "loading" && (
+      {resultState.status === "loading" && (
         <AsyncState state="loading" title="Loading family directory" />
       )}
 
-      {memberState.status === "error" && (
+      {resultState.status === "error" && (
         <AsyncState
           state="error"
           title="Directory unavailable"
-          message={memberState.problem.message}
+          message={resultState.problem.message}
           actionLabel="Retry"
           onAction={retryMembers}
         />
       )}
 
-      {memberState.status === "empty" && (
+      {resultState.status === "empty" && !hasActiveQuery && !hasFilters && (
         <div className="heritage-card p-14 text-center">
           <User className="w-10 h-10 mx-auto mb-4 text-text-light" />
           <h2 className="font-serif text-xl font-semibold mb-2">No family members yet</h2>
@@ -203,7 +222,7 @@ export default function SearchPage() {
         </div>
       )}
 
-      {memberState.status === "ready" && filtered.length === 0 && (
+      {resultState.status === "empty" && (hasActiveQuery || hasFilters) && (
         <div className="heritage-card p-14 text-center">
           <User className="w-10 h-10 mx-auto mb-4 text-text-light" />
           <h2 className="font-serif text-xl font-semibold mb-2">No matching members</h2>
@@ -211,43 +230,69 @@ export default function SearchPage() {
         </div>
       )}
 
-      {memberState.status === "ready" && filtered.length > 0 && (
+      {resultState.status === "ready" && members.length > 0 && (
         <div className="space-y-2.5 stagger-children">
-          {filtered.map((member) => (
-            <Link key={member.id} href={`/member/${member.id}`} className="group block">
+          {members.map((member) => (
+            <div key={member.id} className="group">
+              <TiltCard maxTilt={5} className="rounded-xl">
               <div className="heritage-card p-4 flex items-center gap-4">
-                <div className="w-11 h-11 rounded-xl bg-accent/8 flex items-center justify-center text-base font-serif font-bold text-accent flex-shrink-0 group-hover:bg-accent group-hover:text-white transition-heritage">
-                  {(member.FullName || "?")[0]}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="font-semibold text-sm text-text-primary truncate flex items-center gap-2">
-                    {member.FullName || "Unknown"}
-                    {member.IsAlive && (
-                      <Heart className="w-3 h-3 text-emerald fill-emerald" />
-                    )}
+                <Link href={`/member/${member.id}`} className="flex items-center gap-4 flex-1 min-w-0">
+                  <div className="w-11 h-11 rounded-xl bg-accent/8 flex items-center justify-center text-base font-serif font-bold text-accent flex-shrink-0 group-hover:bg-accent group-hover:text-white transition-heritage">
+                    {(member.FullName || "?")[0]}
                   </div>
-                  <div className="flex items-center gap-3 text-xs text-text-muted mt-0.5">
-                    {member.FatherName && <span>s/o {member.FatherName}</span>}
-                    {member.CurrentCity && (
-                      <span className="flex items-center gap-1">
-                        <MapPin className="w-3 h-3" />
-                        {member.CurrentCity}
-                      </span>
-                    )}
-                    {member.Generation && (
-                      <span className="px-1.5 py-0.5 rounded bg-bg-secondary text-text-muted text-[11px]">
-                        Gen {member.Generation}
-                      </span>
-                    )}
-                    {member.Branch && (
-                      <span className="px-1.5 py-0.5 rounded bg-accent/6 text-accent text-[11px]">
-                        {member.Branch}
-                      </span>
-                    )}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-sm text-text-primary truncate flex items-center gap-2">
+                      {member.FullName || "Unknown"}
+                      {member.IsAlive && (
+                        <Heart className="w-3 h-3 text-emerald fill-emerald" />
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-text-muted mt-0.5">
+                      {member.FatherName && <span>s/o {member.FatherName}</span>}
+                      {member.CurrentCity && (
+                        <span className="flex items-center gap-1">
+                          <MapPin className="w-3 h-3" />
+                          {member.CurrentCity}
+                        </span>
+                      )}
+                      {member.Generation && (
+                        <span className="px-1.5 py-0.5 rounded bg-bg-secondary text-text-muted text-[11px]">
+                          Gen {member.Generation}
+                        </span>
+                      )}
+                      {member.Branch && (
+                        <span className="px-1.5 py-0.5 rounded bg-accent/6 text-accent text-[11px]">
+                          {member.Branch}
+                        </span>
+                      )}
+                    </div>
                   </div>
+                </Link>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {member.Email && (
+                    <a
+                      href={`mailto:${member.Email}`}
+                      title={`Email ${member.Email}`}
+                      className="p-2 rounded-lg bg-accent/8 text-accent hover:bg-accent hover:text-white transition-colors"
+                    >
+                      <Mail className="w-3.5 h-3.5" />
+                    </a>
+                  )}
+                  {member.PhoneNumber && (
+                    <a
+                      href={whatsappHref(member.PhoneNumber)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`WhatsApp ${member.PhoneNumber}`}
+                      className="p-2 rounded-lg bg-emerald/10 text-emerald hover:bg-emerald hover:text-white transition-colors"
+                    >
+                      <MessageCircle className="w-3.5 h-3.5" />
+                    </a>
+                  )}
                 </div>
               </div>
-            </Link>
+              </TiltCard>
+            </div>
           ))}
         </div>
       )}

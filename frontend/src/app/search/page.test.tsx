@@ -1,30 +1,28 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem } from "@/lib/http";
 
-const apiMocks = vi.hoisted(() => ({ fetchMembers: vi.fn() }));
+const apiMocks = vi.hoisted(() => ({ searchMembers: vi.fn() }));
 
-vi.mock("@/lib/api", () => apiMocks);
+vi.mock("@/lib/api", () => ({ searchMembers: apiMocks.searchMembers }));
 
 import SearchPage from "./page";
 
-describe("SearchPage load states", () => {
+const ALI = { id: "member-1", FullName: "Ali Khan", CurrentCity: "Lahore", Branch: "Khan", Generation: 3 };
+
+describe("SearchPage", () => {
   beforeEach(() => {
-    apiMocks.fetchMembers.mockReset();
+    apiMocks.searchMembers.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("gives each directory filter a persistent accessible name", async () => {
-    apiMocks.fetchMembers.mockResolvedValue([
-      {
-        id: "member-1",
-        FullName: "Ali Khan",
-        CurrentCity: "Lahore",
-        Branch: "Khan",
-        Generation: 3,
-      },
-    ]);
+    apiMocks.searchMembers.mockResolvedValue([ALI]);
 
     render(<SearchPage />);
 
@@ -33,21 +31,60 @@ describe("SearchPage load states", () => {
     expect(screen.getByRole("combobox", { name: "Generation" })).toBeInTheDocument();
   });
 
-  it("preserves the query while retrying a failed directory read", async () => {
-    apiMocks.fetchMembers
+  it("searches through the search endpoint with a debounced query", async () => {
+    vi.useFakeTimers();
+    apiMocks.searchMembers.mockResolvedValue([]);
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+    render(<SearchPage />);
+
+    expect(await screen.findByText("No family members yet")).toBeInTheDocument();
+    expect(apiMocks.searchMembers).toHaveBeenCalledTimes(1);
+    expect(apiMocks.searchMembers).toHaveBeenLastCalledWith("", {});
+
+    const search = screen.getByRole("textbox", { name: "Search by name" });
+    await user.type(search, "Ali");
+
+    // Debounce: nothing fires until the pause elapses.
+    expect(apiMocks.searchMembers).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(300);
+
+    expect(apiMocks.searchMembers).toHaveBeenCalledTimes(2);
+    expect(apiMocks.searchMembers).toHaveBeenLastCalledWith("Ali", {});
+  });
+
+  it("shows matching results and keeps the query text", async () => {
+    vi.useFakeTimers();
+    apiMocks.searchMembers.mockImplementation((q: string) =>
+      Promise.resolve(q === "Ali" ? [ALI] : []),
+    );
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+    render(<SearchPage />);
+
+    expect(await screen.findByText("No family members yet")).toBeInTheDocument();
+
+    const search = screen.getByRole("textbox", { name: "Search by name" });
+    await user.type(search, "Ali");
+    vi.advanceTimersByTime(300);
+
+    expect(await screen.findByText("Ali Khan")).toBeInTheDocument();
+    expect(search).toHaveValue("Ali");
+  });
+
+  it("retries after a failed directory read", async () => {
+    apiMocks.searchMembers
       .mockRejectedValueOnce(new ApiProblem(503, "REQUEST_FAILED", "raw failure"))
-      .mockResolvedValueOnce([{ id: "member-1", FullName: "Ali Khan" }]);
+      .mockResolvedValueOnce([ALI]);
     const user = userEvent.setup();
 
     render(<SearchPage />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Directory unavailable");
-    const search = screen.getByRole("textbox", { name: "Search by name" });
-    await user.type(search, "Ali");
     await user.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(await screen.findByText("Ali Khan")).toBeInTheDocument();
-    expect(search).toHaveValue("Ali");
-    expect(apiMocks.fetchMembers).toHaveBeenCalledTimes(2);
+    expect(apiMocks.searchMembers).toHaveBeenCalledTimes(2);
   });
 });
