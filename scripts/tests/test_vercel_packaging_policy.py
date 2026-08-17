@@ -82,29 +82,24 @@ def test_tracked_sensitive_paths_are_rejected(tmp_path: Path) -> None:
     ]
 
 
-def test_vercel_allowlist_must_start_by_ignoring_project_root(tmp_path: Path) -> None:
+def test_unreviewed_project_allowlist_is_rejected(tmp_path: Path) -> None:
     module = _load_module()
     _write_valid_policy(tmp_path)
     frontend_ignore = tmp_path / "frontend" / ".vercelignore"
-    frontend_ignore.write_text("!/src/\n/*\n", encoding="utf-8")
+    frontend_ignore.write_text("/*\n!src\n", encoding="utf-8")
 
     violations = module.validate_repository(tmp_path, tracked_files=[])
 
-    assert violations[0] == "frontend/.vercelignore must start with /*"
+    assert "frontend/.vercelignore has unreviewed pattern: /*" in violations
 
 
-def test_directory_allowlist_uses_vercel_documented_project_root_syntax() -> None:
+def test_project_policies_never_ignore_the_entire_traversal_root() -> None:
     module = _load_module()
 
-    assert "!public" in module.FRONTEND_VERCEL_PATTERNS
-    assert "!src" in module.FRONTEND_VERCEL_PATTERNS
-    assert "!api" in module.BACKEND_VERCEL_PATTERNS
-    assert "!coordination" in module.BACKEND_VERCEL_PATTERNS
-    assert all(
-        not pattern.startswith("!/") and not pattern.endswith("/")
-        for patterns in (
-            module.FRONTEND_VERCEL_PATTERNS,
-            module.BACKEND_VERCEL_PATTERNS,
-        )
-        for pattern in patterns[1:]
-    )
+    for patterns in (
+        module.FRONTEND_VERCEL_PATTERNS,
+        module.BACKEND_VERCEL_PATTERNS,
+    ):
+        assert "/*" not in patterns
+        assert not any(pattern.startswith("!") for pattern in patterns)
+        assert module.COMMON_PROJECT_VERCEL_PATTERNS.issubset(patterns)

@@ -45,6 +45,7 @@ ROOT_VERCEL_PATTERNS = (
     ".worktrees/",
     ".superpowers/",
     ".ruff_cache/",
+    ".github/",
     "docs/",
     "tools/",
     "scripts/",
@@ -60,35 +61,32 @@ ROOT_VERCEL_PATTERNS = (
     "**/*.tsbuildinfo",
 )
 
+COMMON_PROJECT_VERCEL_PATTERNS = frozenset(ROOT_VERCEL_PATTERNS)
+
 FRONTEND_VERCEL_PATTERNS = (
-    "/*",
-    "!public",
-    "!src",
-    "!eslint.config.mjs",
-    "!next.config.ts",
-    "!package-lock.json",
-    "!package.json",
-    "!postcss.config.mjs",
-    "!tsconfig.json",
+    *ROOT_VERCEL_PATTERNS,
+    "backend/",
+    "google_apps_script.js",
+    "requirements.txt",
+    "ruff.toml",
 )
 
 BACKEND_VERCEL_PATTERNS = (
-    "/*",
-    "!api",
-    "!coordination",
-    "!domain",
-    "!repositories",
-    "!.python-version",
-    "!__init__.py",
-    "!airtable_client.py",
-    "!ai_service.py",
-    "!auth.py",
-    "!config.py",
-    "!main.py",
-    "!requirements.txt",
-    "!upstash_url.py",
-    "!vercel.json",
-    "!write_gates.py",
+    *ROOT_VERCEL_PATTERNS,
+    "frontend/",
+    "backend/tests/",
+    "tests/",
+    "add_columns.py",
+    "create_ashar.py",
+    "debug_*.py",
+    "debug_output.txt",
+    "fix_abrar_duplicate.py",
+    "populate_family.py",
+    "requirements-dev.txt",
+    "seed_*.py",
+    "setup_*.py",
+    "test.py",
+    "test_flow.py",
 )
 
 _SENSITIVE_FILENAMES = frozenset(
@@ -120,17 +118,12 @@ def _validate_exact_policy(
     path: Path,
     expected: Sequence[str],
     display_path: str,
-    *,
-    require_allowlist: bool = False,
 ) -> list[str]:
     actual = _patterns(path)
     if not actual:
         return [f"missing deployment policy: {display_path}"]
 
     violations: list[str] = []
-    if require_allowlist and actual[0] != "/*":
-        violations.append(f"{display_path} must start with /*")
-
     missing = sorted(set(expected) - set(actual))
     unexpected = sorted(set(actual) - set(expected))
     violations.extend(f"{display_path} is missing required pattern: {item}" for item in missing)
@@ -188,7 +181,6 @@ def validate_repository(
             repo_root / "frontend" / ".vercelignore",
             FRONTEND_VERCEL_PATTERNS,
             "frontend/.vercelignore",
-            require_allowlist=True,
         )
     )
     violations.extend(
@@ -196,7 +188,6 @@ def validate_repository(
             repo_root / "backend" / ".vercelignore",
             BACKEND_VERCEL_PATTERNS,
             "backend/.vercelignore",
-            require_allowlist=True,
         )
     )
 

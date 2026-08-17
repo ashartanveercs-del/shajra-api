@@ -17,6 +17,7 @@ id_rsa*
 .worktrees/
 .superpowers/
 .ruff_cache/
+.github/
 docs/
 tools/
 scripts/
