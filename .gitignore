@@ -4,6 +4,22 @@
 *.age
 settings.json
 
+# Credentials and private keys
+.git-credentials
+.netrc
+.npmrc
+credentials.json
+id_ed25519*
+id_rsa*
+*.cer
+*.crt
+*.jks
+*.key
+*.keystore
+*.p12
+*.pem
+*.pfx
+
 # Python
 __pycache__/
 *.py[cod]

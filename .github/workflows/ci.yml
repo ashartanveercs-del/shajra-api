@@ -21,6 +21,8 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r backend/requirements-dev.txt
       - run: python -m pytest backend/tests -q
+      - run: python -m pytest scripts/tests -q
+      - run: python scripts/verify_vercel_packaging.py
       - run: ruff check backend
       - run: python -m compileall -q backend
       - run: pip-audit -r backend/requirements.txt
