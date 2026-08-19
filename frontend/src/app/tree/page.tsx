@@ -1,15 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { fetchTree, submitDirectForm, uploadImage, type Member } from "@/lib/api";
 import AsyncState from "@/components/feedback/AsyncState";
 import { asApiProblem, type Loadable } from "@/lib/loadable";
 import { User, Heart, Loader2, Plus, ZoomIn, ZoomOut, Maximize, Edit3, X, Save, Crown } from "lucide-react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
-import EmberParticles from "@/components/ui/EmberParticles";
 import TiltCard from "@/components/ui/TiltCard";
-import FamilyTree3D from "@/components/FamilyTree3D";
+
+const FamilyTree3D = lazy(() => import("@/components/FamilyTree3D"));
 
 type SuggestionForm = {
   fullName: string;
@@ -171,6 +171,7 @@ export default function TreePage() {
   const [suggestionProblem, setSuggestionProblem] = useState<string | null>(null);
   const [uploadProblem, setUploadProblem] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"3d" | "2d">("2d");
+  const [enhancementNotice, setEnhancementNotice] = useState<string | null>(null);
 
   const loadTree = useCallback(() => {
     const request = ++treeRequest.current;
@@ -326,6 +327,45 @@ export default function TreePage() {
     });
   };
 
+  const selectThreeDimensionalView = () => {
+    const reducedMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion) {
+      setViewMode("2d");
+      setEnhancementNotice(
+        "3D motion is disabled by your preferences. The 2D family tree remains available.",
+      );
+      return;
+    }
+
+    const webglAvailable =
+      typeof window.WebGLRenderingContext === "function" ||
+      typeof window.WebGL2RenderingContext === "function";
+    if (!webglAvailable) {
+      setViewMode("2d");
+      setEnhancementNotice(
+        "3D view is unavailable. The 2D family tree remains available.",
+      );
+      return;
+    }
+
+    setEnhancementNotice(null);
+    setViewMode("3d");
+  };
+
+  const selectTwoDimensionalView = () => {
+    setEnhancementNotice(null);
+    setViewMode("2d");
+  };
+
+  const handleThreeDimensionalUnavailable = useCallback(() => {
+    setViewMode("2d");
+    setEnhancementNotice(
+      "3D view is unavailable. The 2D family tree remains available.",
+    );
+  }, []);
+
   return (
     <div className="mx-auto max-w-7xl px-5 sm:px-8 py-12 sm:py-16 overflow-x-auto rendering-wrapper relative">
       <div className="mb-12 animate-fadeInUp flex items-end justify-between">
@@ -342,17 +382,23 @@ export default function TreePage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex items-center rounded-lg border border-border bg-bg-card p-1 shadow-sm">
+          <div
+            className="flex items-center rounded-lg border border-border bg-bg-card p-1 shadow-sm"
+            role="group"
+            aria-label="Tree view"
+          >
             <button
               type="button"
-              onClick={() => setViewMode("3d")}
+              aria-pressed={viewMode === "3d"}
+              onClick={selectThreeDimensionalView}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${viewMode === "3d" ? "bg-accent text-white" : "text-text-muted hover:text-text-primary"}`}
             >
               3D
             </button>
             <button
               type="button"
-              onClick={() => setViewMode("2d")}
+              aria-pressed={viewMode === "2d"}
+              onClick={selectTwoDimensionalView}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${viewMode === "2d" ? "bg-accent text-white" : "text-text-muted hover:text-text-primary"}`}
             >
               2D
@@ -366,6 +412,15 @@ export default function TreePage() {
           )}
         </div>
       </div>
+
+      {enhancementNotice && (
+        <p
+          role="status"
+          className="mb-4 rounded-lg border border-border bg-bg-secondary px-4 py-3 text-sm text-text-muted"
+        >
+          {enhancementNotice}
+        </p>
+      )}
 
       <style dangerouslySetInnerHTML={{
         __html: `
@@ -388,7 +443,6 @@ export default function TreePage() {
       <div
         className="relative h-[65vh] overflow-hidden rounded-lg border border-border bg-bg-secondary/30 animate-fadeInUp"
       >
-        {viewMode === "2d" && <EmberParticles density={90} className="z-0" />}
         {treeState.status === "loading" && (
           <AsyncState state="loading" title="Loading family tree" />
         )}
@@ -421,7 +475,12 @@ export default function TreePage() {
 
         {treeState.status === "ready" && viewMode === "3d" && (
           <div className="absolute inset-0 z-10">
-            <FamilyTree3D tree={tree} />
+            <Suspense fallback={<AsyncState state="loading" title="Loading 3D family tree" />}>
+              <FamilyTree3D
+                tree={tree}
+                onUnavailable={handleThreeDimensionalUnavailable}
+              />
+            </Suspense>
           </div>
         )}
 

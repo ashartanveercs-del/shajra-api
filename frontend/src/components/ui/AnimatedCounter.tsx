@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef } from "react";
 
 /**
  * Animated count-up number. Starts counting when it scrolls into view.
@@ -16,41 +16,43 @@ export default function AnimatedCounter({
   suffix?: string;
 }) {
   const ref = useRef<HTMLSpanElement | null>(null);
-  const [value, setValue] = useState(0);
-  const started = useRef(false);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    if (typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setValue(to);
+    const reducedMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion || typeof IntersectionObserver !== "function") {
       return;
     }
+
+    el.textContent = `0${suffix}`;
+    let raf = 0;
+    let started = false;
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting && !started.current) {
-          started.current = true;
+        if (entry.isIntersecting && !started) {
+          started = true;
           const start = performance.now();
           const tick = (now: number) => {
             const progress = Math.min((now - start) / duration, 1);
             const eased = 1 - Math.pow(1 - progress, 3); // easeOutCubic
-            setValue(Math.round(to * eased));
-            if (progress < 1) requestAnimationFrame(tick);
+            el.textContent = `${Math.round(to * eased)}${suffix}`;
+            if (progress < 1) raf = requestAnimationFrame(tick);
           };
-          requestAnimationFrame(tick);
+          raf = requestAnimationFrame(tick);
           observer.disconnect();
         }
       },
       { threshold: 0.5 },
     );
     observer.observe(el);
-    return () => observer.disconnect();
-  }, [to, duration]);
+    return () => {
+      cancelAnimationFrame(raf);
+      observer.disconnect();
+    };
+  }, [to, duration, suffix]);
 
-  return (
-    <span ref={ref}>
-      {value}
-      {suffix}
-    </span>
-  );
+  return <span ref={ref}>{`${to}${suffix}`}</span>;
 }

@@ -236,6 +236,9 @@ class RedisKeyBuilder:
     def rate_nonce_hmac(self, request_nonce: str) -> str:
         return self.hmac_hex("rate-nonce", request_nonce)
 
+    def history_nonce_hmac(self, request_nonce: str) -> str:
+        return self.hmac_hex("history-nonce", request_nonce)
+
     def _scope_tag(self, domain: Literal["graph", "generic"], scope: str) -> str:
         lease_domain: LeaseDomain = "GRAPH_COMMIT" if domain == "graph" else "GENERIC"
         return (
@@ -311,6 +314,40 @@ class RedisKeyBuilder:
 
     def rate_nonce(self, request_nonce: str) -> str:
         return f"{self._rate_tag()}:nonce:{self.rate_nonce_hmac(request_nonce)}"
+
+    def _history_tag(self) -> str:
+        return f"{{sj:v1:{self.deployment}:history}}"
+
+    def history_entries(self) -> str:
+        return f"{self._history_tag()}:entries"
+
+    def history_active(self) -> str:
+        return f"{self._history_tag()}:active"
+
+    def history_write_guard(self) -> str:
+        return f"{self._history_tag()}:write-guard"
+
+    def history_claim(self, request_nonce: str) -> str:
+        return (
+            f"{self._history_tag()}:claim:"
+            f"{self.history_nonce_hmac(request_nonce)}"
+        )
+
+    def history_result(self, request_nonce: str) -> str:
+        return (
+            f"{self._history_tag()}:result:"
+            f"{self.history_nonce_hmac(request_nonce)}"
+        )
+
+    def history_context(self, request_nonce: str) -> str:
+        return (
+            f"{self._history_tag()}:context:"
+            f"{self.history_nonce_hmac(request_nonce)}"
+        )
+
+    def history_pop_result(self, request_nonce: str) -> str:
+        """Backward-compatible name for the durable undo result key."""
+        return self.history_result(request_nonce)
 
 
 def lease_acquire_request(

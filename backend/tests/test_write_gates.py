@@ -9,6 +9,21 @@ from fastapi.testclient import TestClient
 client = TestClient(main.app)
 
 
+class NoopLeaseManager:
+    def __init__(self):
+        self.lease = object()
+
+    def acquire(self, scope, acquisition_id, ttl_ms=15_000):
+        return self.lease
+
+    def assert_owned(self, lease):
+        assert lease is self.lease
+
+    def release(self, lease, request_nonce):
+        assert lease is self.lease
+        return object()
+
+
 def test_public_submission_is_disabled_before_ai_or_database_work(monkeypatch):
     def downstream_operation(_raw_data):
         raise AssertionError("disabled submission reached downstream processing")
@@ -57,6 +72,42 @@ def test_authenticated_relationship_write_is_disabled_before_database_work(monke
     assert response.json()["detail"]["code"] == "RELATIONSHIP_WRITES_DISABLED"
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "payload", "database_method"),
+    [
+        (
+            "post",
+            "/api/admin/approved-emails",
+            {"Email": "family@example.com", "Name": "Family Member"},
+            "add_approved_email",
+        ),
+        (
+            "delete",
+            "/api/admin/approved-emails/email-record",
+            None,
+            "remove_approved_email",
+        ),
+        ("delete", "/api/admin/comments/comment-record", None, "delete_comment"),
+        ("delete", "/api/admin/stories/story-record", None, "delete_story"),
+    ],
+)
+def test_public_write_gate_blocks_all_admin_content_mutations(
+    monkeypatch, method, path, payload, database_method
+):
+    def downstream_operation(*_args, **_kwargs):
+        raise AssertionError("disabled public write reached the database")
+
+    main.app.dependency_overrides[main.get_current_admin] = lambda: {"sub": "admin"}
+    monkeypatch.setattr(main.db, database_method, downstream_operation)
+    try:
+        response = client.request(method, path, json=payload)
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "PUBLIC_WRITES_DISABLED"
+
+
 def test_graph_heal_is_permanently_gone_for_an_authenticated_admin(monkeypatch):
     def unexpected_fuzzy_operation(*_args, **_kwargs):
         raise AssertionError("removed heal endpoint reached graph traversal")
@@ -75,15 +126,20 @@ def test_graph_heal_is_permanently_gone_for_an_authenticated_admin(monkeypatch):
     }
 
 
-def test_member_create_does_not_run_fuzzy_relinking(monkeypatch):
-    def unexpected_fuzzy_operation(*_args, **_kwargs):
-        raise AssertionError("member creation ran fuzzy relinking or self-healing")
+def test_member_create_only_reads_members_for_commit_recovery(monkeypatch):
+    member_reads = 0
+
+    def current_members():
+        nonlocal member_reads
+        member_reads += 1
+        return []
 
     write_gates = importlib.import_module("write_gates")
     main.app.dependency_overrides[main.get_current_admin] = lambda: {"sub": "admin"}
     main.app.dependency_overrides[write_gates.require_relationship_writes] = lambda: None
+    main.app.dependency_overrides[main.get_relationship_lease_manager] = NoopLeaseManager
     monkeypatch.setattr(main.db, "create_member", lambda fields: {"id": "rec-new", **fields})
-    monkeypatch.setattr(main.db, "get_all_members", unexpected_fuzzy_operation)
+    monkeypatch.setattr(main.db, "get_all_members", current_members)
     try:
         response = client.post("/api/admin/members", json={"FullName": "Test Person"})
     finally:
@@ -92,14 +148,20 @@ def test_member_create_does_not_run_fuzzy_relinking(monkeypatch):
     assert response.status_code == 200
     assert response.json()["id"] == "rec-new"
     assert "_heal" not in response.json()
+    assert member_reads == 1
 
 
-def test_approval_does_not_run_fuzzy_relinking(monkeypatch):
-    def unexpected_fuzzy_operation(*_args, **_kwargs):
-        raise AssertionError("approval ran fuzzy relinking or self-healing")
+def test_approval_revalidates_current_members_without_fuzzy_relinking(monkeypatch):
+    member_reads = 0
+
+    def current_members():
+        nonlocal member_reads
+        member_reads += 1
+        return []
 
     pending = {
         "id": "pending-1",
+        "Status": "Pending",
         "CleanFullName": "Test Person",
         "CleanFatherName": "",
         "CleanMotherName": "",
@@ -117,14 +179,19 @@ def test_approval_does_not_run_fuzzy_relinking(monkeypatch):
         "AIMatchedMotherId": "",
         "AIMatchedSpouseId": "",
         "RawBiography": "",
+        "RawFatherName": "",
+        "RawMotherName": "",
+        "RawSpouseName": "",
+        "RawGender": "Other",
     }
     write_gates = importlib.import_module("write_gates")
     main.app.dependency_overrides[main.get_current_admin] = lambda: {"sub": "admin"}
     main.app.dependency_overrides[write_gates.require_relationship_writes] = lambda: None
+    main.app.dependency_overrides[main.get_relationship_lease_manager] = NoopLeaseManager
     monkeypatch.setattr(main.db, "get_all_pending", lambda: [pending])
     monkeypatch.setattr(main.db, "create_member", lambda fields: {"id": "rec-new", **fields})
     monkeypatch.setattr(main.db, "update_pending", lambda *_args: True)
-    monkeypatch.setattr(main.db, "get_all_members", unexpected_fuzzy_operation)
+    monkeypatch.setattr(main.db, "get_all_members", current_members)
     try:
         response = client.post("/api/admin/approve/pending-1")
     finally:
@@ -133,3 +200,4 @@ def test_approval_does_not_run_fuzzy_relinking(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "approved"
     assert "heal" not in response.json()
+    assert member_reads == 1

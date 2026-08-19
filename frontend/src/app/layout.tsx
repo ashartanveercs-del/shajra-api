@@ -33,8 +33,7 @@ export default function RootLayout({
         <Navbar />
         <main className="flex-1 shrink-0">{children}</main>
         <footer className="w-full py-8 mt-12 border-t border-border bg-bg-secondary/50 text-center text-sm text-text-muted tracking-wide animate-fadeIn">
-          Made and maintained by <span className="font-semibold text-accent">Ashar Tanveer</span><br/>
-          <span className="text-xs opacity-70 mt-1.5 inline-block">WhatsApp: 03369381947 &mdash; For queries, edits, or suggestions</span>
+          Made and maintained by <span className="font-semibold text-accent">Ashar Tanveer</span>
         </footer>
       </body>
     </html>

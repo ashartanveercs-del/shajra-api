@@ -21,6 +21,12 @@ export default function EmberParticles({
     const mount = mountRef.current;
     if (!mount) return;
     if (typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    if (
+      typeof window.WebGLRenderingContext !== "function" &&
+      typeof window.WebGL2RenderingContext !== "function"
+    ) {
+      return;
+    }
 
     const width = mount.clientWidth || 1;
     const height = mount.clientHeight || 1;
@@ -29,7 +35,17 @@ export default function EmberParticles({
     const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 120);
     camera.position.z = 32;
 
-    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    const canvas = document.createElement("canvas");
+    const context =
+      canvas.getContext("webgl2", { alpha: true, antialias: true }) ??
+      canvas.getContext("webgl", { alpha: true, antialias: true });
+    if (!context) return;
+    const renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      antialias: true,
+      canvas,
+      context,
+    });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(width, height);
     mount.appendChild(renderer.domElement);
@@ -59,17 +75,19 @@ export default function EmberParticles({
     scene.add(points);
 
     let raf = 0;
-    const clock = new THREE.Clock();
-    const animate = () => {
+    const timer = new THREE.Timer();
+    timer.connect(document);
+    const animate = (timestamp: number) => {
       raf = requestAnimationFrame(animate);
-      const t = clock.getElapsedTime();
+      timer.update(timestamp);
+      const t = timer.getElapsed();
       points.rotation.y = t * 0.04;
       points.rotation.x = Math.sin(t * 0.12) * 0.06;
       // Gentle vertical drift so the field feels alive
       points.position.y = Math.sin(t * 0.25) * 2;
       renderer.render(scene, camera);
     };
-    animate();
+    raf = requestAnimationFrame(animate);
 
     const onResize = () => {
       const w = mount.clientWidth || 1;
@@ -82,6 +100,7 @@ export default function EmberParticles({
 
     return () => {
       cancelAnimationFrame(raf);
+      timer.dispose();
       window.removeEventListener("resize", onResize);
       geometry.dispose();
       material.dispose();

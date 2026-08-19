@@ -1,6 +1,10 @@
 # Environment Variables
 .env
 .env.local
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 *.age
 settings.json
 

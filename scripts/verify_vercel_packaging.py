@@ -8,6 +8,10 @@ from pathlib import Path, PurePosixPath
 
 REQUIRED_GITIGNORE_PATTERNS = frozenset(
     {
+        ".env.*",
+        "!.env.example",
+        "!.env.sample",
+        "!.env.template",
         ".git-credentials",
         ".netrc",
         ".npmrc",
@@ -46,6 +50,7 @@ ROOT_VERCEL_PATTERNS = (
     ".superpowers/",
     ".ruff_cache/",
     ".github/",
+    ".gitleaks.toml",
     "docs/",
     "tools/",
     "scripts/",

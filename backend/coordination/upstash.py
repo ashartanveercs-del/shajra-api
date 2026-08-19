@@ -2993,7 +2993,7 @@ RATE_LIMIT_POLICIES = MappingProxyType(
     {
         RateLimitPolicyId.LOGIN: RateLimitPolicy(5, 900_000, "IP"),
         RateLimitPolicyId.SUBMIT: RateLimitPolicy(5, 3_600_000, "IP"),
-        RateLimitPolicyId.UPLOAD: RateLimitPolicy(10, 3_600_000, "IDENTITY"),
+        RateLimitPolicyId.UPLOAD: RateLimitPolicy(10, 3_600_000, "IP"),
         RateLimitPolicyId.COMMENT: RateLimitPolicy(20, 3_600_000, "IDENTITY"),
         RateLimitPolicyId.STORY: RateLimitPolicy(20, 3_600_000, "IDENTITY"),
         RateLimitPolicyId.SEARCH: RateLimitPolicy(60, 60_000, "IP"),

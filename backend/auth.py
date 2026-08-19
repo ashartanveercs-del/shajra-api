@@ -5,8 +5,13 @@ import hmac
 from datetime import datetime, timedelta, timezone
 
 import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError
 from config import JWT_ALGORITHM, JWT_EXPIRATION_MINUTES, get_settings
 from fastapi import HTTPException
+
+
+_password_hasher = PasswordHasher()
 
 
 def _get_jwt_secret() -> str:
@@ -31,9 +36,18 @@ def verify_admin(username: str, password: str) -> bool:
         or not configured_password.get_secret_value().strip()
     ):
         return False
-    return hmac.compare_digest(username, configured_username) and hmac.compare_digest(
-        password, configured_password.get_secret_value()
-    )
+    username_matches = hmac.compare_digest(username, configured_username)
+    password_matches: bool
+    try:
+        password_matches = bool(
+            _password_hasher.verify(
+                configured_password.get_secret_value(),
+                password,
+            )
+        )
+    except (InvalidHashError, VerificationError):
+        password_matches = False
+    return username_matches and password_matches
 
 
 def create_access_token(data: dict) -> str:

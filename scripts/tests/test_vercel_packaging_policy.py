@@ -61,6 +61,15 @@ def test_missing_rule_is_reported_without_reading_secret_contents(tmp_path: Path
     assert all("do-not-disclose" not in violation for violation in violations)
 
 
+def test_gitignore_policy_covers_environment_variants_and_keeps_templates() -> None:
+    module = _load_module()
+
+    assert ".env.*" in module.REQUIRED_GITIGNORE_PATTERNS
+    assert "!.env.example" in module.REQUIRED_GITIGNORE_PATTERNS
+    assert "!.env.sample" in module.REQUIRED_GITIGNORE_PATTERNS
+    assert "!.env.template" in module.REQUIRED_GITIGNORE_PATTERNS
+
+
 def test_tracked_sensitive_paths_are_rejected(tmp_path: Path) -> None:
     module = _load_module()
     _write_valid_policy(tmp_path)

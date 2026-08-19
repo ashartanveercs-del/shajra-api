@@ -76,6 +76,21 @@ describe("MemberProfilePage load states", () => {
     expect(screen.queryByText(/No photos added yet/i)).not.toBeInTheDocument();
   });
 
+  it("does not render a member's private contact fields or contact actions", async () => {
+    apiMocks.fetchMember.mockResolvedValue({
+      ...member,
+      Email: "private@example.com",
+      PhoneNumber: "+1 202 555 0114",
+    });
+    const { container } = render(<MemberProfilePage />);
+
+    expect(await screen.findByRole("heading", { name: "Ali Khan" })).toBeInTheDocument();
+    expect(screen.queryByText("private@example.com")).not.toBeInTheDocument();
+    expect(screen.queryByText("+1 202 555 0114")).not.toBeInTheDocument();
+    expect(container.querySelector('a[href^="mailto:"]')).not.toBeInTheDocument();
+    expect(container.querySelector('a[href*="wa.me"]')).not.toBeInTheDocument();
+  });
+
   it("does not let an older member request replace the current route", async () => {
     let resolveFirst: ((value: typeof member) => void) | undefined;
     apiMocks.fetchMember

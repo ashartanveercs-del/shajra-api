@@ -8,6 +8,7 @@ import os
 from typing import Any
 
 from pyairtable.formulas import BLANK, EQ, OR, Field
+from requests.exceptions import HTTPError
 
 from config import (
     AIRTABLE_BASE_ID,
@@ -15,6 +16,7 @@ from config import (
     APPROVED_EMAILS_TABLE,
     APPROVED_MEMBERS_TABLE,
     PENDING_SUBMISSIONS_TABLE,
+    get_settings,
 )
 from repositories.airtable.client import AirtableClient
 from repositories.airtable.formulas import (
@@ -50,9 +52,43 @@ albums_table = _LazyTable("PhotoAlbums")
 approved_emails_table = _LazyTable(APPROVED_EMAILS_TABLE)
 api = _LazyApi()
 
+APPROVED_MEMBER_WRITABLE_FIELDS = frozenset(
+    {
+        "Autobiography",
+        "Biography",
+        "Branch",
+        "BurialLatitude",
+        "BurialLocation",
+        "BurialLongitude",
+        "CurrentCity",
+        "CurrentCountry",
+        "DateOfBirth",
+        "DateOfDeath",
+        "Email",
+        "FatherName",
+        "FatherRecordId",
+        "FullName",
+        "Gender",
+        "Generation",
+        "HeritageStory",
+        "IsAlive",
+        "Latitude",
+        "Longitude",
+        "MotherName",
+        "MotherRecordId",
+        "PhoneNumber",
+        "Photos",
+        "ProfileImageUrl",
+        "ProfilePhoto",
+        "SpouseName",
+        "SpouseRecordId",
+    }
+)
+
 
 def _flatten(record: dict[str, object]) -> dict[str, object]:
-    fields = dict(record.get("fields", {}))
+    raw_fields = record.get("fields")
+    fields: dict[str, object] = dict(raw_fields) if isinstance(raw_fields, dict) else {}
     for field in ("FatherRecordId", "MotherRecordId", "SpouseRecordId"):
         value = fields.get(field)
         if isinstance(value, list):
@@ -69,17 +105,25 @@ def _read_all(table: _LazyTable, formula: str | None = None) -> list[dict[str, o
     return [_flatten(record) for record in records]
 
 
-def _legacy_mutations_enabled() -> bool:
-    return os.getenv("SHAJRA_LEGACY_MUTATIONS_ENABLED", "true").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+def _legacy_mutations_enabled(settings=None) -> bool:
+    settings = settings or get_settings()
+    advertised_enabled = bool(
+        settings.public_writes_enabled or settings.relationship_writes_enabled
+    )
+    explicit = os.getenv("SHAJRA_LEGACY_MUTATIONS_ENABLED")
+    if explicit is None:
+        return advertised_enabled
+    return advertised_enabled and explicit.strip().lower() in {"1", "true", "yes"}
 
 
 def _require_legacy_mutations_enabled() -> None:
     if not _legacy_mutations_enabled():
         raise RuntimeError("Legacy Airtable mutations are disabled")
+
+
+def legacy_mutations_enabled(settings=None) -> bool:
+    """Expose the effective low-level write gate for health/admin status."""
+    return _legacy_mutations_enabled(settings)
 
 
 def _create_legacy(table: _LazyTable, fields: dict[str, object]) -> dict[str, object]:
@@ -108,23 +152,46 @@ def get_all_members() -> list[dict[str, object]]:
 def get_member_by_id(record_id: str) -> dict[str, object] | None:
     try:
         return _flatten(members_table.get(record_id))
-    except Exception:
-        return None
+    except HTTPError as error:
+        if error.response is not None and error.response.status_code == 404:
+            return None
+        raise
 
 
 def create_member(fields: dict[str, object]) -> dict[str, object]:
     """Legacy, feature-gated mutation export for existing v1 routes."""
-    # Airtable rejects unknown field names; the Pydantic schemas carry extra
-    # optional fields (CardStyle, DateOfDeath, Branch, ...) that don't exist in
-    # the Airtable Members table. Drop empty/None values so only real, known
-    # fields are written. (create only — update keeps empties to allow clearing.)
-    fields = {k: v for k, v in fields.items() if v is not None and v != ""}
-    return _create_legacy(members_table, fields)
+    return _create_legacy(members_table, prepare_member_create_fields(fields))
+
+
+def prepare_member_create_fields(
+    fields: dict[str, object],
+) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in fields.items()
+        if key in APPROVED_MEMBER_WRITABLE_FIELDS
+        and value is not None
+        and value != ""
+    }
 
 
 def update_member(record_id: str, fields: dict[str, object]) -> dict[str, object]:
     """Legacy, feature-gated mutation export for existing v1 routes."""
-    return _update_legacy(members_table, record_id, fields)
+    return _update_legacy(
+        members_table,
+        record_id,
+        prepare_member_update_fields(fields),
+    )
+
+
+def prepare_member_update_fields(
+    fields: dict[str, object],
+) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in fields.items()
+        if key in APPROVED_MEMBER_WRITABLE_FIELDS and value is not None
+    }
 
 
 def delete_member(record_id: str) -> bool:

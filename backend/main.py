@@ -2,31 +2,50 @@
 Shajra System — Main FastAPI Application v2
 """
 import os
-import re
-import unicodedata
 from datetime import datetime, timezone
-from typing import Optional
+from io import BytesIO
+from ipaddress import ip_address
+from math import ceil
+from typing import Literal, NoReturn, Optional
+import warnings
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 # Load .env only if it exists (local dev). On Vercel, env vars come from dashboard.
 _env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 if os.path.exists(_env_path):
     load_dotenv(_env_path)
 
-import cloudinary
-import cloudinary.uploader
+import cloudinary  # type: ignore[import-untyped]
+import cloudinary.uploader  # type: ignore[import-untyped]
 from requests.exceptions import HTTPError
 
 cloudinary.config(secure=True)
 
 import ai_service
 import airtable_client as db
+import relationship_writes
+import runtime_coordination
 from auth import create_access_token, decode_access_token, verify_admin
+from change_history import ChangeHistoryStore, InMemoryChangeHistoryStore
 from config import get_settings
+from coordination import (
+    CoordinationError,
+    IpRateLimitSubject,
+    LeaseManager,
+    RateLimiter,
+    RateLimitPolicyId,
+    new_acquisition_id,
+)
+from public_data import normalize_name as normalize_person_name
+from public_data import redact_public
+from public_data import unique_member_by_name
 from write_gates import require_public_writes, require_relationship_writes
 
 app = FastAPI(
@@ -35,7 +54,93 @@ app = FastAPI(
     version="2.0.0",
 )
 
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_REQUEST_BYTES = MAX_IMAGE_UPLOAD_BYTES + 64 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_FRAMES = 200
+MAX_IMAGE_TOTAL_PIXELS = 40_000_000
+ALLOWED_IMAGE_CONTENT_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/webp", "image/gif"}
+)
+IMAGE_FORMATS_BY_CONTENT_TYPE = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+    "image/gif": "GIF",
+}
+
+
+class _UploadRequestTooLarge(Exception):
+    pass
+
+
+class UploadRequestSizeLimitMiddleware:
+    def __init__(self, app: ASGIApp, maximum_bytes: int) -> None:
+        self.app = app
+        self.maximum_bytes = maximum_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http" or scope.get("path") != "/api/upload-image":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        raw_content_length = headers.get(b"content-length", b"")
+        try:
+            content_length = int(raw_content_length) if raw_content_length else None
+        except ValueError:
+            content_length = None
+        if content_length is not None and content_length > self.maximum_bytes:
+            await self._reject(scope, receive, send)
+            return
+
+        received_bytes = 0
+        pending_messages: list[Message] = []
+
+        async def limited_receive() -> Message:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.maximum_bytes:
+                    raise _UploadRequestTooLarge
+            return message
+
+        async def buffered_send(message: Message) -> None:
+            pending_messages.append(message)
+
+        try:
+            await self.app(scope, limited_receive, buffered_send)
+        except _UploadRequestTooLarge:
+            pass
+        if received_bytes > self.maximum_bytes:
+            await self._reject(scope, receive, send)
+            return
+        for message in pending_messages:
+            await send(message)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": "Image exceeds the 10 MB upload limit."},
+        )
+        await response(scope, receive, send)
+
+_change_history: list[dict[str, object]] = []
+_memory_change_history_store = InMemoryChangeHistoryStore(_change_history)
+_HISTORY_RECONCILIATION_CONFIRMATION = "I_HAVE_VERIFIED_THE_DATASTORE"
+
 # CORS — allow frontend to call backend
+app.add_middleware(
+    UploadRequestSizeLimitMiddleware,
+    maximum_bytes=MAX_IMAGE_REQUEST_BYTES,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().allowed_origins,
@@ -58,11 +163,177 @@ def get_current_admin(authorization: str = Header(None)):
     return payload
 
 
+_COORDINATION_ERROR_MESSAGES = {
+    "COORDINATION_UNINITIALIZED": "Relationship coordination is not initialized.",
+    "COORDINATION_UNAVAILABLE": "Relationship coordination is temporarily unavailable.",
+    "LOCK_UNAVAILABLE": "Another relationship update is in progress.",
+    "LEASE_LOST": "Relationship coordination was lost. Please retry.",
+    "COORDINATION_STATE_CORRUPT": "Relationship coordination is temporarily unavailable.",
+    "UNDO_HISTORY_RESTORE_FAILED": "Undo failed and its history could not be restored.",
+    "UNDO_IN_PROGRESS": "An undo is awaiting recovery before more changes can be saved.",
+    "UNDO_HISTORY_GAP": "Undo and relationship edits are paused until change history is recovered.",
+}
+
+
+def _raise_coordination_error(error: CoordinationError) -> NoReturn:
+    code = (
+        error.code
+        if error.code in _COORDINATION_ERROR_MESSAGES
+        else "COORDINATION_UNAVAILABLE"
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={"code": code, "message": _COORDINATION_ERROR_MESSAGES[code]},
+    ) from error
+
+
+def get_relationship_lease_manager() -> LeaseManager:
+    try:
+        return runtime_coordination.build_lease_manager(get_settings())
+    except CoordinationError as error:
+        _raise_coordination_error(error)
+
+
+def get_change_history_store() -> ChangeHistoryStore:
+    settings = get_settings()
+    if settings.app_env in {"development", "test"}:
+        return _memory_change_history_store
+    try:
+        return runtime_coordination.build_change_history_store(settings)
+    except CoordinationError as error:
+        _raise_coordination_error(error)
+
+
+def get_upload_rate_limiter() -> RateLimiter:
+    try:
+        return runtime_coordination.build_rate_limiter(get_settings())
+    except CoordinationError as error:
+        _raise_upload_protection_error(error)
+
+
+def get_login_rate_limiter() -> RateLimiter:
+    try:
+        return runtime_coordination.build_rate_limiter(get_settings())
+    except CoordinationError as error:
+        _raise_login_protection_error(error)
+
+
+def _raise_upload_protection_error(error: CoordinationError) -> NoReturn:
+    code = (
+        error.code
+        if error.code in _COORDINATION_ERROR_MESSAGES
+        else "COORDINATION_UNAVAILABLE"
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": code,
+            "message": "Upload protection is temporarily unavailable.",
+        },
+    ) from error
+
+
+def _raise_login_protection_error(error: CoordinationError) -> NoReturn:
+    code = (
+        error.code
+        if error.code in _COORDINATION_ERROR_MESSAGES
+        else "COORDINATION_UNAVAILABLE"
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": code,
+            "message": "Login protection is temporarily unavailable.",
+        },
+    ) from error
+
+
+def _request_ip(request: Request) -> str:
+    forwarded = ""
+    if os.getenv("VERCEL") == "1":
+        forwarded = (
+            request.headers.get("x-forwarded-for", "")
+            .split(",", 1)[0]
+            .strip()
+        )
+    candidate = forwarded or (request.client.host if request.client else "")
+    try:
+        return str(ip_address(candidate))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_CLIENT_IP", "message": "Client address is invalid."},
+        ) from None
+
+
+def require_upload_rate_limit(
+    request: Request,
+    limiter: RateLimiter = Depends(get_upload_rate_limiter),
+) -> None:
+    try:
+        result = limiter.consume(
+            RateLimitPolicyId.UPLOAD,
+            IpRateLimitSubject("IP", _request_ip(request)),
+            new_acquisition_id(),
+        )
+    except CoordinationError as error:
+        _raise_upload_protection_error(error)
+    if not result.allowed:
+        retry_after = max(1, ceil(result.retry_after_ms / 1000))
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "RATE_LIMITED",
+                "message": "Too many image uploads. Please try again later.",
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def require_login_rate_limit(
+    request: Request,
+    limiter: RateLimiter = Depends(get_login_rate_limiter),
+) -> None:
+    try:
+        result = limiter.consume(
+            RateLimitPolicyId.LOGIN,
+            IpRateLimitSubject("IP", _request_ip(request)),
+            new_acquisition_id(),
+        )
+    except CoordinationError as error:
+        _raise_login_protection_error(error)
+    if not result.allowed:
+        retry_after = max(1, ceil(result.retry_after_ms / 1000))
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "RATE_LIMITED",
+                "message": "Too many login attempts. Please try again later.",
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
 # ── Pydantic Models ─────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class HistoryEntryPayload(BaseModel):
+    timestamp: str
+    action: Literal["approve", "create", "delete", "update"]
+    record_id: str
+    before: dict[str, object] | None = None
+    after: dict[str, object] | None = None
+
+
+class HistoryReconcileRequest(BaseModel):
+    idempotencyKey: str
+    resolution: Literal["abort", "commit"]
+    confirmation: str
+    entry: HistoryEntryPayload | None = None
 
 class MemberCreate(BaseModel):
     FullName: str
@@ -206,10 +477,12 @@ def health_ready():
             "airtable": bool(settings.airtable_pat and settings.airtable_base_id),
             "groq": bool(settings.groq_api_key),
             "cloudinary": bool(settings.cloudinary_url),
+            "coordination": runtime_coordination.coordination_configured(settings),
         },
         "writes": {
             "public": settings.public_writes_enabled,
             "relationships": settings.relationship_writes_enabled,
+            "datastore": db.legacy_mutations_enabled(settings),
         },
         "normalizedReads": settings.normalized_reads_enabled,
     }
@@ -218,7 +491,7 @@ def health_ready():
 @app.get("/api/members")
 def list_members():
     """Get all approved family members (for tree & map)."""
-    return db.get_all_members()
+    return redact_public(db.get_all_members())
 
 
 @app.get("/api/members/{record_id}")
@@ -227,7 +500,7 @@ def get_member(record_id: str):
     member = db.get_member_by_id(record_id)
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
-    return member
+    return redact_public(member)
 
 
 @app.get("/api/search")
@@ -242,6 +515,9 @@ def search_members(q: str = "", city: str = "", branch: str = "", generation: st
     branch = (branch or "").strip()
     generation = (generation or "").strip()
 
+    has_filters = any((city, branch, generation))
+    if len(q) < 2 and not has_filters:
+        return []
     if len(q) >= 2:
         members = db.search_members(q)
     else:
@@ -249,27 +525,33 @@ def search_members(q: str = "", city: str = "", branch: str = "", generation: st
 
     results = []
     for m in members:
-        if city and (m.get("CurrentCity") or "").strip() != city:
+        if city and str(m.get("CurrentCity") or "").strip() != city:
             continue
-        if branch and (m.get("Branch") or "").strip() != branch:
+        if branch and str(m.get("Branch") or "").strip() != branch:
             continue
         if generation and str(m.get("Generation") or "") != generation:
             continue
         results.append(m)
 
-    return results
+    return redact_public(results)
 
 
 @app.get("/api/tree")
 def get_tree():
     """Build hierarchical tree data with Marital Grouping (no duplicates).
 
-    v4: Normalized name matching (casefold + diacritics + trailing-word strip,
-        never first-name-only), spouse nodes created from name text with their
-        exact name (no '(Unknown)' phantom placeholders), and always-reciprocal
-        spouse links.
+    v4: Exact normalized name matching (Unicode, case, and whitespace), spouse
+        nodes created from name text with their exact name (no '(Unknown)'
+        phantom placeholders), and always-reciprocal spouse links.
     """
-    members = db.get_all_members()
+    members = sorted(
+        (dict(member) for member in db.get_all_members()),
+        key=lambda member: (
+            str(member.get("id", "")),
+            normalize_person_name(member.get("FullName")),
+        ),
+    )
+    indexed_members = list(members)
     lookup = {m["id"]: m for m in members}
 
     # Helper: create a spouse snapshot that carries all useful fields
@@ -304,68 +586,42 @@ def get_tree():
     # ── Name normalization ────────────────────────────────────────────
     def normalize_name(name) -> str:
         """Casefold, strip diacritics, collapse whitespace."""
-        if not name:
-            return ""
-        s = unicodedata.normalize("NFKD", str(name))
-        s = "".join(c for c in s if not unicodedata.combining(c))
-        return re.sub(r"\s+", " ", s.casefold().strip())
+        return normalize_person_name(name)
 
     def name_keys(name) -> list:
         """Matching keys from most-specific to least-specific.
 
-        Progressively strips trailing words but never drops below two words,
-        so a bare first name can never match (avoids false positives).
-        Single-word names only ever match on the full name.
+        Matching is exact after Unicode, case, and whitespace normalization.
         """
         n = normalize_name(name)
         if not n:
             return []
-        words = n.split()
-        if len(words) <= 2:
-            return [n]
-        keys = []
-        while len(words) >= 2:
-            keys.append(" ".join(words))
-            words = words[:-1]
-        return keys
-
-    # Build a normalized name -> member index for smart matching
-    name_index: dict[str, list] = {}
-    for m in members:
-        for key in name_keys(m.get("FullName")):
-            name_index.setdefault(key, []).append(m)
+        return [n]
 
     # Registry of name-derived nodes (created from name text), keyed by
     # normalized name so the same person referenced from multiple places
     # resolves to a single node.
-    name_nodes: dict[str, dict] = {}
+    name_nodes: dict[tuple[str, str, str, str], dict] = {}
 
     def find_member_by_name(name, exclude_id=None, gender=None):
-        # Iterate most-specific → least-specific keys. Only link when a key
-        # matches EXACTLY ONE candidate; multiple candidates is ambiguous and
-        # must never be guessed (avoids attaching the wrong same-name relative).
-        for key in name_keys(name):
-            candidates = [
-                c for c in name_index.get(key, [])
-                if not (exclude_id and c["id"] == exclude_id)
-                and not (gender and c.get("Gender") and c.get("Gender") != gender)
-            ]
-            if len(candidates) == 1:
-                return candidates[0]
-            if len(candidates) > 1:
-                return None
-        return None
+        return unique_member_by_name(
+            name,
+            indexed_members,
+            exclude_id=exclude_id,
+            gender=gender,
+        )
 
-    def make_name_node(name, gender) -> dict:
+    def make_name_node(name, gender, owner_id, relationship) -> dict:
         """Create (or reuse) a node for a person known only by name text.
 
         The node carries the exact name — never an '(Unknown)' suffix — so a
         spouse/parent referenced by name renders with their real name.
         """
         n_key = normalize_name(name)
-        if n_key in name_nodes:
-            return name_nodes[n_key]
-        fake_id = f"__name__{n_key.replace(' ', '_')}"
+        node_key = (n_key, str(gender), str(owner_id), str(relationship))
+        if node_key in name_nodes:
+            return name_nodes[node_key]
+        fake_id = f"__name__{owner_id}__{relationship}"
         node = {
             "id": fake_id, "FullName": name.strip(), "Gender": gender,
             "IsAlive": False, "ProfileImageUrl": "", "DateOfBirth": "",
@@ -375,17 +631,17 @@ def get_tree():
             "CurrentCity": "", "CurrentCountry": "", "Biography": "",
             "children": [], "Spouse": None, "IsPlaceholder": True,
         }
-        name_nodes[n_key] = node
+        name_nodes[node_key] = node
         lookup[fake_id] = node
         return node
 
-    def resolve_by_name(name, gender, exclude_id=None):
+    def resolve_by_name(name, gender, exclude_id=None, relationship="unknown"):
         if not name or not name.strip():
             return None
         m = find_member_by_name(name, exclude_id=exclude_id, gender=gender)
         if m:
             return m
-        return make_name_node(name, gender)
+        return make_name_node(name, gender, exclude_id or "unknown", relationship)
 
     def opposite_gender(gender):
         if gender == "Male":
@@ -396,10 +652,24 @@ def get_tree():
 
     def link_spouses(a, b):
         """Reciprocally link two people as spouses (never one-sided)."""
-        if not a.get("Spouse"):
-            a["Spouse"] = spouse_snapshot(b)
-        if not b.get("Spouse"):
-            b["Spouse"] = spouse_snapshot(a)
+        a_id = get_sid(a.get("id"))
+        b_id = get_sid(b.get("id"))
+        if not a_id or not b_id or a_id == b_id:
+            return False
+        a_declared = get_sid(a.get("SpouseRecordId"))
+        b_declared = get_sid(b.get("SpouseRecordId"))
+        a_linked = get_sid((a.get("Spouse") or {}).get("id"))
+        b_linked = get_sid((b.get("Spouse") or {}).get("id"))
+        if (
+            (a_declared and a_declared != b_id)
+            or (b_declared and b_declared != a_id)
+            or (a_linked and a_linked != b_id)
+            or (b_linked and b_linked != a_id)
+        ):
+            return False
+        a["Spouse"] = spouse_snapshot(b)
+        b["Spouse"] = spouse_snapshot(a)
+        return True
 
     # ── Phase 0: Spouse linking (record id, then name text) ───────────
     # Resolved first so parent resolution can cross-reference spouses.
@@ -414,7 +684,10 @@ def get_tree():
         if not spouse_name:
             continue
         spouse_node = resolve_by_name(
-            spouse_name, opposite_gender(m.get("Gender", "")), exclude_id=m["id"]
+            spouse_name,
+            opposite_gender(m.get("Gender", "")),
+            exclude_id=m["id"],
+            relationship="spouse",
         )
         if spouse_node:
             link_spouses(m, spouse_node)
@@ -441,7 +714,12 @@ def get_tree():
                     set(name_keys(name)) & set(name_keys(osname))
                 ):
                     return osid
-        node = resolve_by_name(name, gender, exclude_id=m["id"])
+        node = resolve_by_name(
+            name,
+            gender,
+            exclude_id=m["id"],
+            relationship=id_field.casefold(),
+        )
         if node:
             return node["id"]
         return rec_id or ""
@@ -458,43 +736,40 @@ def get_tree():
         if node["id"] not in existing_ids:
             members.append(node)
 
-    # ── Phase 2: Infer spousal links from shared children ─────────────
+    # ── Phase 2: Deterministically project ancestry to a DAG ──────────
+    # Process stable parent edges and discard only the edge that closes a cycle.
+    # A valid second parent survives, unlike the previous all-or-nothing repair.
+    ancestry_children: dict[str, set[str]] = {}
+
+    def closes_cycle(parent_id: str, child_id: str) -> bool:
+        stack = [child_id]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current == parent_id:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(sorted(ancestry_children.get(current, ()), reverse=True))
+        return False
+
+    for m in sorted(members, key=lambda member: str(member["id"])):
+        for field in ("FatherRecordId", "MotherRecordId"):
+            parent_id = get_sid(m.get(field))
+            if not parent_id or parent_id not in lookup:
+                continue
+            if parent_id == m["id"] or closes_cycle(parent_id, m["id"]):
+                m[field] = ""
+                continue
+            ancestry_children.setdefault(parent_id, set()).add(m["id"])
+
+    # ── Phase 2.5: Infer spouses only from repaired parent pairs ──────
     for m in members:
         father_id = get_sid(m.get("FatherRecordId"))
         mother_id = get_sid(m.get("MotherRecordId"))
         if father_id and mother_id and father_id in lookup and mother_id in lookup:
             link_spouses(lookup[father_id], lookup[mother_id])
-
-    # ── Phase 2.5: Break parent-link cycles ─────────────────────────────
-    # A parent-link cycle (e.g. A.FatherRecordId=B and B.FatherRecordId=A) would
-    # otherwise make every member in the cycle "dependent", so phase 5 silently
-    # drops them all. Break the back-edge so no member ever vanishes: the
-    # cycle-member becomes a root (or stays under a real ancestor) instead.
-    def _parent_record_ids(m):
-        pids = []
-        for pid in (get_sid(m.get("FatherRecordId")), get_sid(m.get("MotherRecordId"))):
-            if pid and pid in lookup:
-                pids.append(pid)
-        return pids
-
-    def _in_parent_cycle(mid):
-        # Is `mid` reachable from itself by walking up parent record links?
-        seen = set()
-        stack = [p for p in _parent_record_ids(lookup.get(mid) or {})]
-        while stack:
-            cur = stack.pop()
-            if cur == mid:
-                return True
-            if cur in seen:
-                continue
-            seen.add(cur)
-            stack.extend(_parent_record_ids(lookup.get(cur) or {}))
-        return False
-
-    for m in members:
-        if _in_parent_cycle(m["id"]):
-            m["FatherRecordId"] = ""
-            m["MotherRecordId"] = ""
 
     # ── Phase 3: Build parent-child hierarchy ─────────────────────────
     for m in members:
@@ -506,6 +781,26 @@ def get_tree():
             lookup[mother_id]["children"].append(m)
 
     # ── Phase 4: Merge spouse children into primary member ────────────
+    def child_reaches(candidate, target_id):
+        stack = [candidate]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            current_id = current["id"]
+            if current_id == target_id:
+                return True
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            stack.extend(
+                sorted(
+                    current.get("children", []),
+                    key=lambda child: str(child["id"]),
+                    reverse=True,
+                )
+            )
+        return False
+
     def merge_spouse_children(node, visited=None):
         if visited is None:
             visited = set()
@@ -519,8 +814,13 @@ def get_tree():
                 spouse_full = lookup[spouse_id]
                 existing = {c["id"] for c in node["children"]}
                 for child in spouse_full.get("children", []):
-                    if child["id"] not in existing:
+                    if (
+                        child["id"] not in existing
+                        and child["id"] != node["id"]
+                        and not child_reaches(child, node["id"])
+                    ):
                         node["children"].append(child)
+                        existing.add(child["id"])
         for child in node["children"]:
             merge_spouse_children(child, visited)
 
@@ -528,41 +828,77 @@ def get_tree():
     final_roots = []
     processed_root_ids = set()
 
-    # Pre-mark all spouses of dependent members so they never become roots prematurely
-    for m in members:
-        father_id = get_sid(m.get("FatherRecordId"))
-        mother_id = get_sid(m.get("MotherRecordId"))
-        if (father_id and father_id in lookup) or (mother_id and mother_id in lookup):
-            if m.get("Spouse"):
-                processed_root_ids.add(m["Spouse"]["id"])
-
     def sort_key(m):
         gen_val = m.get("Generation")
         gen = gen_val if isinstance(gen_val, (int, float)) else 99
-        has_parents = 0 if (m.get("FatherRecordId") or m.get("MotherRecordId")) else 1
-        return (gen, has_parents)
+        has_parents = 1 if (m.get("FatherRecordId") or m.get("MotherRecordId")) else 0
+        return (gen, has_parents, normalize_name(m.get("FullName")), str(m["id"]))
 
-    for m in sorted(members, key=sort_key):
-        if m["id"] in processed_root_ids:
-            continue
+    independent_members = []
+    independent_ids = set()
+    for m in members:
         father_id = get_sid(m.get("FatherRecordId"))
         mother_id = get_sid(m.get("MotherRecordId"))
-        is_independent = (not father_id or father_id not in lookup) and \
-                         (not mother_id or mother_id not in lookup)
-        if is_independent:
-            final_roots.append(m)
-            processed_root_ids.add(m["id"])
-            if m.get("Spouse"):
-                processed_root_ids.add(m["Spouse"]["id"])
-        else:
-            if m.get("Spouse"):
-                processed_root_ids.add(m["Spouse"]["id"])
+        if (not father_id or father_id not in lookup) and (
+            not mother_id or mother_id not in lookup
+        ):
+            independent_members.append(m)
+            independent_ids.add(m["id"])
+
+    # A dependent member's independent spouse is represented on that member's
+    # card, unless the supposed spouse is also an actual ancestor. Malformed
+    # data must never suppress the only ancestry root for a component.
+    suppressed_spouse_roots = set()
+    for m in members:
+        father_id = get_sid(m.get("FatherRecordId"))
+        mother_id = get_sid(m.get("MotherRecordId"))
+        has_parent = (father_id and father_id in lookup) or (
+            mother_id and mother_id in lookup
+        )
+        spouse_id = m.get("Spouse", {}).get("id") if m.get("Spouse") else ""
+        if (
+            has_parent
+            and spouse_id in independent_ids
+            and not child_reaches(lookup[spouse_id], m["id"])
+        ):
+            suppressed_spouse_roots.add(spouse_id)
+
+    root_candidates = [
+        member
+        for member in independent_members
+        if member["id"] not in suppressed_spouse_roots
+    ]
+    if not root_candidates:
+        root_candidates = independent_members
+
+    for m in sorted(root_candidates, key=sort_key):
+        if m["id"] in processed_root_ids:
+            continue
+        final_roots.append(m)
+        processed_root_ids.add(m["id"])
+        spouse_id = m.get("Spouse", {}).get("id") if m.get("Spouse") else ""
+        if spouse_id in independent_ids:
+            processed_root_ids.add(spouse_id)
 
     # Merge spouse children for all nodes in the final tree
     for root in final_roots:
         merge_spouse_children(root)
 
-    return final_roots
+    def sort_descendants(node, visited=None):
+        if visited is None:
+            visited = set()
+        if node["id"] in visited:
+            return
+        visited.add(node["id"])
+        node["children"].sort(key=sort_key)
+        for child in node["children"]:
+            sort_descendants(child, visited)
+
+    final_roots.sort(key=sort_key)
+    for root in final_roots:
+        sort_descendants(root)
+
+    return redact_public(final_roots)
 
 
 CITY_GEODATA = {
@@ -597,11 +933,7 @@ def get_map_markers():
 
     def normalize_name(name) -> str:
         """Casefold, strip diacritics, collapse whitespace for name matching."""
-        if not name:
-            return ""
-        s = unicodedata.normalize("NFKD", str(name))
-        s = "".join(c for c in s if not unicodedata.combining(c))
-        return re.sub(r"\s+", " ", s.casefold().strip())
+        return normalize_person_name(name)
 
     def normalize_city(value) -> str:
         """Strip everything after the first comma, e.g. 'Karachi, Pakistan' -> 'Karachi'."""
@@ -611,13 +943,6 @@ def get_map_markers():
 
     member_lookup = {m["id"]: m for m in members}
 
-    # Name -> member index used to resolve parents by name when record IDs are missing.
-    name_index = {}
-    for m in members:
-        key = normalize_name(m.get("FullName"))
-        if key:
-            name_index.setdefault(key, []).append(m)
-
     def city_coords(city_value):
         city = normalize_city(city_value)
         if city in CITY_GEODATA:
@@ -625,6 +950,8 @@ def get_map_markers():
         return None
 
     def get_burial_coords(member):
+        if member.get("IsAlive", True):
+            return None, None
         if member.get("BurialLatitude") and member.get("BurialLongitude"):
             return float(member["BurialLatitude"]), float(member["BurialLongitude"])
         return city_coords(member.get("BurialLocation")) or (None, None)
@@ -638,29 +965,19 @@ def get_map_markers():
         if coords:
             return coords
         # 3. Burial coordinates fallback (deceased member's resting place)
-        if member.get("BurialLatitude") and member.get("BurialLongitude"):
-            return float(member["BurialLatitude"]), float(member["BurialLongitude"])
-        return city_coords(member.get("BurialLocation")) or (None, None)
+        return get_burial_coords(member)
 
     def resolve_parent(m, name_field, id_field, gender):
         """Resolve a parent by record ID, falling back to a name match against FullName."""
         pid = get_sid(m.get(id_field))
         if pid and pid in member_lookup:
             return member_lookup[pid]
-        name = normalize_name(m.get(name_field))
-        if not name:
-            return None
-        # Exact normalized name match
-        for cand in name_index.get(name, []):
-            if cand["id"] != m["id"] and (not gender or cand.get("Gender", "") == gender):
-                return cand
-        # Partial / contained match (e.g. missing middle name)
-        for key, cands in name_index.items():
-            if name in key or key in name:
-                for cand in cands:
-                    if cand["id"] != m["id"] and (not gender or cand.get("Gender", "") == gender):
-                        return cand
-        return None
+        return unique_member_by_name(
+            m.get(name_field),
+            members,
+            exclude_id=str(m["id"]),
+            gender=gender,
+        )
 
     for m in members:
         mid = m["id"]
@@ -751,7 +1068,7 @@ def verify_email(email: str = ""):
 @app.get("/api/comments/{member_record_id}")
 def get_comments(member_record_id: str):
     """Get all comments for a member."""
-    return db.get_comments_for_member(member_record_id)
+    return redact_public(db.get_comments_for_member(member_record_id))
 
 
 @app.post("/api/comments")
@@ -762,7 +1079,7 @@ def post_comment(comment: CommentCreate, _=Depends(require_public_writes)):
             status_code=403,
             detail="Your email is not on the approved family members list. Contact the admin to get access."
         )
-    fields = {
+    fields: dict[str, object] = {
         "MemberRecordId": comment.MemberRecordId,
         "MemberName": comment.MemberName,
         "AuthorName": comment.AuthorName,
@@ -778,25 +1095,25 @@ def post_comment(comment: CommentCreate, _=Depends(require_public_writes)):
 @app.get("/api/stories")
 def get_all_stories():
     """Get all stories."""
-    return db.get_all_stories()
+    return redact_public(db.get_all_stories())
 
 
 @app.get("/api/stories/family")
 def get_family_stories():
     """Get stories not tied to a specific member."""
-    return db.get_family_stories()
+    return redact_public(db.get_family_stories())
 
 
 @app.get("/api/stories/member/{member_record_id}")
 def get_stories_for_member(member_record_id: str):
     """Get stories for a specific member."""
-    return db.get_stories_for_member(member_record_id)
+    return redact_public(db.get_stories_for_member(member_record_id))
 
 
 @app.post("/api/stories")
 def post_story(story: StoryCreate, _=Depends(require_public_writes)):
     """Submit a new story."""
-    fields = {
+    fields: dict[str, object] = {
         "Title": story.Title,
         "Content": story.Content,
         "AuthorName": story.AuthorName,
@@ -897,24 +1214,87 @@ async def direct_submit(payload: DirectSubmission, _=Depends(require_public_writ
     except HTTPError as e:
         raise HTTPException(
             status_code=422,
-            detail=f"Airtable Schema Error in PendingSubmissions: {e.response.text}",
+            detail=f"Airtable Schema Error in PendingSubmissions: {_airtable_error_text(e)}",
         ) from e
 
+def _validate_image_content(content: bytes, content_type: str) -> None:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(content)) as image:
+                detected_format = str(image.format or "").upper()
+                width, height = image.size
+                frames = int(getattr(image, "n_frames", 1))
+                if detected_format != IMAGE_FORMATS_BY_CONTENT_TYPE[content_type]:
+                    raise ValueError("declared and detected image formats differ")
+                if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                    raise ValueError("image dimensions exceed policy")
+                if frames <= 0 or frames > MAX_IMAGE_FRAMES:
+                    raise ValueError("image frame count exceeds policy")
+                if width * height * frames > MAX_IMAGE_TOTAL_PIXELS:
+                    raise ValueError("aggregate image pixels exceed policy")
+                image.verify()
+            if frames > 1:
+                decoded_pixels = 0
+                with Image.open(BytesIO(content)) as image:
+                    for frame_index in range(frames):
+                        image.seek(frame_index)
+                        frame_width, frame_height = image.size
+                        if frame_width <= 0 or frame_height <= 0:
+                            raise ValueError("image frame dimensions are invalid")
+                        decoded_pixels += frame_width * frame_height
+                        if decoded_pixels > MAX_IMAGE_TOTAL_PIXELS:
+                            raise ValueError("aggregate image pixels exceed policy")
+                        image.load()
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is not a valid image.",
+        ) from None
+
+
 @app.post("/api/upload-image")
-async def upload_image(file: UploadFile = File(...), _=Depends(require_public_writes)):
+async def upload_image(
+    file: UploadFile = File(...),
+    _=Depends(require_public_writes),
+    __=Depends(require_upload_rate_limit),
+):
     """
     Publicly accessible image uploader for form submissions and admin edits.
     Uploads precisely to Cloudinary and returns the secure public URL perfectly suited for Airtable.
     """
+    if file.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Only standard images are allowed.",
+        )
+
+    file_content = await file.read(MAX_IMAGE_UPLOAD_BYTES + 1)
+    if len(file_content) > MAX_IMAGE_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Image exceeds the 10 MB upload limit.",
+        )
+    if not file_content:
+        raise HTTPException(status_code=400, detail="Image file is empty.")
+
+    _validate_image_content(file_content, file.content_type)
+
     try:
-        if file.content_type not in ["image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"]:
-            raise HTTPException(status_code=400, detail="Invalid file type. Only standard images are allowed.")
-            
-        file_content = await file.read()
         res = cloudinary.uploader.upload(file_content, folder="shajra_system")
-        return {"url": res.get("secure_url")}
+        secure_url = res.get("secure_url")
+        if not secure_url:
+            raise RuntimeError("Cloudinary response omitted secure_url")
+        return {"url": secure_url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Cloudinary upload failed.") from e
+        raise HTTPException(status_code=502, detail="Cloudinary upload failed.") from e
 
 
 # ══════════════════════════════════════════════════════════════
@@ -922,7 +1302,7 @@ async def upload_image(file: UploadFile = File(...), _=Depends(require_public_wr
 # ══════════════════════════════════════════════════════════════
 
 @app.post("/api/admin/login")
-def admin_login(req: LoginRequest):
+def admin_login(req: LoginRequest, _=Depends(require_login_rate_limit)):
     """Admin login — returns JWT token."""
     if not verify_admin(req.username, req.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -939,31 +1319,45 @@ def list_pending(admin=Depends(get_current_admin)):
 
 # ── Change History & Undo System ──────────────────────────────────────
 
-# In-memory change history (lost on restart — for session undo only)
-_change_history: list = []
-_MAX_HISTORY = 50
+# Development/test uses the module list for compatibility. Preview and
+# production resolve the same interface to durable Upstash history.
 
 
-def _snapshot_member(record_id: str) -> dict | None:
-    """Take a snapshot of a member before mutation."""
-    try:
-        return db.get_member_by_id(record_id)
-    except Exception:  # noqa: BLE001 - Preserve the v1 missing-member snapshot fallback.
-        return None
-
-
-def _push_history(action: str, record_id: str, before: dict | None, after: dict | None):
-    """Push a change to the undo stack."""
-    _change_history.append({
+def _push_history(
+    history_store: ChangeHistoryStore,
+    request_nonce: str,
+    action: str,
+    record_id: str,
+    before: dict | None,
+    after: dict | None,
+) -> bool:
+    """Commit guarded history without making an uncertain write retryable."""
+    entry: dict[str, object] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
         "record_id": record_id,
         "before": before,
         "after": after,
-    })
-    # Trim to max size
-    while len(_change_history) > _MAX_HISTORY:
-        _change_history.pop(0)
+    }
+    try:
+        history_store.bind_write_target(
+            request_nonce,
+            {"action": action, "record_id": record_id},
+        )
+        history_store.commit_write(request_nonce, entry)
+    except CoordinationError:
+        return False
+    return True
+
+
+def _undo_metadata(available: bool) -> dict[str, object]:
+    metadata: dict[str, object] = {"undoAvailable": available}
+    if not available:
+        metadata["undoWarning"] = (
+            "The change was saved but cannot be undone because durable history "
+            "is temporarily unavailable."
+        )
+    return metadata
 
 
 @app.get("/api/admin/pending/status/{status}")
@@ -972,23 +1366,40 @@ def list_pending_by_status(status: str, admin=Depends(get_current_admin)):
     return db.get_pending_by_status(status)
 
 
-def _link_spouse_reciprocal(member: dict) -> None:
-    """Store the marriage on BOTH sides of the relationship.
+def _raise_relationship_error(error: Exception) -> None:
+    if isinstance(error, CoordinationError):
+        _raise_coordination_error(error)
+    if isinstance(error, relationship_writes.RelationshipConflict):
+        status_code = (
+            404
+            if error.code in {"MEMBER_NOT_FOUND", "PENDING_NOT_FOUND", "UNDO_EMPTY"}
+            else 409
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    if isinstance(error, relationship_writes.RelationshipPersistenceError):
+        code = (
+            "RELATIONSHIP_ROLLBACK_INCOMPLETE"
+            if error.rollback_incomplete
+            else "RELATIONSHIP_WRITE_FAILED"
+        )
+        message = (
+            "The relationship update failed and could not be fully restored."
+            if error.rollback_incomplete
+            else "The relationship update failed and no changes were kept."
+        )
+        raise HTTPException(
+            status_code=500 if error.rollback_incomplete else 502,
+            detail={"code": code, "message": message},
+        ) from error
+    raise error
 
-    When a member is created/approved with a SpouseRecordId, update that spouse's
-    SpouseRecordId to point back at this member. Best-effort: a failure here
-    (e.g. the spouse is a name-only placeholder with no real record) must never
-    fail the whole create/approve operation — get_tree() also links spouses at
-    read time, so this only improves data integrity.
-    """
-    spouse_id = (member.get("SpouseRecordId") or "").strip()
-    member_id = member.get("id")
-    if not spouse_id or not member_id or spouse_id == member_id:
-        return
-    try:
-        db.update_member(spouse_id, {"SpouseRecordId": member_id})
-    except Exception:  # noqa: BLE001 - best-effort reciprocal link.
-        pass
+
+def _airtable_error_text(error: HTTPError) -> str:
+    response = error.response
+    return response.text if response is not None else "Unknown Airtable error"
 
 
 @app.post("/api/admin/approve/{record_id}")
@@ -996,60 +1407,56 @@ def approve_submission(
     record_id: str,
     admin=Depends(get_current_admin),
     _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
 ):
     """
     Approve a pending submission: create an approved member, mark submission as approved.
     """
-    pending_records = db.get_all_pending()
-    pending = None
-    for p in pending_records:
-        if p["id"] == record_id:
-            pending = p
-            break
-
-    if not pending:
-        raise HTTPException(status_code=404, detail="Pending submission not found")
-
-    # Create approved member from AI-cleaned data
-    member_fields = {
-        "FullName": pending.get("CleanFullName", pending.get("RawFullName", "")),
-        "FatherName": pending.get("CleanFatherName", ""),
-        "MotherName": pending.get("CleanMotherName", ""),
-        "SpouseName": pending.get("CleanSpouseName", ""),
-        "DateOfBirth": pending.get("CleanDOB", ""),
-        "DateOfDeath": pending.get("CleanDOD", ""),
-        "CurrentCity": pending.get("CleanCity", ""),
-        "CurrentCountry": pending.get("CleanCountry", ""),
-        "BurialLocation": pending.get("CleanBurialLocation", ""),
-        "Gender": pending.get("CleanGender", ""),
-        "Email": pending.get("CleanEmail", pending.get("RawEmail", "")),
-        "PhoneNumber": pending.get("CleanPhoneNumber", pending.get("RawPhoneNumber", "")),
-        "ProfileImageUrl": pending.get("CleanProfileImage", pending.get("RawProfileImage", "")),
-        "Biography": pending.get("RawBiography", ""),
-        "FatherRecordId": pending.get("AIMatchedFatherId", ""),
-        "MotherRecordId": pending.get("AIMatchedMotherId", ""),
-        "SpouseRecordId": pending.get("AIMatchedSpouseId", ""),
+    undo_available = True
+    history_nonce = new_acquisition_id()
+    history_operation: dict[str, object] = {
+        "action": "approve",
+        "record_id": record_id,
     }
 
-    # Determine IsAlive: only mark as dead if CleanDOD contains an actual date-like value
-    clean_dod = (pending.get("CleanDOD", "") or "").strip().lower()
-    has_real_dod = bool(clean_dod) and clean_dod not in ("", "n/a", "unknown", "none", "na", "-")
-    member_fields["IsAlive"] = not has_real_dod
+    def record_history(new_member: dict[str, object]) -> None:
+        nonlocal undo_available
+        undo_available = _push_history(
+            history_store,
+            history_nonce,
+            "approve",
+            str(new_member["id"]),
+            {"pending_id": record_id},
+            new_member,
+        )
 
-    # Remove None items, keep everything else so we can clear Text fields
-    member_fields = {k: v for k, v in member_fields.items() if v is not None}
+    try:
+        new_member = relationship_writes.approve_member(
+            db,
+            record_id,
+            lease_manager=lease_manager,
+            history_preflight=lambda: history_store.begin_write(
+                history_nonce, history_operation
+            ),
+            history_started=lambda: history_store.mark_write_started(
+                history_nonce
+            ),
+            history_recorder=record_history,
+            history_abort=lambda: history_store.abort_write(history_nonce),
+        )
+    except (
+        CoordinationError,
+        relationship_writes.RelationshipConflict,
+        relationship_writes.RelationshipPersistenceError,
+    ) as error:
+        _raise_relationship_error(error)
 
-    new_member = db.create_member(member_fields)
-    db.update_pending(record_id, {"Status": "Approved"})
-
-    # Reciprocally link the spouse so the marriage unit is stored on BOTH
-    # sides of the relationship (not just the new member -> spouse).
-    _link_spouse_reciprocal(new_member)
-
-    # Record in history
-    _push_history("approve", new_member["id"], None, new_member)
-
-    return {"status": "approved", "member": new_member}
+    return {
+        "status": "approved",
+        "member": new_member,
+        **_undo_metadata(undo_available),
+    }
 
 
 @app.get("/api/admin/integrations")
@@ -1058,14 +1465,29 @@ def admin_integrations(admin=Depends(get_current_admin)):
     return {
         "groqConfigured": bool(settings.groq_api_key),
         "cloudinaryConfigured": bool(settings.cloudinary_url),
-        "coordinationConfigured": False,
+        "coordinationConfigured": runtime_coordination.coordination_configured(settings),
+        "datastoreMutationsEnabled": db.legacy_mutations_enabled(settings),
     }
 
 @app.post("/api/admin/reject/{record_id}")
-def reject_submission(record_id: str, admin=Depends(get_current_admin)):
+def reject_submission(
+    record_id: str,
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+):
     """Reject a pending submission."""
-    db.update_pending(record_id, {"Status": "Rejected"})
-    return {"status": "rejected"}
+    try:
+        relationship_writes.reject_pending(
+            db, record_id, lease_manager=lease_manager
+        )
+        return {"status": "rejected"}
+    except (
+        CoordinationError,
+        relationship_writes.RelationshipConflict,
+        relationship_writes.RelationshipPersistenceError,
+    ) as error:
+        _raise_relationship_error(error)
 
 
 @app.post("/api/admin/members")
@@ -1073,16 +1495,55 @@ def admin_create_member(
     member: MemberCreate,
     admin=Depends(get_current_admin),
     _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
 ):
     """Admin directly creates an approved member."""
+    undo_available = True
+    history_nonce = new_acquisition_id()
+    history_operation: dict[str, object] = {
+        "action": "create",
+        "record_id": "",
+    }
+
+    def record_history(new_member: dict[str, object]) -> None:
+        nonlocal undo_available
+        undo_available = _push_history(
+            history_store,
+            history_nonce,
+            "create",
+            str(new_member["id"]),
+            None,
+            new_member,
+        )
+
     try:
         fields = member.model_dump(exclude_none=True)
-        new_member = db.create_member(fields)
-        _link_spouse_reciprocal(new_member)
-        _push_history("create", new_member["id"], None, new_member)
-        return new_member
+        new_member = relationship_writes.create_member(
+            db,
+            fields,
+            lease_manager=lease_manager,
+            history_preflight=lambda: history_store.begin_write(
+                history_nonce, history_operation
+            ),
+            history_started=lambda: history_store.mark_write_started(
+                history_nonce
+            ),
+            history_recorder=record_history,
+            history_abort=lambda: history_store.abort_write(history_nonce),
+        )
+        return {**new_member, **_undo_metadata(undo_available)}
+    except (
+        CoordinationError,
+        relationship_writes.RelationshipConflict,
+        relationship_writes.RelationshipPersistenceError,
+    ) as error:
+        _raise_relationship_error(error)
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}") from e
+        raise HTTPException(
+            status_code=422,
+            detail=f"Airtable Schema Error: {_airtable_error_text(e)}",
+        ) from e
 
 @app.put("/api/admin/members/{record_id}")
 def admin_update_member(
@@ -1090,16 +1551,58 @@ def admin_update_member(
     member: MemberUpdate,
     admin=Depends(get_current_admin),
     _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
 ):
     """Admin updates an approved member."""
+    undo_available = True
+    history_nonce = new_acquisition_id()
+    history_operation: dict[str, object] = {
+        "action": "update",
+        "record_id": record_id,
+    }
+
+    def record_history(
+        before: dict[str, object], after: dict[str, object]
+    ) -> None:
+        nonlocal undo_available
+        undo_available = _push_history(
+            history_store,
+            history_nonce,
+            "update",
+            record_id,
+            before,
+            after,
+        )
+
     try:
-        before = _snapshot_member(record_id)
         fields = member.model_dump(exclude_none=True)
-        result = db.update_member(record_id, fields)
-        _push_history("update", record_id, before, result)
-        return result
+        result = relationship_writes.update_member(
+            db,
+            record_id,
+            fields,
+            lease_manager=lease_manager,
+            history_preflight=lambda: history_store.begin_write(
+                history_nonce, history_operation
+            ),
+            history_started=lambda: history_store.mark_write_started(
+                history_nonce
+            ),
+            history_recorder=record_history,
+            history_abort=lambda: history_store.abort_write(history_nonce),
+        )
+        return {**result, **_undo_metadata(undo_available)}
+    except (
+        CoordinationError,
+        relationship_writes.RelationshipConflict,
+        relationship_writes.RelationshipPersistenceError,
+    ) as error:
+        _raise_relationship_error(error)
     except HTTPError as e:
-        raise HTTPException(status_code=422, detail=f"Airtable Schema Error: {e.response.text}") from e
+        raise HTTPException(
+            status_code=422,
+            detail=f"Airtable Schema Error: {_airtable_error_text(e)}",
+        ) from e
 
 
 @app.delete("/api/admin/members/{record_id}")
@@ -1107,63 +1610,192 @@ def admin_delete_member(
     record_id: str,
     admin=Depends(get_current_admin),
     _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
 ):
     """Admin deletes an approved member. Snapshots before for undo."""
-    before = _snapshot_member(record_id)
-    db.delete_member(record_id)
-    _push_history("delete", record_id, before, None)
-    return {"status": "deleted"}
+    undo_available = True
+    history_nonce = new_acquisition_id()
+    history_operation: dict[str, object] = {
+        "action": "delete",
+        "record_id": record_id,
+    }
+
+    def record_history(snapshot: dict[str, object]) -> None:
+        nonlocal undo_available
+        undo_available = _push_history(
+            history_store,
+            history_nonce,
+            "delete",
+            record_id,
+            snapshot,
+            None,
+        )
+
+    try:
+        relationship_writes.delete_member_with_snapshot(
+            db,
+            record_id,
+            lease_manager=lease_manager,
+            history_preflight=lambda: history_store.begin_write(
+                history_nonce, history_operation
+            ),
+            history_started=lambda: history_store.mark_write_started(
+                history_nonce
+            ),
+            history_recorder=record_history,
+            history_abort=lambda: history_store.abort_write(history_nonce),
+        )
+        return {"status": "deleted", **_undo_metadata(undo_available)}
+    except (
+        CoordinationError,
+        relationship_writes.RelationshipConflict,
+        relationship_writes.RelationshipPersistenceError,
+    ) as error:
+        _raise_relationship_error(error)
 
 
 # ── Undo / Revert Endpoint ────────────────────────────────────────────
 
 @app.get("/api/admin/history")
-def get_change_history(admin=Depends(get_current_admin)):
+def get_change_history(
+    admin=Depends(get_current_admin),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
+):
     """Get the change history stack (most recent first)."""
-    return list(reversed(_change_history))
+    try:
+        return history_store.list()
+    except CoordinationError as error:
+        _raise_coordination_error(error)
+
+
+@app.get("/api/admin/history/write-status")
+def get_history_write_status(
+    admin=Depends(get_current_admin),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
+):
+    """Expose enough durable metadata to reconcile an interrupted write."""
+    try:
+        status = history_store.write_status()
+    except CoordinationError as error:
+        _raise_coordination_error(error)
+    if status is None:
+        return {"active": False}
+    return {
+        "active": True,
+        "idempotencyKey": status.nonce,
+        "phase": status.phase,
+        "operation": status.operation,
+        "preparedAt": status.prepared_at,
+        "startedAt": status.started_at,
+        "boundAt": status.bound_at,
+    }
+
+
+@app.post("/api/admin/history/reconcile")
+def reconcile_history_write(
+    request: HistoryReconcileRequest,
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
+):
+    """Resolve an interrupted write after an administrator verifies Airtable."""
+    nonce = request.idempotencyKey.strip()
+    if not nonce or len(nonce) > 128 or "\x00" in nonce:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "IDEMPOTENCY_KEY_REQUIRED",
+                "message": "A valid interrupted-write idempotency key is required.",
+            },
+        )
+    if request.confirmation != _HISTORY_RECONCILIATION_CONFIRMATION:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "DATASTORE_VERIFICATION_REQUIRED",
+                "message": "Verify the datastore before reconciling change history.",
+            },
+        )
+    if request.resolution == "commit" and request.entry is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "HISTORY_ENTRY_REQUIRED",
+                "message": "A verified history entry is required to commit recovery.",
+            },
+        )
+    if request.resolution == "abort" and request.entry is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "HISTORY_ENTRY_NOT_ALLOWED",
+                "message": "Abort recovery must not include a history entry.",
+            },
+        )
+    entry = request.entry.model_dump() if request.entry is not None else None
+    try:
+        relationship_writes.reconcile_history_write(
+            db,
+            history_store,
+            nonce,
+            entry,
+            lease_manager=lease_manager,
+        )
+    except CoordinationError as error:
+        _raise_coordination_error(error)
+    return {"status": "resolved", "resolution": request.resolution}
+
+
+@app.get("/api/admin/undo/status")
+def get_undo_status(
+    admin=Depends(get_current_admin),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
+):
+    """Return the durable nonce needed to resume an interrupted undo."""
+    try:
+        active_nonce = history_store.active_nonce()
+    except CoordinationError as error:
+        _raise_coordination_error(error)
+    return {
+        "active": active_nonce is not None,
+        "idempotencyKey": active_nonce,
+    }
 
 @app.post("/api/admin/undo")
 def undo_last_change(
-    admin=Depends(get_current_admin), _=Depends(require_relationship_writes)
+    admin=Depends(get_current_admin),
+    _=Depends(require_relationship_writes),
+    lease_manager: LeaseManager = Depends(get_relationship_lease_manager),
+    history_store: ChangeHistoryStore = Depends(get_change_history_store),
+    idempotency_key: str | None = Header(
+        default=None, alias="X-Idempotency-Key"
+    ),
 ):
     """Undo the most recent admin change."""
-    if not _change_history:
-        raise HTTPException(status_code=404, detail="No changes to undo")
-    
-    entry = _change_history.pop()
-    action = entry["action"]
-    record_id = entry["record_id"]
-    before = entry["before"]
-    
+    request_nonce = str(idempotency_key or "").strip()
+    if not request_nonce or len(request_nonce) > 128 or "\x00" in request_nonce:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "IDEMPOTENCY_KEY_REQUIRED",
+                "message": "A valid X-Idempotency-Key header is required.",
+            },
+        )
     try:
-        if action == "create":
-            # Undo create → delete the record
-            db.delete_member(record_id)
-            return {"status": "undone", "action": "Deleted created member", "record_id": record_id}
-        
-        elif action == "update":
-            # Undo update → restore previous fields
-            if before:
-                restore_fields = {k: v for k, v in before.items() if k != "id"}
-                db.update_member(record_id, restore_fields)
-                return {"status": "undone", "action": f"Restored {before.get('FullName', record_id)} to previous state"}
-            raise HTTPException(status_code=500, detail="No snapshot available to restore")
-        
-        elif action == "delete":
-            # Undo delete → recreate the record with original data
-            if before:
-                restore_fields = {k: v for k, v in before.items() if k != "id"}
-                new_rec = db.create_member(restore_fields)
-                return {"status": "undone", "action": f"Restored deleted member {before.get('FullName', '')}", "new_id": new_rec["id"]}
-            raise HTTPException(status_code=500, detail="No snapshot available to restore")
-        
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
-    
-    except Exception as e:
-        # Put entry back if undo failed
-        _change_history.append(entry)
-        raise HTTPException(status_code=500, detail="Undo failed.") from e
+        return relationship_writes.undo_last_change(
+            db,
+            history_store,
+            request_nonce,
+            lease_manager=lease_manager,
+        )
+    except (
+        CoordinationError,
+        relationship_writes.RelationshipConflict,
+        relationship_writes.RelationshipPersistenceError,
+    ) as error:
+        _raise_relationship_error(error)
 
 
 # ── Manual Heal Endpoint ──────────────────────────────────────────────
@@ -1188,9 +1820,13 @@ def list_approved_emails(admin=Depends(get_current_admin)):
 
 
 @app.post("/api/admin/approved-emails")
-def add_approved_email(payload: ApprovedEmailCreate, admin=Depends(get_current_admin)):
+def add_approved_email(
+    payload: ApprovedEmailCreate,
+    admin=Depends(get_current_admin),
+    _=Depends(require_public_writes),
+):
     """Add an approved family email."""
-    fields = {
+    fields: dict[str, object] = {
         "Email": payload.Email.lower().strip(),
         "Name": payload.Name,
         "Notes": payload.Notes,
@@ -1201,7 +1837,11 @@ def add_approved_email(payload: ApprovedEmailCreate, admin=Depends(get_current_a
 
 
 @app.delete("/api/admin/approved-emails/{record_id}")
-def remove_approved_email(record_id: str, admin=Depends(get_current_admin)):
+def remove_approved_email(
+    record_id: str,
+    admin=Depends(get_current_admin),
+    _=Depends(require_public_writes),
+):
     """Remove an approved email."""
     db.remove_approved_email(record_id)
     return {"status": "removed"}
@@ -1216,7 +1856,11 @@ def list_all_comments(admin=Depends(get_current_admin)):
 
 
 @app.delete("/api/admin/comments/{record_id}")
-def delete_comment(record_id: str, admin=Depends(get_current_admin)):
+def delete_comment(
+    record_id: str,
+    admin=Depends(get_current_admin),
+    _=Depends(require_public_writes),
+):
     """Admin deletes a comment."""
     db.delete_comment(record_id)
     return {"status": "deleted"}
@@ -1225,7 +1869,11 @@ def delete_comment(record_id: str, admin=Depends(get_current_admin)):
 # ── Admin: Stories Moderation ──────────────────────────────────────
 
 @app.delete("/api/admin/stories/{record_id}")
-def delete_story(record_id: str, admin=Depends(get_current_admin)):
+def delete_story(
+    record_id: str,
+    admin=Depends(get_current_admin),
+    _=Depends(require_public_writes),
+):
     """Admin deletes a story."""
     db.delete_story(record_id)
     return {"status": "deleted"}

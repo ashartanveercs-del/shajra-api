@@ -18,6 +18,7 @@ id_rsa*
 .superpowers/
 .ruff_cache/
 .github/
+.gitleaks.toml
 docs/
 tools/
 scripts/

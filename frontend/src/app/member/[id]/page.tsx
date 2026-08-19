@@ -31,20 +31,9 @@ import {
   MessageSquare,
   Lock,
   Send,
-  Mail,
-  Phone,
-  MessageCircle,
   Camera,
   Plus
 } from "lucide-react";
-
-/** Normalize a phone number into a wa.me-friendly digits string. */
-function whatsappHref(phone: string | undefined): string {
-  if (!phone) return "";
-  let digits = phone.replace(/[^\d]/g, "");
-  if (digits.startsWith("0")) digits = "92" + digits.slice(1);
-  return `https://wa.me/${digits}`;
-}
 
 type AuxiliarySection = "relationships" | "comments" | "albums";
 
@@ -374,8 +363,6 @@ export default function MemberProfilePage() {
             {[
               { label: "Date of Birth", value: member.DateOfBirth, icon: Calendar },
               { label: "Date of Death", value: member.DateOfDeath, icon: Calendar },
-              { label: "Email", value: member.Email, icon: Mail, href: member.Email ? `mailto:${member.Email}` : "" },
-              { label: "WhatsApp", value: member.PhoneNumber, icon: MessageCircle, href: whatsappHref(member.PhoneNumber), external: true },
               { label: "City", value: member.CurrentCity, icon: MapPin },
               { label: "Country", value: member.CurrentCountry, icon: MapPin },
               { label: "Burial Location", value: member.BurialLocation, icon: MapPin },
@@ -386,21 +373,7 @@ export default function MemberProfilePage() {
                   <item.icon className="w-3.5 h-3.5 text-text-light mt-0.5 flex-shrink-0" />
                   <div>
                     <dt className="text-[11px] text-text-light uppercase tracking-wide">{item.label}</dt>
-                    {item.href ? (
-                      <dd>
-                        <a
-                          href={item.href}
-                          target={item.external ? "_blank" : undefined}
-                          rel={item.external ? "noopener noreferrer" : undefined}
-                          className="text-sm font-medium text-accent hover:underline inline-flex items-center gap-1"
-                        >
-                          {item.value}
-                          <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </dd>
-                    ) : (
-                      <dd className="text-sm font-medium text-text-primary">{item.value}</dd>
-                    )}
+                    <dd className="text-sm font-medium text-text-primary">{item.value}</dd>
                   </div>
                 </div>
               ))}

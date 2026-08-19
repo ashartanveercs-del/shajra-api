@@ -72,3 +72,67 @@ def test_map_markers_resolves_parent_by_record_id(monkeypatch):
     data = client.get("/api/map-markers").json()
 
     assert any("Child" in a["label"] and "Parent" in a["label"] for a in data["arcs"])
+
+
+def test_map_markers_rejects_partial_parent_name_match(monkeypatch):
+    members = [
+        _member(id="p", FullName="Tanveer Kamal", Gender="Male", CurrentCity="Dubai"),
+        _member(
+            id="c",
+            FullName="Child",
+            CurrentCity="Karachi",
+            FatherName="Tanveer Kamal Rasheed",
+        ),
+    ]
+    monkeypatch.setattr(main.db, "get_all_members", lambda: members)
+
+    data = client.get("/api/map-markers").json()
+
+    assert data["arcs"] == []
+
+
+def test_map_markers_rejects_ambiguous_exact_parent_name(monkeypatch):
+    members = [
+        _member(id="p1", FullName="Jose Khan", Gender="Male", CurrentCity="Dubai"),
+        _member(id="p2", FullName="JOS\u00c9  KHAN", Gender="Male", CurrentCity="Lahore"),
+        _member(
+            id="c",
+            FullName="Child",
+            CurrentCity="Karachi",
+            FatherName="Jose Khan",
+        ),
+    ]
+    monkeypatch.setattr(main.db, "get_all_members", lambda: members)
+
+    data = client.get("/api/map-markers").json()
+
+    assert data["arcs"] == []
+
+
+def test_map_markers_excludes_burial_marker_and_fallback_for_living_member(
+    monkeypatch,
+):
+    members = [
+        _member(
+            id="living-parent",
+            FullName="Living Parent",
+            Gender="Male",
+            IsAlive=True,
+            BurialLocation="Dubai",
+        ),
+        _member(
+            id="child",
+            FullName="Child",
+            CurrentCity="Karachi",
+            FatherRecordId="living-parent",
+        ),
+    ]
+    monkeypatch.setattr(main.db, "get_all_members", lambda: members)
+
+    data = client.get("/api/map-markers").json()
+
+    assert not any(
+        marker["id"] == "living-parent" and marker["type"] == "burial"
+        for marker in data["markers"]
+    )
+    assert data["arcs"] == []

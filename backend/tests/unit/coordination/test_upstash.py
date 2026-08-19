@@ -1706,7 +1706,7 @@ def test_rate_policy_table_is_exact_typed_and_keeps_comment_story_buckets_distin
     } == {
         RateLimitPolicyId.LOGIN: (5, 900_000, "IP"),
         RateLimitPolicyId.SUBMIT: (5, 3_600_000, "IP"),
-        RateLimitPolicyId.UPLOAD: (10, 3_600_000, "IDENTITY"),
+        RateLimitPolicyId.UPLOAD: (10, 3_600_000, "IP"),
         RateLimitPolicyId.COMMENT: (20, 3_600_000, "IDENTITY"),
         RateLimitPolicyId.STORY: (20, 3_600_000, "IDENTITY"),
         RateLimitPolicyId.SEARCH: (60, 60_000, "IP"),
@@ -1769,7 +1769,7 @@ def test_rate_limit_exact_window_boundary_n_n_plus_one_and_typed_subjects():
     (
         ("LOGIN", ("IP", "203.0.113.1")),
         ("SUBMIT", ("IP", "203.0.113.2")),
-        ("UPLOAD", ("IDENTITY", "usr_upload")),
+        ("UPLOAD", ("IP", "203.0.113.5")),
         ("COMMENT", ("IDENTITY", "usr_comment")),
         ("STORY", ("IDENTITY", "usr_story")),
         ("SEARCH", ("IP", "203.0.113.3")),
