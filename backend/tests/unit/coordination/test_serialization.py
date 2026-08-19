@@ -28,6 +28,7 @@ RUNTIME_SETTINGS = {
     "upstash_redis_rest_token": "upstash-secret-marker",
     "redis_namespace": "preview-1",
     "redis_key_hmac_secret": "hmac-secret-marker",
+    "cors_allowed_origins": "https://synthetic.example",
 }
 
 

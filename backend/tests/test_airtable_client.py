@@ -168,3 +168,18 @@ def test_explicit_legacy_kill_switch_overrides_advertised_write_flags(monkeypatc
     )
 
     assert airtable_client._legacy_mutations_enabled() is False
+
+
+def test_environment_mismatch_disables_legacy_mutations(monkeypatch):
+    monkeypatch.delenv("SHAJRA_LEGACY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.setattr(
+        airtable_client,
+        "get_settings",
+        lambda: SimpleNamespace(
+            public_writes_enabled=True,
+            relationship_writes_enabled=True,
+            environment_mismatch=True,
+        ),
+    )
+
+    assert airtable_client._legacy_mutations_enabled() is False

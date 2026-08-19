@@ -57,6 +57,27 @@ def test_relationship_dependency_fails_closed_with_test_settings(monkeypatch):
     }
 
 
+def test_vercel_environment_mismatch_disables_advertised_writes(monkeypatch):
+    write_gates = importlib.import_module("write_gates")
+    settings = Settings(
+        app_env="development",
+        vercel_env="production",
+        cors_allowed_origins="https://shajraheritage.vercel.app",
+        public_writes_enabled=True,
+        relationship_writes_enabled=True,
+        _env_file=None,
+    )
+    monkeypatch.setattr(write_gates, "get_settings", lambda: settings)
+
+    with pytest.raises(HTTPException) as public_error:
+        write_gates.require_public_writes()
+    with pytest.raises(HTTPException) as relationship_error:
+        write_gates.require_relationship_writes()
+
+    assert public_error.value.status_code == 503
+    assert relationship_error.value.status_code == 503
+
+
 def test_authenticated_relationship_write_is_disabled_before_database_work(monkeypatch):
     def downstream_operation(*_args, **_kwargs):
         raise AssertionError("disabled relationship write reached the database")

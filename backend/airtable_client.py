@@ -109,7 +109,7 @@ def _legacy_mutations_enabled(settings=None) -> bool:
     settings = settings or get_settings()
     advertised_enabled = bool(
         settings.public_writes_enabled or settings.relationship_writes_enabled
-    )
+    ) and not bool(getattr(settings, "environment_mismatch", False))
     explicit = os.getenv("SHAJRA_LEGACY_MUTATIONS_ENABLED")
     if explicit is None:
         return advertised_enabled

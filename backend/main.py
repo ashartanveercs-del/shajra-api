@@ -11,7 +11,6 @@ import warnings
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
@@ -43,6 +42,7 @@ from coordination import (
     RateLimitPolicyId,
     new_acquisition_id,
 )
+from cors_policy import configure_cors
 from public_data import normalize_name as normalize_person_name
 from public_data import redact_public
 from public_data import unique_member_by_name
@@ -141,13 +141,7 @@ app.add_middleware(
     UploadRequestSizeLimitMiddleware,
     maximum_bytes=MAX_IMAGE_REQUEST_BYTES,
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=get_settings().allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app, get_settings())
 
 
 # ── Auth Dependency ─────────────────────────────────────────────
@@ -196,7 +190,7 @@ def get_relationship_lease_manager() -> LeaseManager:
 
 def get_change_history_store() -> ChangeHistoryStore:
     settings = get_settings()
-    if settings.app_env in {"development", "test"}:
+    if settings.runtime_environment in {"development", "test"}:
         return _memory_change_history_store
     try:
         return runtime_coordination.build_change_history_store(settings)
@@ -472,7 +466,8 @@ def health_ready():
     settings = get_settings()
     return {
         "status": "ready",
-        "environment": settings.app_env,
+        "environment": settings.runtime_environment,
+        "environmentMismatch": settings.environment_mismatch,
         "configured": {
             "airtable": bool(settings.airtable_pat and settings.airtable_base_id),
             "groq": bool(settings.groq_api_key),
@@ -480,11 +475,11 @@ def health_ready():
             "coordination": runtime_coordination.coordination_configured(settings),
         },
         "writes": {
-            "public": settings.public_writes_enabled,
-            "relationships": settings.relationship_writes_enabled,
+            "public": settings.effective_public_writes_enabled,
+            "relationships": settings.effective_relationship_writes_enabled,
             "datastore": db.legacy_mutations_enabled(settings),
         },
-        "normalizedReads": settings.normalized_reads_enabled,
+        "normalizedReads": settings.effective_normalized_reads_enabled,
     }
 
 
