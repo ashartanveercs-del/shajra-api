@@ -100,6 +100,18 @@ describe("TreePage load states", () => {
     expect(screen.getByRole("button", { name: "2D" })).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("hides the desktop add action through a responsive wrapper", async () => {
+    apiMocks.fetchTree.mockResolvedValue([
+      { id: "member-1", FullName: "Ali Khan", Gender: "Male", children: [] },
+    ]);
+
+    render(<TreePage />);
+
+    const addMember = await screen.findByRole("link", { name: "Add Family Member" });
+    expect(addMember).not.toHaveClass("hidden");
+    expect(addMember.parentElement).toHaveClass("hidden", "sm:block");
+  });
+
   it("keeps the visible 2D tree for reduced-motion users", async () => {
     apiMocks.fetchTree.mockResolvedValue([
       { id: "member-1", FullName: "Ali Khan", Gender: "Male", children: [] },

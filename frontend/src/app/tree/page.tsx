@@ -405,10 +405,12 @@ export default function TreePage() {
             </button>
           </div>
           {tree.length > 0 && (
-            <Link href="/submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap hidden sm:flex">
-              <Plus className="w-3.5 h-3.5" />
-              Add Family Member
-            </Link>
+            <div className="hidden sm:block">
+              <Link href="/submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap">
+                <Plus className="w-3.5 h-3.5" />
+                Add Family Member
+              </Link>
+            </div>
           )}
         </div>
       </div>
