@@ -31,8 +31,6 @@ import {
   MessageSquare,
   Lock,
   Send,
-  Mail,
-  Phone,
   Camera,
   Plus
 } from "lucide-react";
@@ -365,8 +363,6 @@ export default function MemberProfilePage() {
             {[
               { label: "Date of Birth", value: member.DateOfBirth, icon: Calendar },
               { label: "Date of Death", value: member.DateOfDeath, icon: Calendar },
-              { label: "Email", value: member.Email, icon: Mail },
-              { label: "Phone", value: member.PhoneNumber, icon: Phone },
               { label: "City", value: member.CurrentCity, icon: MapPin },
               { label: "Country", value: member.CurrentCountry, icon: MapPin },
               { label: "Burial Location", value: member.BurialLocation, icon: MapPin },

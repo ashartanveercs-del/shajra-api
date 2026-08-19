@@ -9,5 +9,6 @@ export default defineConfig({
     passWithNoTests: true,
     restoreMocks: true,
     clearMocks: true,
+    maxWorkers: 2,
   },
 });

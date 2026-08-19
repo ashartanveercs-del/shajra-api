@@ -5,9 +5,17 @@ import gc
 from collections.abc import Iterator, Sequence
 from typing import Any, Callable
 
+# Lupa locks the first loaded runtime module on Linux. Load LuaJIT before
+# fakeredis imports its default Lua 5.1 runtime.
+# isort: off
+import lupa.luajit21
+
+# Keep one runtime alive so the later fakeredis import cannot replace LuaJIT.
+_LUAJIT_BOOTSTRAP_RUNTIME = lupa.luajit21.LuaRuntime()
+
 import fakeredis
 import fakeredis.commands_mixins.scripting_mixin as scripting_mixin
-import lupa.luajit21
+# isort: on
 import pytest
 from fakeredis.commands_mixins.scripting_mixin import ScriptingCommandsMixin
 
@@ -133,6 +141,15 @@ class ProductionLuaRedis:
             server = connection._server
             server._lua_runtime.execute(_BIT_SPY_LUA)
             server._lua_expected_globals.add(b"__shajra_bit_calls")
+        finally:
+            self.client.connection_pool.release(connection)
+
+    def runtime_implementation(self) -> str:
+        self.client.eval("return 1", 0)
+        connection = self.client.connection_pool.get_connection()
+        try:
+            raw = connection._server._lua_runtime.lua_implementation
+            return raw.decode("ascii") if isinstance(raw, bytes) else str(raw)
         finally:
             self.client.connection_pool.release(connection)
 

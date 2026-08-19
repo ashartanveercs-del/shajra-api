@@ -83,6 +83,8 @@ class ProductionLuaHarness(Protocol):
         nonce_idempotent: bool,
     ) -> list[Any]: ...
 
+    def runtime_implementation(self) -> str: ...
+
 
 SHA256_PROBE_LUA = (
     "-- shajra-test:sha256-probe:v1\n"
@@ -155,6 +157,7 @@ def test_harness_executes_the_exact_production_lua_string(
 
     assert result[:2] == ["OK", "TIME"]
     assert production_lua.executed_scripts == [RATE_TIME_LUA]
+    assert production_lua.runtime_implementation().startswith("LuaJIT 2.1")
 
 
 def _seed_ready_graph(

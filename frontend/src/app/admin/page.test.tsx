@@ -208,6 +208,68 @@ describe("AdminPage reliability states", () => {
     expect(screen.getByText("New Session")).toBeInTheDocument();
   });
 
+  it("restores a persisted history-gap warning and keeps undo blocked", async () => {
+    localStorage.setItem(
+      "shajra:admin-undo-block",
+      "A previous change was saved without durable undo history.",
+    );
+
+    render(<AdminPage />);
+
+    expect(
+      await screen.findByText("A previous change was saved without durable undo history."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Undo Last Change" })).toBeDisabled();
+  });
+
+  it("allows only recorded changes above a persistent history-gap barrier", async () => {
+    const undoWarning = "The approval was saved but cannot be undone right now.";
+    apiMocks.fetchPending.mockResolvedValue([
+      { id: "submission-1", Status: "Pending", RawFullName: "Ali Pending" },
+    ]);
+    apiMocks.fetchMembers.mockResolvedValue([
+      { id: "member-1", FullName: "Sara Khan" },
+    ]);
+    apiMocks.approveSubmission.mockResolvedValue({
+      status: "approved",
+      undoAvailable: false,
+      undoWarning,
+    });
+    apiMocks.adminDeleteMember.mockResolvedValue({
+      status: "deleted",
+      undoAvailable: true,
+    });
+    apiMocks.adminUndo.mockResolvedValue({ status: "undone" });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+
+    render(<AdminPage />);
+
+    await user.click(await screen.findByRole("button", { name: "Approve Ali Pending" }));
+    expect(await screen.findByText(undoWarning)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Undo Last Change" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: /^Members/ }));
+    await user.click(screen.getByRole("button", { name: "Delete Sara Khan" }));
+
+    expect(await screen.findByText(undoWarning)).toBeInTheDocument();
+    expect(screen.getByText(/1 newer recorded change can still be undone/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Undo Last Change" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "Undo Last Change" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Undo Last Change" })).toBeDisabled();
+    });
+    expect(screen.getByText(undoWarning)).toBeInTheDocument();
+    expect(apiMocks.adminUndo).toHaveBeenCalledOnce();
+    expect(JSON.parse(localStorage.getItem("shajra:admin-undo-block") || "{}")).toMatchObject({
+      warning: undoWarning,
+      safeUndoCount: 0,
+    });
+    confirmSpy.mockRestore();
+  });
+
   it("guards login reentry while the first login is pending", async () => {
     localStorage.clear();
     const login = deferred<string>();
@@ -233,6 +295,7 @@ describe("AdminPage reliability states", () => {
       groqConfigured: false,
       cloudinaryConfigured: true,
       coordinationConfigured: true,
+      datastoreMutationsEnabled: true,
     });
     const user = userEvent.setup();
 
@@ -244,7 +307,8 @@ describe("AdminPage reliability states", () => {
     expect(integrationFrame).toHaveClass("rounded-lg");
     expect(integrationFrame).not.toHaveClass("heritage-card");
     expect(screen.getByText("Not configured")).toBeInTheDocument();
-    expect(screen.getAllByText("Configured")).toHaveLength(2);
+    expect(screen.getByText("Datastore writes")).toBeInTheDocument();
+    expect(screen.getAllByText("Configured")).toHaveLength(3);
     expect(screen.queryByRole("button", { name: /Heal Graph/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Save Settings/i })).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/API Key/i)).not.toBeInTheDocument();

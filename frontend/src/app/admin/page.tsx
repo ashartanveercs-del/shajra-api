@@ -18,6 +18,7 @@ import {
   adminFetchIntegrations,
   adminUndo,
   type AdminIntegrations,
+  type AdminMutationMetadata,
   type PendingSubmission,
   type Member,
   type ApprovedEmail,
@@ -46,10 +47,38 @@ import {
 type Tab = "pending" | "members" | "tree" | "add" | "emails" | "integrations";
 type DashboardSection = "pending" | "members" | "emails";
 
+const ADMIN_UNDO_BLOCK_KEY = "shajra:admin-undo-block";
+const DEFAULT_UNDO_WARNING = "This change was saved without durable undo history.";
+
+type UndoBarrier = {
+  warning: string;
+  safeUndoCount: number;
+};
+
+function parseUndoBarrier(value: string | null): UndoBarrier | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object") throw new Error("invalid undo barrier");
+    const warning = Reflect.get(parsed, "warning");
+    const safeUndoCount = Reflect.get(parsed, "safeUndoCount");
+    if (typeof warning !== "string" || !warning.trim()) throw new Error("invalid undo warning");
+    return {
+      warning,
+      safeUndoCount: Number.isSafeInteger(safeUndoCount) && Number(safeUndoCount) > 0
+        ? Number(safeUndoCount)
+        : 0,
+    };
+  } catch {
+    return { warning: value, safeUndoCount: 0 };
+  }
+}
+
 const INTEGRATION_ROWS = [
   ["Groq", "groqConfigured"],
   ["Cloudinary", "cloudinaryConfigured"],
   ["Coordination", "coordinationConfigured"],
+  ["Datastore writes", "datastoreMutationsEnabled"],
 ] as const satisfies ReadonlyArray<readonly [string, keyof AdminIntegrations]>;
 
 type DashboardData = {
@@ -145,6 +174,11 @@ export default function AdminPage() {
   const [retryingSections, setRetryingSections] = useState<Set<DashboardSection>>(new Set());
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [undoBarrier, setUndoBarrier] = useState<UndoBarrier | null>(() =>
+    typeof window === "undefined"
+      ? null
+      : parseUndoBarrier(localStorage.getItem(ADMIN_UNDO_BLOCK_KEY)),
+  );
   const dashboardRequest = useRef(0);
   const dashboardSectionRequest = useRef<Record<DashboardSection, number>>({
     pending: 0,
@@ -156,6 +190,41 @@ export default function AdminPage() {
   const loginRequest = useRef(0);
   const loginInFlight = useRef(false);
   const retryingSectionsRef = useRef<Set<DashboardSection>>(new Set());
+  const undoBarrierRef = useRef(undoBarrier);
+
+  const persistUndoBarrier = useCallback((next: UndoBarrier | null) => {
+    undoBarrierRef.current = next;
+    setUndoBarrier(next);
+    if (next) localStorage.setItem(ADMIN_UNDO_BLOCK_KEY, JSON.stringify(next));
+    else localStorage.removeItem(ADMIN_UNDO_BLOCK_KEY);
+  }, []);
+
+  const applyUndoMetadata = useCallback((result?: AdminMutationMetadata | null) => {
+    if (!result) return;
+    if (result.undoAvailable === false) {
+      const warning = result.undoWarning?.trim() || DEFAULT_UNDO_WARNING;
+      persistUndoBarrier({ warning, safeUndoCount: 0 });
+    } else if (result.undoAvailable === true) {
+      const current = undoBarrierRef.current;
+      if (current) {
+        persistUndoBarrier({
+          ...current,
+          safeUndoCount: current.safeUndoCount + 1,
+        });
+      }
+    }
+  }, [persistUndoBarrier]);
+
+  useEffect(() => {
+    const syncUndoBlock = (event: StorageEvent) => {
+      if (event.key !== ADMIN_UNDO_BLOCK_KEY) return;
+      const next = parseUndoBarrier(event.newValue);
+      undoBarrierRef.current = next;
+      setUndoBarrier(next);
+    };
+    window.addEventListener("storage", syncUndoBlock);
+    return () => window.removeEventListener("storage", syncUndoBlock);
+  }, []);
 
   const sessionIsCurrent = useCallback((epoch: number, expectedToken: string) => (
     sessionEpoch.current === epoch && activeToken.current === expectedToken
@@ -293,8 +362,9 @@ export default function AdminPage() {
     setActionLoading(id);
     setActionError(null);
     try {
-      await approveSubmission(token, id);
+      const result = await approveSubmission(token, id);
       if (!sessionIsCurrent(epoch, token)) return;
+      applyUndoMetadata(result);
       await loadData();
     } catch (error: unknown) {
       if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The submission could not be approved.").message);
@@ -325,8 +395,9 @@ export default function AdminPage() {
     setActionLoading(id);
     setActionError(null);
     try {
-      await adminDeleteMember(token, id);
+      const result = await adminDeleteMember(token, id);
       if (!sessionIsCurrent(epoch, token)) return;
+      applyUndoMetadata(result);
       await loadData();
     } catch (error: unknown) {
       if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The member could not be deleted.").message);
@@ -343,6 +414,13 @@ export default function AdminPage() {
     try {
       await adminUndo(token);
       if (!sessionIsCurrent(epoch, token)) return;
+      const barrier = undoBarrierRef.current;
+      if (barrier?.safeUndoCount) {
+        persistUndoBarrier({
+          ...barrier,
+          safeUndoCount: barrier.safeUndoCount - 1,
+        });
+      }
       await loadData();
     } catch (error: unknown) {
       if (sessionIsCurrent(epoch, token)) setActionError(asApiProblem(error, "The last change could not be undone.").message);
@@ -449,13 +527,29 @@ export default function AdminPage() {
         <button
           type="button"
           onClick={handleUndo}
-          disabled={actionLoading === "undo"}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-text-muted hover:text-accent hover:bg-accent/5 border border-border rounded-lg transition-heritage"
+          disabled={actionLoading === "undo" || Boolean(undoBarrier && undoBarrier.safeUndoCount === 0)}
+          aria-describedby={undoBarrier ? "admin-undo-warning" : undefined}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-text-muted hover:text-accent hover:bg-accent/5 border border-border rounded-lg transition-heritage disabled:cursor-not-allowed disabled:opacity-50"
         >
           {actionLoading === "undo" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Undo2 className="w-3.5 h-3.5" />}
           Undo Last Change
         </button>
       </div>
+
+      {undoBarrier && (
+        <div id="admin-undo-warning" role="alert" className="mb-5 flex items-start gap-2 rounded-lg border border-amber/30 bg-amber/10 p-3 text-sm text-text-primary">
+          <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-amber" />
+          <div>
+            <p className="font-medium">{undoBarrier.safeUndoCount > 0 ? "Undo history limited" : "Undo unavailable"}</p>
+            <p className="mt-0.5 text-xs text-text-muted">{undoBarrier.warning}</p>
+            {undoBarrier.safeUndoCount > 0 && (
+              <p className="mt-1 text-xs text-text-muted">
+                {undoBarrier.safeUndoCount} newer recorded {undoBarrier.safeUndoCount === 1 ? "change can" : "changes can"} still be undone; older history remains blocked.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {actionError && (
         <div role="alert" className="mb-5 rounded-lg border border-terracotta-light bg-terracotta-light/30 p-3 text-sm text-terracotta">
@@ -479,8 +573,8 @@ export default function AdminPage() {
         <>
           {tab === "pending" && (unavailable.has("pending") ? <AdminSectionUnavailable title="Submissions unavailable" pending={retryingSections.has("pending")} onRetry={() => void retrySection("pending")} /> : <PendingTab submissions={pendingOnly} actionLoading={actionLoading} onApprove={handleApprove} onReject={handleReject} />)}
           {tab === "members" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" pending={retryingSections.has("members")} onRetry={() => void retrySection("members")} /> : <MembersTab members={members} actionLoading={actionLoading} onDelete={handleDelete} />)}
-          {tab === "tree" && <AdminTreeEditor token={token} onUpdated={() => loadData()} />}
-          {tab === "add" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" pending={retryingSections.has("members")} onRetry={() => void retrySection("members")} /> : <AddMemberTab token={token} onCreated={() => loadData()} members={members} />)}
+          {tab === "tree" && <AdminTreeEditor token={token} onUpdated={(result) => { applyUndoMetadata(result); void loadData(); }} />}
+          {tab === "add" && (unavailable.has("members") ? <AdminSectionUnavailable title="Members unavailable" pending={retryingSections.has("members")} onRetry={() => void retrySection("members")} /> : <AddMemberTab token={token} onCreated={(result) => { applyUndoMetadata(result); void loadData(); }} members={members} />)}
           {tab === "emails" && (unavailable.has("emails") ? <AdminSectionUnavailable title="Approved emails unavailable" pending={retryingSections.has("emails")} onRetry={() => void retrySection("emails")} /> : <EmailsTab emails={emails} token={token} onUpdated={() => loadData()} />)}
           {tab === "integrations" && <IntegrationsTab token={token} />}
         </>
@@ -704,7 +798,7 @@ function MembersTab({ members, actionLoading, onDelete }: { members: Member[]; a
   );
 }
 
-function AddMemberTab({ token, onCreated, members }: { token: string; onCreated: () => void; members: Member[] }) {
+function AddMemberTab({ token, onCreated, members }: { token: string; onCreated: (result: AdminMutationMetadata) => void; members: Member[] }) {
   const [form, setForm] = useState({
     FullName: "", FatherName: "", MotherName: "", SpouseName: "", DateOfBirth: "", DateOfDeath: "",
     CurrentCity: "", CurrentCountry: "", BurialLocation: "", Biography: "", Gender: "",
@@ -740,10 +834,10 @@ function AddMemberTab({ token, onCreated, members }: { token: string; onCreated:
       if (form.Generation) fields.Generation = parseInt(form.Generation);
       else delete fields.Generation;
       Object.keys(fields).forEach((k) => { if (fields[k] === "") delete fields[k]; });
-      await adminCreateMember(token, fields as Partial<Member>);
+      const result = await adminCreateMember(token, fields as Partial<Member>);
       setSuccess(true);
       setForm({ FullName: "", FatherName: "", MotherName: "", SpouseName: "", DateOfBirth: "", DateOfDeath: "", CurrentCity: "", CurrentCountry: "", BurialLocation: "", Biography: "", Gender: "", Generation: "", Branch: "", FatherRecordId: "", MotherRecordId: "", SpouseRecordId: "", IsAlive: true });
-      onCreated();
+      onCreated(result);
       successTimer.current = setTimeout(() => {
         successTimer.current = null;
         setSuccess(false);

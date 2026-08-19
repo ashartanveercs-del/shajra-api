@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { fetchTree, submitDirectForm, uploadImage, type Member } from "@/lib/api";
 import AsyncState from "@/components/feedback/AsyncState";
 import { asApiProblem, type Loadable } from "@/lib/loadable";
-import { User, Heart, Loader2, Plus, ZoomIn, ZoomOut, Maximize, Edit3, X, Save } from "lucide-react";
+import { User, Heart, Loader2, Plus, ZoomIn, ZoomOut, Maximize, Edit3, X, Save, Crown } from "lucide-react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
+import TiltCard from "@/components/ui/TiltCard";
+
+const FamilyTree3D = lazy(() => import("@/components/FamilyTree3D"));
 
 type SuggestionForm = {
   fullName: string;
@@ -38,7 +41,7 @@ function AvatarCircle({ member }: { member: Member }) {
   return (
     <div className="flex flex-col items-center">
       <div
-        className="relative z-10 mb-1.5 flex h-10 w-10 items-center justify-center rounded-full border border-black/5 bg-white/70 bg-cover bg-center font-serif text-base font-bold shadow-sm sm:h-12 sm:w-12 sm:text-lg"
+        className="relative z-10 mb-1.5 flex h-11 w-11 items-center justify-center rounded-full border-2 border-white bg-gradient-to-br from-white to-bg-secondary bg-cover bg-center font-serif text-base font-bold text-accent shadow-md sm:h-14 sm:w-14 sm:text-xl"
         style={
           member.ProfileImageUrl
             ? { backgroundImage: `url(${member.ProfileImageUrl})` }
@@ -47,13 +50,13 @@ function AvatarCircle({ member }: { member: Member }) {
       >
         {!member.ProfileImageUrl && (member.FullName || "?")[0]}
         {member.IsAlive && (
-          <div className="absolute -right-1 -top-1 z-20 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-emerald/20 bg-white shadow-sm">
-            <Heart className="h-2 w-2 fill-emerald text-emerald" />
+          <div className="absolute -right-0.5 -top-0.5 z-20 flex h-4 w-4 items-center justify-center rounded-full border-2 border-white bg-emerald shadow-sm">
+            <Heart className="h-2 w-2 fill-white text-white" />
           </div>
         )}
       </div>
-      <div className="max-w-[80px] truncate text-center text-[11px] font-semibold leading-none opacity-90 sm:text-xs">
-        {member.FullName?.split(" ")[0]}
+      <div className="max-w-[96px] truncate text-center text-[11px] font-semibold leading-tight text-text-primary sm:text-xs">
+        {member.FullName?.split(" ").slice(0, 2).join(" ")}
       </div>
     </div>
   );
@@ -63,19 +66,21 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
   const isCouple = !!member.Spouse;
 
   const getGenderBg = (gender?: string) => {
-    if (gender === "Male") return "bg-sky-light/80 border-sky/30 text-sky-900";
-    if (gender === "Female") return "bg-plum-light/80 border-plum/30 text-plum-900";
-    return "bg-bg-secondary border-border text-text-primary";
+    if (gender === "Male") return "bg-gradient-to-br from-sky-light to-white border-sky/30 text-sky-900";
+    if (gender === "Female") return "bg-gradient-to-br from-plum-light to-white border-plum/30 text-plum-900";
+    return "bg-gradient-to-br from-bg-secondary to-white border-border text-text-primary";
   };
 
   return (
     <div className="group inline-block">
+      <TiltCard maxTilt={9} className="rounded-2xl">
       <div
-        className={`flex flex-col items-center p-3 rounded-2xl border ${getGenderBg(member.Gender)} shadow-sm hover:shadow-md transition-all min-w-[120px] relative hover:-translate-y-1 ${member.FullName === "Ashar Tanveer" ? 'border-accent shadow-[0_0_15px_rgba(231,166,26,0.3)] ring-2 ring-accent/20' : ''} ${member.FullName?.includes("(Unknown)") ? 'border-dashed opacity-70 grayscale-[0.3]' : ''}`}
+        className={`flex flex-col items-center p-3 rounded-2xl border ${member.FullName === "Ashar Tanveer" ? 'border-amber-400 bg-gradient-to-br from-amber-50 via-white to-amber-100 text-amber-900 shadow-[0_0_28px_rgba(231,166,26,0.5)] ring-2 ring-amber-400/50 creator-glow' : getGenderBg(member.Gender) + " shadow-sm hover:shadow-md"} transition-all min-w-[120px] relative hover:-translate-y-1 ${member.FullName?.includes("(Unknown)") ? 'border-dashed opacity-70 grayscale-[0.3]' : ''}`}
       >
         {/* Creator Badge */}
         {member.FullName === "Ashar Tanveer" && (
-          <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-accent text-white px-3 py-0.5 rounded-full text-[10px] font-bold tracking-widest shadow-lg border border-white/20 animate-pulse z-[110]">
+          <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500 text-white px-3 py-0.5 rounded-full text-[10px] font-bold tracking-widest shadow-lg shadow-amber-500/40 border border-amber-200/70 flex items-center gap-1 animate-pulse z-[110]">
+            <Crown className="w-3 h-3 fill-amber-200" />
             CREATOR
           </div>
         )}
@@ -113,8 +118,10 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
         </div>
 
         {isCouple ? (
-          <div className="text-[10px] uppercase tracking-tighter font-bold opacity-40 mt-1">
-             Family Unit 
+          <div className="mt-1 inline-flex items-center gap-2 text-[9px] uppercase tracking-[0.22em] font-semibold text-accent">
+            <span className="w-4 h-px bg-accent/40" />
+            Married
+            <span className="w-4 h-px bg-accent/40" />
           </div>
         ) : (
           (member.DateOfBirth || member.DateOfDeath) && (
@@ -124,6 +131,7 @@ function TreeCard({ member, onSuggestEdit }: { member: Member & { Spouse?: Membe
           )
         )}
       </div>
+      </TiltCard>
     </div>
   );
 }
@@ -162,6 +170,8 @@ export default function TreePage() {
   const [showSuccess, setShowSuccess] = useState(false);
   const [suggestionProblem, setSuggestionProblem] = useState<string | null>(null);
   const [uploadProblem, setUploadProblem] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"3d" | "2d">("2d");
+  const [enhancementNotice, setEnhancementNotice] = useState<string | null>(null);
 
   const loadTree = useCallback(() => {
     const request = ++treeRequest.current;
@@ -317,6 +327,45 @@ export default function TreePage() {
     });
   };
 
+  const selectThreeDimensionalView = () => {
+    const reducedMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion) {
+      setViewMode("2d");
+      setEnhancementNotice(
+        "3D motion is disabled by your preferences. The 2D family tree remains available.",
+      );
+      return;
+    }
+
+    const webglAvailable =
+      typeof window.WebGLRenderingContext === "function" ||
+      typeof window.WebGL2RenderingContext === "function";
+    if (!webglAvailable) {
+      setViewMode("2d");
+      setEnhancementNotice(
+        "3D view is unavailable. The 2D family tree remains available.",
+      );
+      return;
+    }
+
+    setEnhancementNotice(null);
+    setViewMode("3d");
+  };
+
+  const selectTwoDimensionalView = () => {
+    setEnhancementNotice(null);
+    setViewMode("2d");
+  };
+
+  const handleThreeDimensionalUnavailable = useCallback(() => {
+    setViewMode("2d");
+    setEnhancementNotice(
+      "3D view is unavailable. The 2D family tree remains available.",
+    );
+  }, []);
+
   return (
     <div className="mx-auto max-w-7xl px-5 sm:px-8 py-12 sm:py-16 overflow-x-auto rendering-wrapper relative">
       <div className="mb-12 animate-fadeInUp flex items-end justify-between">
@@ -332,13 +381,48 @@ export default function TreePage() {
             Explore generations of heritage. Scroll horizontally to view wide branches of the family.
           </p>
         </div>
-        {tree.length > 0 && (
-          <Link href="/submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap hidden sm:flex">
-            <Plus className="w-3.5 h-3.5" />
-            Add Family Member
-          </Link>
-        )}
+        <div className="flex items-center gap-2">
+          <div
+            className="flex items-center rounded-lg border border-border bg-bg-card p-1 shadow-sm"
+            role="group"
+            aria-label="Tree view"
+          >
+            <button
+              type="button"
+              aria-pressed={viewMode === "3d"}
+              onClick={selectThreeDimensionalView}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${viewMode === "3d" ? "bg-accent text-white" : "text-text-muted hover:text-text-primary"}`}
+            >
+              3D
+            </button>
+            <button
+              type="button"
+              aria-pressed={viewMode === "2d"}
+              onClick={selectTwoDimensionalView}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${viewMode === "2d" ? "bg-accent text-white" : "text-text-muted hover:text-text-primary"}`}
+            >
+              2D
+            </button>
+          </div>
+          {tree.length > 0 && (
+            <div className="hidden sm:block">
+              <Link href="/submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap">
+                <Plus className="w-3.5 h-3.5" />
+                Add Family Member
+              </Link>
+            </div>
+          )}
+        </div>
       </div>
+
+      {enhancementNotice && (
+        <p
+          role="status"
+          className="mb-4 rounded-lg border border-border bg-bg-secondary px-4 py-3 text-sm text-text-muted"
+        >
+          {enhancementNotice}
+        </p>
+      )}
 
       <style dangerouslySetInnerHTML={{
         __html: `
@@ -347,15 +431,15 @@ export default function TreePage() {
         .family-tree li { float: left; text-align: center; list-style-type: none; position: relative; padding: 30px 10px 0 10px; transition: all 0.5s; }
         .family-tree li::before, .family-tree li::after { content: ''; position: absolute; top: 0; height: 30px; }
         /* Use --line-pos to point exactly to the blood child instead of the absolute center */
-        .family-tree li::before { right: calc(100% - var(--line-pos, 50%)); width: var(--line-pos, 50%); border-top: 2px solid #dcd7cf; }
-        .family-tree li::after { left: var(--line-pos, 50%); width: calc(100% - var(--line-pos, 50%)); border-left: 2px solid #dcd7cf; border-top: 2px solid #dcd7cf; }
+        .family-tree li::before { right: calc(100% - var(--line-pos, 50%)); width: var(--line-pos, 50%); border-top: 2px solid #c9a97a; }
+        .family-tree li::after { left: var(--line-pos, 50%); width: calc(100% - var(--line-pos, 50%)); border-left: 2px solid #c9a97a; border-top: 2px solid #c9a97a; }
         .family-tree li:only-child::after, .family-tree li:only-child::before { display: none; }
         .family-tree li:only-child { padding-top: 0; }
         .family-tree li:first-child::before, .family-tree li:last-child::after { border: 0 none; }
-        .family-tree li:last-child::before { border-right: 2px solid #dcd7cf; border-radius: 0 5px 0 0; }
+        .family-tree li:last-child::before { border-right: 2px solid #c9a97a; border-radius: 0 5px 0 0; }
         .family-tree li:first-child::after { border-radius: 5px 0 0 0; }
         /* The drop-down line from the parent couple to the horizontal line. This always stays at 50% because the children branch from the union. */
-        .family-tree ul ul::before { content: ''; position: absolute; top: 0; left: 50%; border-left: 2px solid #dcd7cf; width: 0; height: 30px; transform: translateX(-1px); }
+        .family-tree ul ul::before { content: ''; position: absolute; top: 0; left: 50%; border-left: 2px solid #c9a97a; width: 0; height: 30px; transform: translateX(-1px); }
       `}} />
 
       <div
@@ -391,7 +475,18 @@ export default function TreePage() {
           </div>
         )}
 
-        {treeState.status === "ready" && (
+        {treeState.status === "ready" && viewMode === "3d" && (
+          <div className="absolute inset-0 z-10">
+            <Suspense fallback={<AsyncState state="loading" title="Loading 3D family tree" />}>
+              <FamilyTree3D
+                tree={tree}
+                onUnavailable={handleThreeDimensionalUnavailable}
+              />
+            </Suspense>
+          </div>
+        )}
+
+        {treeState.status === "ready" && viewMode === "2d" && (
           <TransformWrapper
             initialScale={1}
             minScale={0.2}

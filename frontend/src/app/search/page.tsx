@@ -1,253 +1,269 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchMembers, type Member } from "@/lib/api";
-import AsyncState from "@/components/feedback/AsyncState";
-import { asApiProblem, type Loadable } from "@/lib/loadable";
 import Link from "next/link";
-import {
-  Search as SearchIcon,
-  User,
-  MapPin,
-  Filter,
-  X,
-  Heart,
-} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Filter, Heart, MapPin, Search as SearchIcon, User, X } from "lucide-react";
+
+import AsyncState from "@/components/feedback/AsyncState";
+import TiltCard from "@/components/ui/TiltCard";
+import { searchMembers, type Member, type SearchFilters } from "@/lib/api";
+import { asApiProblem } from "@/lib/loadable";
+import type { ApiProblem } from "@/lib/http";
+
+const DEBOUNCE_MS = 300;
+
+type SearchState =
+  | { status: "idle" }
+  | { status: "ready"; data: Member[]; requestKey: string }
+  | { status: "empty"; data: Member[]; requestKey: string }
+  | { status: "error"; problem: ApiProblem; requestKey: string };
 
 export default function SearchPage() {
-  const [memberState, setMemberState] = useState<Loadable<Member[]>>({ status: "loading" });
-  const memberRequest = useRef(0);
+  const [resultState, setResultState] = useState<SearchState>({ status: "idle" });
+  const resultRequest = useRef(0);
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [filterCity, setFilterCity] = useState("");
   const [filterBranch, setFilterBranch] = useState("");
   const [filterGeneration, setFilterGeneration] = useState("");
+  const [retryNonce, setRetryNonce] = useState(0);
 
-  const loadMembers = useCallback(() => {
-    const request = ++memberRequest.current;
-    fetchMembers().then(
+  const filters = useMemo<SearchFilters>(() => {
+    const next: SearchFilters = {};
+    const city = filterCity.trim();
+    const branch = filterBranch.trim();
+    const generation = filterGeneration.trim();
+    if (city) next.city = city;
+    if (branch) next.branch = branch;
+    if (generation) next.generation = generation;
+    return next;
+  }, [filterBranch, filterCity, filterGeneration]);
+
+  const hasFilters = Object.keys(filters).length > 0;
+  const trimmedQuery = query.trim();
+  const trimmedDebouncedQuery = debouncedQuery.trim();
+  const hasActiveQuery = trimmedQuery.length >= 2;
+  const shouldShowSearch = hasActiveQuery || hasFilters;
+  const canRequest = trimmedDebouncedQuery.length >= 2 || hasFilters;
+  const requestKey = useMemo(
+    () => JSON.stringify([trimmedDebouncedQuery, filters, retryNonce]),
+    [filters, retryNonce, trimmedDebouncedQuery],
+  );
+
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedQuery(query), DEBOUNCE_MS);
+    return () => clearTimeout(handle);
+  }, [query]);
+
+  useEffect(() => {
+    if (!canRequest) {
+      resultRequest.current += 1;
+      return;
+    }
+
+    const request = ++resultRequest.current;
+    searchMembers(trimmedDebouncedQuery, filters).then(
       (data) => {
-        if (request !== memberRequest.current) return;
-        setMemberState(data.length > 0 ? { status: "ready", data } : { status: "empty", data });
+        if (request !== resultRequest.current) return;
+        setResultState(
+          data.length > 0
+            ? { status: "ready", data, requestKey }
+            : { status: "empty", data, requestKey },
+        );
       },
       (error: unknown) => {
-        if (request !== memberRequest.current) return;
-        setMemberState({
+        if (request !== resultRequest.current) return;
+        setResultState({
           status: "error",
           problem: asApiProblem(error, "The family directory could not be loaded."),
+          requestKey,
         });
       },
     );
-  }, []);
 
-  useEffect(() => {
-    loadMembers();
     return () => {
-      memberRequest.current += 1;
+      if (request === resultRequest.current) resultRequest.current += 1;
     };
-  }, [loadMembers]);
+  }, [canRequest, filters, requestKey, trimmedDebouncedQuery]);
 
-  const retryMembers = () => {
-    setMemberState({ status: "loading" });
-    loadMembers();
+  const isDebouncing = trimmedQuery !== trimmedDebouncedQuery;
+  const isLoading =
+    shouldShowSearch &&
+    (isDebouncing || resultState.status === "idle" || resultState.requestKey !== requestKey);
+  const visibleState: SearchState | { status: "loading" } = !shouldShowSearch
+    ? { status: "idle" }
+    : isLoading
+      ? { status: "loading" }
+      : resultState;
+  const members = "data" in visibleState ? visibleState.data : [];
+
+  const clearFilters = () => {
+    setFilterCity("");
+    setFilterBranch("");
+    setFilterGeneration("");
   };
 
-  const members = useMemo(
-    () => ("data" in memberState ? memberState.data : []),
-    [memberState],
-  );
-
-  const cities = useMemo(
-    () => [...new Set(members.map((m) => m.CurrentCity).filter(Boolean))].sort(),
-    [members]
-  );
-  const branches = useMemo(
-    () => [...new Set(members.map((m) => m.Branch).filter(Boolean))].sort(),
-    [members]
-  );
-  const generations = useMemo(
-    () =>
-      [...new Set(members.map((m) => m.Generation).filter((g) => g !== undefined && g !== null))]
-        .sort((a, b) => (a as number) - (b as number)),
-    [members]
-  );
-
-  const filtered = useMemo(() => {
-    return members.filter((m) => {
-      const matchesQuery =
-        !query ||
-        (m.FullName || "").toLowerCase().includes(query.toLowerCase()) ||
-        (m.FatherName || "").toLowerCase().includes(query.toLowerCase());
-      const matchesCity = !filterCity || m.CurrentCity === filterCity;
-      const matchesBranch = !filterBranch || m.Branch === filterBranch;
-      const matchesGen = !filterGeneration || String(m.Generation) === filterGeneration;
-      return matchesQuery && matchesCity && matchesBranch && matchesGen;
-    });
-  }, [members, query, filterCity, filterBranch, filterGeneration]);
-
-  const hasFilters = filterCity || filterBranch || filterGeneration;
-
   return (
-    <div className="mx-auto max-w-4xl px-5 sm:px-8 py-12 sm:py-16">
+    <div className="mx-auto max-w-4xl px-5 py-12 sm:px-8 sm:py-16">
       <div className="mb-10 animate-fadeInUp">
-        <p className="text-accent text-sm font-medium uppercase tracking-wide mb-2 flex items-center gap-2">
-          <span className="w-6 h-px bg-accent" />
+        <p className="mb-2 flex items-center gap-2 text-sm font-medium uppercase tracking-wide text-accent">
+          <span className="h-px w-6 bg-accent" />
           Directory
         </p>
-        <h1 className="heading-serif text-3xl sm:text-4xl font-bold mb-3">
-          Search & Discover
+        <h1 className="heading-serif mb-3 text-3xl font-bold sm:text-4xl">
+          Search &amp; Discover
         </h1>
-        <p className="text-text-muted text-base">
-          Find any family member by name, location, or generation.
+        <p className="text-base text-text-muted">
+          Find family members by name, location, branch, or generation.
         </p>
       </div>
 
-      {/* Search */}
-      <div className="heritage-card p-4 mb-5">
+      <div className="heritage-card mb-5 p-4">
         <div className="relative">
-          <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-text-light" />
+          <SearchIcon className="absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-text-light" />
           <input
-            type="text"
+            type="search"
             aria-label="Search by name"
             placeholder="Search by name..."
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(event) => setQuery(event.target.value)}
             className="input-heritage"
             style={{ paddingLeft: "2.75rem" }}
           />
         </div>
       </div>
 
-      {/* Filters */}
-      <div className="flex flex-wrap items-center gap-2.5 mb-8">
-        <Filter className="w-3.5 h-3.5 text-text-light" />
-        <select
+      <div className="mb-8 grid min-w-0 grid-cols-1 items-center gap-2.5 sm:grid-cols-3 lg:grid-cols-[auto_repeat(3,minmax(0,1fr))_auto_auto]">
+        <Filter className="hidden h-3.5 w-3.5 text-text-light lg:block" />
+        <input
+          type="text"
           aria-label="City"
+          placeholder="City"
           value={filterCity}
-          onChange={(e) => setFilterCity(e.target.value)}
-          className="input-heritage w-auto text-[13px] py-2"
-        >
-          <option value="">All Cities</option>
-          {cities.map((city) => (
-            <option key={city} value={city}>{city}</option>
-          ))}
-        </select>
-
-        {branches.length > 0 && (
-          <select
-            aria-label="Branch"
-            value={filterBranch}
-            onChange={(e) => setFilterBranch(e.target.value)}
-            className="input-heritage w-auto text-[13px] py-2"
-          >
-            <option value="">All Branches</option>
-            {branches.map((b) => (
-              <option key={b} value={b}>{b}</option>
-            ))}
-          </select>
-        )}
-
-        {generations.length > 0 && (
-          <select
-            aria-label="Generation"
-            value={filterGeneration}
-            onChange={(e) => setFilterGeneration(e.target.value)}
-            className="input-heritage w-auto text-[13px] py-2"
-          >
-            <option value="">All Generations</option>
-            {generations.map((gen) => (
-              <option key={gen} value={String(gen)}>Gen {gen}</option>
-            ))}
-          </select>
-        )}
+          onChange={(event) => setFilterCity(event.target.value)}
+          className="input-heritage min-w-0 py-2 text-[13px]"
+        />
+        <input
+          type="text"
+          aria-label="Branch"
+          placeholder="Branch"
+          value={filterBranch}
+          onChange={(event) => setFilterBranch(event.target.value)}
+          className="input-heritage min-w-0 py-2 text-[13px]"
+        />
+        <input
+          type="number"
+          min="1"
+          inputMode="numeric"
+          aria-label="Generation"
+          placeholder="Generation"
+          value={filterGeneration}
+          onChange={(event) => setFilterGeneration(event.target.value)}
+          className="input-heritage min-w-0 py-2 text-[13px]"
+        />
 
         {hasFilters && (
           <button
-            onClick={() => {
-              setFilterCity("");
-              setFilterBranch("");
-              setFilterGeneration("");
-            }}
-            className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-terracotta hover:bg-terracotta-light rounded-lg transition-heritage"
+            type="button"
+            onClick={clearFilters}
+            className="flex items-center justify-center gap-1 rounded-lg px-2.5 py-2 text-xs text-terracotta transition-heritage hover:bg-terracotta-light"
           >
-            <X className="w-3 h-3" />
+            <X className="h-3 w-3" />
             Clear
           </button>
         )}
 
-        <span className="ml-auto text-xs text-text-light">
-          {memberState.status === "ready" || memberState.status === "empty"
-            ? `${filtered.length} result${filtered.length !== 1 ? "s" : ""}`
-            : "Results unavailable"}
+        <span className="text-xs text-text-light sm:col-span-3 lg:col-span-1 lg:ml-auto">
+          {visibleState.status === "ready" || visibleState.status === "empty"
+            ? `${members.length} result${members.length === 1 ? "" : "s"}`
+            : visibleState.status === "loading"
+              ? "Searching..."
+              : visibleState.status === "error"
+                ? "Results unavailable"
+                : "No search yet"}
         </span>
       </div>
 
-      {memberState.status === "loading" && (
-        <AsyncState state="loading" title="Loading family directory" />
+      {visibleState.status === "idle" && (
+        <div className="heritage-card p-10 text-center sm:p-14">
+          <SearchIcon className="mx-auto mb-4 h-10 w-10 text-text-light" />
+          <h2 className="mb-2 font-serif text-xl font-semibold">Search by name or filter</h2>
+          <p className="text-sm text-text-muted">
+            Enter at least 2 characters or add a filter.
+          </p>
+        </div>
       )}
 
-      {memberState.status === "error" && (
+      {visibleState.status === "loading" && (
+        <AsyncState state="loading" title="Searching family directory" />
+      )}
+
+      {visibleState.status === "error" && (
         <AsyncState
           state="error"
           title="Directory unavailable"
-          message={memberState.problem.message}
+          message={visibleState.problem.message}
           actionLabel="Retry"
-          onAction={retryMembers}
+          onAction={() => setRetryNonce((nonce) => nonce + 1)}
         />
       )}
 
-      {memberState.status === "empty" && (
-        <div className="heritage-card p-14 text-center">
-          <User className="w-10 h-10 mx-auto mb-4 text-text-light" />
-          <h2 className="font-serif text-xl font-semibold mb-2">No family members yet</h2>
-          <p className="text-text-muted text-sm">The family directory has no records yet.</p>
+      {visibleState.status === "empty" && (
+        <div className="heritage-card p-10 text-center sm:p-14">
+          <User className="mx-auto mb-4 h-10 w-10 text-text-light" />
+          <h2 className="mb-2 font-serif text-xl font-semibold">No matching members</h2>
+          <p className="text-sm text-text-muted">Try a different search or filter.</p>
         </div>
       )}
 
-      {memberState.status === "ready" && filtered.length === 0 && (
-        <div className="heritage-card p-14 text-center">
-          <User className="w-10 h-10 mx-auto mb-4 text-text-light" />
-          <h2 className="font-serif text-xl font-semibold mb-2">No matching members</h2>
-          <p className="text-text-muted text-sm">Try a different search or filter.</p>
-        </div>
-      )}
-
-      {memberState.status === "ready" && filtered.length > 0 && (
-        <div className="space-y-2.5 stagger-children">
-          {filtered.map((member) => (
-            <Link key={member.id} href={`/member/${member.id}`} className="group block">
-              <div className="heritage-card p-4 flex items-center gap-4">
-                <div className="w-11 h-11 rounded-xl bg-accent/8 flex items-center justify-center text-base font-serif font-bold text-accent flex-shrink-0 group-hover:bg-accent group-hover:text-white transition-heritage">
-                  {(member.FullName || "?")[0]}
+      {visibleState.status === "ready" && members.length > 0 && (
+        <div className="stagger-children space-y-2.5">
+          {members.map((member) => (
+            <div key={member.id} className="group min-w-0">
+              <TiltCard maxTilt={5} className="min-w-0 rounded-lg">
+                <div className="heritage-card min-w-0 p-4">
+                  <Link
+                    href={`/member/${member.id}`}
+                    className="grid min-w-0 grid-cols-[2.75rem_minmax(0,1fr)] items-start gap-3 sm:gap-4"
+                  >
+                    <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-lg bg-accent/8 font-serif text-base font-bold text-accent transition-heritage group-hover:bg-accent group-hover:text-white">
+                      {(member.FullName || "?")[0]}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm font-semibold text-text-primary">
+                        <span className="min-w-0 break-words">
+                          {member.FullName || "Unknown"}
+                        </span>
+                        {member.IsAlive && (
+                          <Heart className="h-3 w-3 flex-shrink-0 fill-emerald text-emerald" />
+                        )}
+                      </div>
+                      <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text-muted">
+                        {member.FatherName && (
+                          <span className="min-w-0 break-words">s/o {member.FatherName}</span>
+                        )}
+                        {member.CurrentCity && (
+                          <span className="flex min-w-0 max-w-full items-start gap-1 break-words">
+                            <MapPin className="mt-0.5 h-3 w-3 flex-shrink-0" />
+                            {member.CurrentCity}
+                          </span>
+                        )}
+                        {member.Generation && (
+                          <span className="rounded bg-bg-secondary px-1.5 py-0.5 text-[11px] text-text-muted">
+                            Gen {member.Generation}
+                          </span>
+                        )}
+                        {member.Branch && (
+                          <span className="min-w-0 break-words rounded bg-accent/6 px-1.5 py-0.5 text-[11px] text-accent">
+                            {member.Branch}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </Link>
                 </div>
-                <div className="flex-1 min-w-0">
-                  <div className="font-semibold text-sm text-text-primary truncate flex items-center gap-2">
-                    {member.FullName || "Unknown"}
-                    {member.IsAlive && (
-                      <Heart className="w-3 h-3 text-emerald fill-emerald" />
-                    )}
-                  </div>
-                  <div className="flex items-center gap-3 text-xs text-text-muted mt-0.5">
-                    {member.FatherName && <span>s/o {member.FatherName}</span>}
-                    {member.CurrentCity && (
-                      <span className="flex items-center gap-1">
-                        <MapPin className="w-3 h-3" />
-                        {member.CurrentCity}
-                      </span>
-                    )}
-                    {member.Generation && (
-                      <span className="px-1.5 py-0.5 rounded bg-bg-secondary text-text-muted text-[11px]">
-                        Gen {member.Generation}
-                      </span>
-                    )}
-                    {member.Branch && (
-                      <span className="px-1.5 py-0.5 rounded bg-accent/6 text-accent text-[11px]">
-                        {member.Branch}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </Link>
+              </TiltCard>
+            </div>
           ))}
         </div>
       )}

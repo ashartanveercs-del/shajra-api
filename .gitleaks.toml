@@ -1,0 +1,42 @@
+title = "Shajra secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "shajra-secret-env-fallback"
+description = "Runtime secrets must not have literal environment fallbacks"
+regex = '''(?:ADMIN_PASSWORD(?:_HASH)?|JWT_SECRET|AIRTABLE_PAT|GROQ_API_KEY|CLOUDINARY_URL|MUTATION_PREVIEW_SECRET|UPSTASH_REDIS_REST_TOKEN|REDIS_KEY_HMAC_SECRET)\s*=\s*os\.(?:getenv|environ\.get)\(\s*["'][A-Z0-9_]+["']\s*,\s*["']([^"'\s]{8,})["']'''
+secretGroup = 1
+keywords = [
+  "ADMIN_PASSWORD",
+  "JWT_SECRET",
+  "AIRTABLE_PAT",
+  "GROQ_API_KEY",
+  "CLOUDINARY_URL",
+  "MUTATION_PREVIEW_SECRET",
+  "UPSTASH_REDIS_REST_TOKEN",
+  "REDIS_KEY_HMAC_SECRET",
+]
+
+[[rules]]
+id = "shajra-direct-secret-literal"
+description = "Runtime secret constants must not contain literal values"
+regex = '''(?:ADMIN_PASSWORD(?:_HASH)?|JWT_SECRET|AIRTABLE_PAT|GROQ_API_KEY|CLOUDINARY_URL|MUTATION_PREVIEW_SECRET|UPSTASH_REDIS_REST_TOKEN|REDIS_KEY_HMAC_SECRET)\s*=\s*["']([^"'\s]{8,})["']'''
+secretGroup = 1
+keywords = [
+  "ADMIN_PASSWORD",
+  "JWT_SECRET",
+  "AIRTABLE_PAT",
+  "GROQ_API_KEY",
+  "CLOUDINARY_URL",
+  "MUTATION_PREVIEW_SECRET",
+  "UPSTASH_REDIS_REST_TOKEN",
+  "REDIS_KEY_HMAC_SECRET",
+]
+
+[[allowlists]]
+description = "Python Airtable type annotation is not a credential"
+targetRules = ["airtable-api-key"]
+regexTarget = "line"
+regexes = ['''^\s*airtable_type:\s*AirtableFieldType\s*$''']

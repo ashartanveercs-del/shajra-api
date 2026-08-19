@@ -1,4 +1,4 @@
-import { requestJson } from "./http";
+import { ApiProblem, requestJson } from "./http";
 
 export interface Member {
   id: string;
@@ -141,12 +141,28 @@ export interface MapData {
   arcs: MapArc[];
 }
 
+export interface SearchFilters {
+  city?: string;
+  branch?: string;
+  generation?: string;
+}
+
 export interface ImageUpload {
   url: string;
 }
 
 interface AdminUndoResult {
   action?: string;
+}
+
+export interface AdminUndoStatus {
+  active: boolean;
+  idempotencyKey: string | null;
+}
+
+export interface AdminMutationMetadata {
+  undoAvailable?: boolean;
+  undoWarning?: string;
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -167,8 +183,16 @@ export function fetchMapMarkers(): Promise<MapData> {
   return requestJson<MapData>("/api/map-markers", { cache: "no-store" });
 }
 
-export function searchMembers(query: string): Promise<Member[]> {
-  return requestJson<Member[]>(`/api/search?q=${encodeURIComponent(query)}`, {
+export function searchMembers(
+  query: string,
+  filters: SearchFilters = {},
+): Promise<Member[]> {
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (filters.city) params.set("city", filters.city);
+  if (filters.branch) params.set("branch", filters.branch);
+  if (filters.generation) params.set("generation", filters.generation);
+  return requestJson<Member[]>(`/api/search?${params.toString()}`, {
     cache: "no-store",
   });
 }
@@ -256,8 +280,11 @@ export function fetchPending(token: string): Promise<PendingSubmission[]> {
   });
 }
 
-export function approveSubmission(token: string, recordId: string): Promise<unknown> {
-  return requestJson<unknown>(`/api/admin/approve/${recordId}`, {
+export function approveSubmission(
+  token: string,
+  recordId: string,
+): Promise<AdminMutationMetadata & { status?: string; member?: Member }> {
+  return requestJson<AdminMutationMetadata & { status?: string; member?: Member }>(`/api/admin/approve/${recordId}`, {
     method: "POST",
     headers: authHeaders(token),
   });
@@ -270,8 +297,11 @@ export function rejectSubmission(token: string, recordId: string): Promise<unkno
   });
 }
 
-export function adminCreateMember(token: string, fields: Partial<Member>): Promise<Member> {
-  return requestJson<Member>("/api/admin/members", {
+export function adminCreateMember(
+  token: string,
+  fields: Partial<Member>,
+): Promise<Member & AdminMutationMetadata> {
+  return requestJson<Member & AdminMutationMetadata>("/api/admin/members", {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(fields),
@@ -282,16 +312,19 @@ export function adminUpdateMember(
   token: string,
   recordId: string,
   fields: Partial<Member>,
-): Promise<Member> {
-  return requestJson<Member>(`/api/admin/members/${recordId}`, {
+): Promise<Member & AdminMutationMetadata> {
+  return requestJson<Member & AdminMutationMetadata>(`/api/admin/members/${recordId}`, {
     method: "PUT",
     headers: authHeaders(token),
     body: JSON.stringify(fields),
   });
 }
 
-export function adminDeleteMember(token: string, recordId: string): Promise<unknown> {
-  return requestJson<unknown>(`/api/admin/members/${recordId}`, {
+export function adminDeleteMember(
+  token: string,
+  recordId: string,
+): Promise<AdminMutationMetadata & { status?: string }> {
+  return requestJson<AdminMutationMetadata & { status?: string }>(`/api/admin/members/${recordId}`, {
     method: "DELETE",
     headers: authHeaders(token),
   });
@@ -327,6 +360,7 @@ export interface AdminIntegrations {
   groqConfigured: boolean;
   cloudinaryConfigured: boolean;
   coordinationConfigured: boolean;
+  datastoreMutationsEnabled: boolean;
 }
 
 export function adminFetchIntegrations(token: string): Promise<AdminIntegrations> {
@@ -346,11 +380,48 @@ export function uploadImage(file: File): Promise<ImageUpload> {
 
 // ── Admin: Undo / Heal ──────────────────────────────────────────────
 
-export function adminUndo(token: string): Promise<AdminUndoResult> {
-  return requestJson<AdminUndoResult>("/api/admin/undo", {
-    method: "POST",
+const ADMIN_UNDO_REQUEST_KEY = "shajra:admin-undo-request";
+
+export function adminGetUndoStatus(token: string): Promise<AdminUndoStatus> {
+  return requestJson<AdminUndoStatus>("/api/admin/undo/status", {
     headers: authHeaders(token),
   });
+}
+
+async function currentUndoRequestId(token: string): Promise<string> {
+  const status = await adminGetUndoStatus(token);
+  if (status.active && status.idempotencyKey) {
+    sessionStorage.setItem(ADMIN_UNDO_REQUEST_KEY, status.idempotencyKey);
+    return status.idempotencyKey;
+  }
+
+  const existing = sessionStorage.getItem(ADMIN_UNDO_REQUEST_KEY);
+  if (existing) return existing;
+
+  const requestId = globalThis.crypto.randomUUID();
+  sessionStorage.setItem(ADMIN_UNDO_REQUEST_KEY, requestId);
+  return requestId;
+}
+
+export async function adminUndo(token: string): Promise<AdminUndoResult> {
+  const requestId = await currentUndoRequestId(token);
+  let result: AdminUndoResult;
+  try {
+    result = await requestJson<AdminUndoResult>("/api/admin/undo", {
+      method: "POST",
+      headers: {
+        ...authHeaders(token),
+        "X-Idempotency-Key": requestId,
+      },
+    });
+  } catch (error: unknown) {
+    if (error instanceof ApiProblem && error.status === 404 && error.code === "UNDO_EMPTY") {
+      sessionStorage.removeItem(ADMIN_UNDO_REQUEST_KEY);
+    }
+    throw error;
+  }
+  sessionStorage.removeItem(ADMIN_UNDO_REQUEST_KEY);
+  return result;
 }
 
 export function adminGetHistory(token: string): Promise<unknown[]> {

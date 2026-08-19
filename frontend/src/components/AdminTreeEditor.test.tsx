@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -150,6 +150,195 @@ describe("AdminTreeEditor reliability states", () => {
     expect(screen.getByRole("alert")).not.toHaveTextContent("secret-token");
     expect(alertSpy).not.toHaveBeenCalled();
     alertSpy.mockRestore();
+  });
+
+  it("sends a spouse change as one server-side relationship command", async () => {
+    apiMocks.fetchTree.mockResolvedValue([
+      {
+        id: "member-a",
+        FullName: "Member Alpha",
+        Gender: "Male",
+        SpouseRecordId: "member-b",
+        Spouse: { id: "member-b", FullName: "Member Beta", Gender: "Female" },
+        children: [],
+      },
+      { id: "member-c", FullName: "Member Gamma", Gender: "Female", children: [] },
+    ]);
+    apiMocks.adminUpdateMember.mockResolvedValue({});
+    const user = userEvent.setup();
+
+    render(<AdminTreeEditor token="admin-token" />);
+    await user.click(await screen.findByRole("button", { name: "Edit Member Alpha" }));
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Spouse (link to existing member)" }),
+      "member-c",
+    );
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Edit Member Info" })).not.toBeInTheDocument();
+    });
+    expect(apiMocks.adminUpdateMember).toHaveBeenCalledOnce();
+    expect(apiMocks.adminUpdateMember).toHaveBeenCalledWith(
+      "admin-token",
+      "member-a",
+      expect.objectContaining({ SpouseRecordId: "member-c", SpouseName: "" }),
+    );
+  });
+
+  it("reports mutation undo metadata to the admin dashboard", async () => {
+    const result = {
+      id: "member-a",
+      undoAvailable: false,
+      undoWarning: "The change was saved without durable history.",
+    };
+    apiMocks.fetchTree.mockResolvedValue([
+      { id: "member-a", FullName: "Member Alpha", Gender: "Male", children: [] },
+    ]);
+    apiMocks.adminUpdateMember.mockResolvedValue(result);
+    const onUpdated = vi.fn();
+    const user = userEvent.setup();
+
+    render(<AdminTreeEditor token="admin-token" onUpdated={onUpdated} />);
+    await user.click(await screen.findByRole("button", { name: "Edit Member Alpha" }));
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(onUpdated).toHaveBeenCalledWith(result));
+  });
+
+  it("offers only real gender-matched non-descendants as structural parents", async () => {
+    apiMocks.fetchTree.mockResolvedValue([
+      {
+        id: "edited",
+        FullName: "Edited Member",
+        Gender: "Male",
+        children: [
+          {
+            id: "son",
+            FullName: "Descendant Son",
+            Gender: "Male",
+            FatherRecordId: "edited",
+            children: [
+              {
+                id: "granddaughter",
+                FullName: "Descendant Granddaughter",
+                Gender: "Female",
+                FatherRecordId: "son",
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+      { id: "valid-father", FullName: "Valid Father", Gender: "Male", children: [] },
+      { id: "valid-mother", FullName: "Valid Mother", Gender: "Female", children: [] },
+      { id: "unknown-gender", FullName: "Unknown Gender", children: [] },
+      {
+        id: "__name__edited__father",
+        FullName: "Name-only Father",
+        Gender: "Male",
+        IsPlaceholder: true,
+        children: [],
+      },
+      {
+        id: "placeholder-mother",
+        FullName: "Placeholder Mother",
+        Gender: "Female",
+        IsPlaceholder: true,
+        children: [],
+      },
+    ]);
+    const user = userEvent.setup();
+
+    render(<AdminTreeEditor token="admin-token" />);
+    await user.click(await screen.findByRole("button", { name: "Edit Edited Member" }));
+
+    const fatherOptions = within(
+      screen.getByRole("combobox", { name: "Structural Father" }),
+    ).getAllByRole("option");
+    const motherOptions = within(
+      screen.getByRole("combobox", { name: "Structural Mother" }),
+    ).getAllByRole("option");
+
+    expect(fatherOptions.map((option) => option.textContent)).toEqual([
+      "No father",
+      "Valid Father",
+    ]);
+    expect(motherOptions.map((option) => option.textContent)).toEqual([
+      "No mother",
+      "Valid Mother",
+    ]);
+  });
+
+  it("keeps linked and name-only spouse inputs mutually exclusive", async () => {
+    apiMocks.fetchTree.mockResolvedValue([
+      {
+        id: "member-a",
+        FullName: "Member Alpha",
+        Gender: "Male",
+        SpouseRecordId: "member-b",
+        SpouseName: "Member Beta",
+        Spouse: { id: "member-b", FullName: "Member Beta", Gender: "Female" },
+        children: [],
+      },
+      { id: "member-c", FullName: "Member Gamma", Gender: "Female", children: [] },
+    ]);
+    apiMocks.adminUpdateMember.mockResolvedValue({});
+    const user = userEvent.setup();
+
+    render(<AdminTreeEditor token="admin-token" />);
+    await user.click(await screen.findByRole("button", { name: "Edit Member Alpha" }));
+
+    const spouseSelect = screen.getByRole("combobox", {
+      name: "Spouse (link to existing member)",
+    });
+    const spouseName = screen.getByRole("textbox", { name: "Spouse Name (if not in tree)" });
+
+    expect(spouseName).toBeDisabled();
+    await user.selectOptions(spouseSelect, "member-c");
+    expect(spouseName).toHaveValue("");
+    expect(spouseName).toBeDisabled();
+
+    await user.selectOptions(spouseSelect, "");
+    expect(spouseName).toBeEnabled();
+    await user.type(spouseName, "Unlisted Partner");
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(apiMocks.adminUpdateMember).toHaveBeenCalledWith(
+      "admin-token",
+      "member-a",
+      expect.objectContaining({
+        SpouseRecordId: "",
+        SpouseName: "Unlisted Partner",
+      }),
+    );
+  });
+
+  it("unlinks spouses with one server-side relationship command", async () => {
+    apiMocks.fetchTree.mockResolvedValue([
+      {
+        id: "member-a",
+        FullName: "Member Alpha",
+        Gender: "Male",
+        SpouseRecordId: "member-b",
+        Spouse: { id: "member-b", FullName: "Member Beta", Gender: "Female" },
+        children: [],
+      },
+    ]);
+    apiMocks.adminUpdateMember.mockResolvedValue({});
+    const user = userEvent.setup();
+
+    render(<AdminTreeEditor token="admin-token" />);
+    await user.click(
+      await screen.findByRole("button", { name: "Unlink Member Alpha and Member Beta" }),
+    );
+
+    await waitFor(() => expect(apiMocks.fetchTree).toHaveBeenCalledTimes(2));
+    expect(apiMocks.adminUpdateMember).toHaveBeenCalledOnce();
+    expect(apiMocks.adminUpdateMember).toHaveBeenCalledWith("admin-token", "member-a", {
+      SpouseRecordId: "",
+      SpouseName: "",
+    });
   });
 
   it("ignores a late upload result after another member draft opens", async () => {

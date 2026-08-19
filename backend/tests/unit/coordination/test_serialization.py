@@ -28,6 +28,7 @@ RUNTIME_SETTINGS = {
     "upstash_redis_rest_token": "upstash-secret-marker",
     "redis_namespace": "preview-1",
     "redis_key_hmac_secret": "hmac-secret-marker",
+    "cors_allowed_origins": "https://synthetic.example",
 }
 
 
@@ -275,6 +276,14 @@ def test_hmac_key_topology_is_domain_separated_colocated_and_contains_no_raw_sec
         ),
         keys.rate_nonce("actor@example.com"),
     }
+    history_keys = {
+        keys.history_entries(),
+        keys.history_active(),
+        keys.history_write_guard(),
+        keys.history_claim("actor@example.com"),
+        keys.history_result("actor@example.com"),
+        keys.history_context("actor@example.com"),
+    }
 
     def tag(value: str) -> str:
         return re.search(r"\{[^}]+\}", value).group(0)  # type: ignore[union-attr]
@@ -283,6 +292,7 @@ def test_hmac_key_topology_is_domain_separated_colocated_and_contains_no_raw_sec
     assert len({tag(value) for value in generic_keys}) == 1
     assert {tag(value) for value in revocation_keys} == {"{sj:v1:prod-1:revocation}"}
     assert {tag(value) for value in rate_keys} == {"{sj:v1:prod-1:rate}"}
+    assert {tag(value) for value in history_keys} == {"{sj:v1:prod-1:history}"}
     assert {tag(value) for value in revocation_keys}.isdisjoint(
         {tag(value) for value in rate_keys}
     )
@@ -293,7 +303,7 @@ def test_hmac_key_topology_is_domain_separated_colocated_and_contains_no_raw_sec
     assert keys.graph_acquisition_result("family/private", "same") != (
         keys.generic_acquisition_result("family/private", "same")
     )
-    for key in graph_keys | generic_keys | revocation_keys | rate_keys:
+    for key in graph_keys | generic_keys | revocation_keys | rate_keys | history_keys:
         assert all(raw not in key for raw in raw_values)
 
 

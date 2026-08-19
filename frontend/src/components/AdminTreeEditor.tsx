@@ -29,6 +29,7 @@ import {
   adminUpdateMember,
   fetchTree,
   uploadImage,
+  type AdminMutationMetadata,
   type Member,
 } from "@/lib/api";
 import { asApiProblem, type Loadable } from "@/lib/loadable";
@@ -87,6 +88,42 @@ function flattenTree(nodes: Member[]): Member[] {
     ...flattenTree(node.children ?? []),
   ]);
   return Array.from(new Map(members.map((member) => [member.id, member])).values());
+}
+
+function isSyntheticPlaceholder(member: Member): boolean {
+  return member.IsPlaceholder === true || member.id.startsWith("__name__");
+}
+
+function descendantIds(nodes: Member[], memberId: string): Set<string> {
+  const childrenByParent = new Map<string, Set<string>>();
+  const addChild = (parentId: string | undefined, childId: string) => {
+    if (!parentId || !childId) return;
+    const children = childrenByParent.get(parentId) ?? new Set<string>();
+    children.add(childId);
+    childrenByParent.set(parentId, children);
+  };
+  const visit = (members: Member[]) => {
+    for (const member of members) {
+      addChild(member.FatherRecordId, member.id);
+      addChild(member.MotherRecordId, member.id);
+      for (const child of member.children ?? []) {
+        addChild(member.id, child.id);
+        addChild(member.Spouse?.id, child.id);
+      }
+      visit(member.children ?? []);
+    }
+  };
+  visit(nodes);
+
+  const descendants = new Set<string>();
+  const pending = [...(childrenByParent.get(memberId) ?? [])];
+  while (pending.length > 0) {
+    const childId = pending.pop() as string;
+    if (descendants.has(childId)) continue;
+    descendants.add(childId);
+    pending.push(...(childrenByParent.get(childId) ?? []));
+  }
+  return descendants;
 }
 
 function genderClasses(gender?: string) {
@@ -302,6 +339,7 @@ function memberDraft(member: Member): Partial<Member> {
     FatherName: member.FatherName,
     MotherName: member.MotherName,
     SpouseName: member.SpouseName,
+    SpouseRecordId: member.SpouseRecordId,
     DateOfBirth: member.DateOfBirth,
     DateOfDeath: member.DateOfDeath,
     Gender: member.Gender,
@@ -317,7 +355,7 @@ function memberDraft(member: Member): Partial<Member> {
   };
 }
 
-export default function AdminTreeEditor({ token, onUpdated }: { token: string; onUpdated?: () => void }) {
+export default function AdminTreeEditor({ token, onUpdated }: { token: string; onUpdated?: (result?: AdminMutationMetadata) => void }) {
   const [treeState, setTreeState] = useState<Loadable<Member[]>>({ status: "loading" });
   const [actionLoading, setActionLoading] = useState(false);
   const [actionError, setActionError] = useState("");
@@ -332,6 +370,26 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const tree = useMemo(() => ("data" in treeState ? treeState.data : []), [treeState]);
   const allMembers = useMemo(() => flattenTree(tree), [tree]);
+  const invalidParentIds = useMemo(() => {
+    if (!editingMember) return new Set<string>();
+    return new Set([editingMember.id, ...descendantIds(tree, editingMember.id)]);
+  }, [editingMember, tree]);
+  const fatherCandidates = useMemo(
+    () => allMembers.filter((member) => (
+      member.Gender === "Male" &&
+      !invalidParentIds.has(member.id) &&
+      !isSyntheticPlaceholder(member)
+    )),
+    [allMembers, invalidParentIds],
+  );
+  const motherCandidates = useMemo(
+    () => allMembers.filter((member) => (
+      member.Gender === "Female" &&
+      !invalidParentIds.has(member.id) &&
+      !isSyntheticPlaceholder(member)
+    )),
+    [allMembers, invalidParentIds],
+  );
 
   const modalIsCurrent = useCallback((generation: number, memberId: string) => (
     modalGeneration.current === generation && editingMemberRef.current?.id === memberId
@@ -364,9 +422,9 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     if (editingMember) closeButtonRef.current?.focus();
   }, [editingMember]);
 
-  const refreshAfterWrite = () => {
+  const refreshAfterWrite = (result?: AdminMutationMetadata) => {
     void loadData();
-    onUpdated?.();
+    onUpdated?.(result);
   };
 
   const handlePhotoUpload = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -397,8 +455,8 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     setActionLoading(true);
     setActionError("");
     try {
-      await adminUpdateMember(token, draggedId, updates);
-      refreshAfterWrite();
+      const result = await adminUpdateMember(token, draggedId, updates);
+      refreshAfterWrite(result);
     } catch (error: unknown) {
       setActionError(asApiProblem(error, "The family connection could not be updated.").message);
     } finally {
@@ -414,10 +472,10 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     setActionLoading(true);
     setActionError("");
     try {
-      await adminUpdateMember(token, memberId, editForm);
+      const result = await adminUpdateMember(token, memberId, editForm);
       if (!modalIsCurrent(generation, memberId)) return;
       closeEditor();
-      refreshAfterWrite();
+      refreshAfterWrite(result);
     } catch (error: unknown) {
       if (modalIsCurrent(generation, memberId)) {
         setActionError(asApiProblem(error, "The member changes could not be saved.").message);
@@ -431,10 +489,10 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     setActionLoading(true);
     setActionError("");
     try {
-      await adminUpdateMember(token, id, { FatherRecordId: "", MotherRecordId: "" });
-      refreshAfterWrite();
+      const result = await adminUpdateMember(token, id, { SpouseRecordId: "", SpouseName: "" });
+      refreshAfterWrite(result);
     } catch (error: unknown) {
-      setActionError(asApiProblem(error, "The family connection could not be removed.").message);
+      setActionError(asApiProblem(error, "The marriage could not be removed.").message);
     } finally {
       setActionLoading(false);
     }
@@ -446,8 +504,8 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     setActionLoading(true);
     setActionError("");
     try {
-      await adminDeleteMember(token, id);
-      refreshAfterWrite();
+      const result = await adminDeleteMember(token, id);
+      refreshAfterWrite(result);
     } catch (error: unknown) {
       setActionError(asApiProblem(error, "The member could not be deleted.").message);
     } finally {
@@ -474,6 +532,11 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
       ProfileImageUrl: "",
       ...(parent ? { Generation: (parent.Generation || 1) + 1 } : {}),
       ...(parent ? legacyParentRelationship(parent) : {}),
+      ...(parent
+        ? parent.Gender === "Female"
+          ? { MotherName: parent.FullName, FatherName: parent.Spouse?.FullName || "" }
+          : { FatherName: parent.FullName, MotherName: parent.Spouse?.FullName || "" }
+        : {}),
     };
     openEditor({ id: "new", FullName: "" }, draft, invoker);
   };
@@ -486,10 +549,10 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
     setActionLoading(true);
     setActionError("");
     try {
-      await adminCreateMember(token, editForm);
+      const result = await adminCreateMember(token, editForm);
       if (!modalIsCurrent(generation, memberId)) return;
       closeEditor();
-      refreshAfterWrite();
+      refreshAfterWrite(result);
     } catch (error: unknown) {
       if (modalIsCurrent(generation, memberId)) {
         setActionError(asApiProblem(error, "The member could not be created.").message);
@@ -653,7 +716,7 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
                   <label htmlFor="editor-father" className="mb-1.5 block text-xs font-bold uppercase text-sky">Structural Father</label>
                   <select id="editor-father" value={editForm.FatherRecordId || ""} onChange={(event) => setEditForm((current) => ({ ...current, FatherRecordId: event.target.value }))} className="input-heritage relative z-50 w-full bg-white">
                     <option value="">No father</option>
-                    {allMembers.filter((member) => member.id !== editingMember.id).map((member) => (
+                    {fatherCandidates.map((member) => (
                       <option key={member.id} value={member.id}>{member.FullName}</option>
                     ))}
                   </select>
@@ -662,11 +725,27 @@ export default function AdminTreeEditor({ token, onUpdated }: { token: string; o
                   <label htmlFor="editor-mother" className="mb-1.5 block text-xs font-bold uppercase text-plum">Structural Mother</label>
                   <select id="editor-mother" value={editForm.MotherRecordId || ""} onChange={(event) => setEditForm((current) => ({ ...current, MotherRecordId: event.target.value }))} className="input-heritage relative z-50 w-full bg-white">
                     <option value="">No mother</option>
-                    {allMembers.filter((member) => member.id !== editingMember.id).map((member) => (
+                    {motherCandidates.map((member) => (
                       <option key={member.id} value={member.id}>{member.FullName}</option>
                     ))}
                   </select>
                 </div>
+              </div>
+
+              <div className="rounded-lg border border-amber/25 bg-amber/5 p-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <label htmlFor="editor-spouse" className="text-xs font-bold uppercase text-amber">
+                    Spouse (link to existing member)
+                    <select id="editor-spouse" value={editForm.SpouseRecordId || ""} onChange={(event) => setEditForm((current) => ({ ...current, SpouseRecordId: event.target.value, SpouseName: "" }))} className="input-heritage mt-1.5 w-full bg-white">
+                      <option value="">No spouse</option>
+                      {allMembers.filter((member) => member.id !== editingMember.id && !member.id.startsWith("__name__")).map((member) => (
+                        <option key={member.id} value={member.id}>{member.FullName}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <EditorInput id="editor-spouse-name" label="Spouse Name (if not in tree)" value={editForm.SpouseName} disabled={Boolean(editForm.SpouseRecordId)} onChange={(SpouseName) => setEditForm((current) => ({ ...current, SpouseName, SpouseRecordId: SpouseName.trim() ? "" : current.SpouseRecordId }))} />
+                </div>
+                <p className="mt-2 text-[11px] leading-relaxed text-text-muted">Pick an existing member to link a marriage, or type a name for a spouse not yet in the tree.</p>
               </div>
 
               <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">

@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,6 +13,14 @@ from upstash_url import require_canonical_upstash_url
 
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+VERCEL_PREVIEW_FRONTEND_ORIGIN_REGEX = (
+    r"^https://frontend-(?:[a-z0-9]{9}|git-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)"
+    r"-ashartanveercs-dels-projects\.vercel\.app$"
+)
+DNS_LABEL_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+    re.IGNORECASE | re.ASCII,
+)
 
 
 def _is_missing(value: str | SecretStr | None) -> bool:
@@ -20,6 +29,32 @@ def _is_missing(value: str | SecretStr | None) -> bool:
     if isinstance(value, SecretStr):
         value = value.get_secret_value()
     return not value.strip()
+
+
+def _is_canonical_https_origin(value: str) -> bool:
+    if "*" in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    hostname = parsed.hostname or ""
+    labels = hostname.split(".")
+    return bool(
+        parsed.scheme == "https"
+        and hostname
+        and parsed.netloc == hostname
+        and port is None
+        and len(hostname) <= 253
+        and len(labels) >= 2
+        and all(DNS_LABEL_PATTERN.fullmatch(label) for label in labels)
+        and not parsed.username
+        and not parsed.password
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 class Settings(BaseSettings):
@@ -32,6 +67,7 @@ class Settings(BaseSettings):
     )
 
     app_env: Literal["development", "test", "preview", "production"] = "development"
+    vercel_env: Literal["development", "preview", "production"] | None = None
     airtable_pat: SecretStr | None = None
     airtable_base_id: str | None = None
     groq_api_key: SecretStr | None = None
@@ -75,11 +111,46 @@ class Settings(BaseSettings):
                 r"[a-z0-9]+(?:-[a-z0-9]+)*", self.redis_namespace or ""
             ) or not 1 <= len(self.redis_namespace or "") <= 32:
                 raise ValueError("Invalid REDIS_NAMESPACE")
+        if self.runtime_environment in {"preview", "production"}:
+            origins = self.allowed_origins
+            if not origins or not all(_is_canonical_https_origin(origin) for origin in origins):
+                raise ValueError("Invalid CORS_ALLOWED_ORIGINS")
         return self
 
     @property
     def allowed_origins(self) -> list[str]:
         return [value.strip() for value in self.cors_allowed_origins.split(",") if value.strip()]
+
+    @property
+    def allowed_origin_regex(self) -> str | None:
+        if self.vercel_env != "preview":
+            return None
+        return VERCEL_PREVIEW_FRONTEND_ORIGIN_REGEX
+
+    @property
+    def runtime_environment(self) -> Literal["development", "test", "preview", "production"]:
+        if self.vercel_env in {"preview", "production"}:
+            return self.vercel_env
+        return self.app_env
+
+    @property
+    def environment_mismatch(self) -> bool:
+        return (
+            self.vercel_env in {"preview", "production"}
+            and self.app_env != self.vercel_env
+        )
+
+    @property
+    def effective_public_writes_enabled(self) -> bool:
+        return self.public_writes_enabled and not self.environment_mismatch
+
+    @property
+    def effective_relationship_writes_enabled(self) -> bool:
+        return self.relationship_writes_enabled and not self.environment_mismatch
+
+    @property
+    def effective_normalized_reads_enabled(self) -> bool:
+        return self.normalized_reads_enabled and not self.environment_mismatch
 
 
 @lru_cache

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,7 @@ VALID_RUNTIME_SETTINGS = {
     "upstash_redis_rest_token": "test-upstash-token",
     "redis_namespace": "preview-1",
     "redis_key_hmac_secret": "test-hmac-secret",
+    "cors_allowed_origins": "https://synthetic.example",
 }
 
 REQUIRED_SETTINGS = (
@@ -141,6 +143,84 @@ def test_allowed_origins_trims_and_drops_empty_values():
     )
 
     assert settings.allowed_origins == ["https://one.example", "http://two.example"]
+
+
+def test_vercel_preview_origin_regex_is_preview_only_and_tightly_scoped():
+    preview = Settings(
+        vercel_env="preview",
+        cors_allowed_origins="https://shajraheritage.vercel.app",
+        _env_file=None,
+    )
+    production = Settings(
+        vercel_env="production",
+        cors_allowed_origins="https://shajraheritage.vercel.app",
+        _env_file=None,
+    )
+
+    assert preview.allowed_origin_regex is not None
+    assert production.allowed_origin_regex is None
+
+    allowed = (
+        "https://frontend-6ilwmwtze-ashartanveercs-dels-projects.vercel.app",
+        "https://frontend-git-codex-recover-95ea0c-ashartanveercs-dels-projects.vercel.app",
+    )
+    rejected = (
+        "http://frontend-6ilwmwtze-ashartanveercs-dels-projects.vercel.app",
+        "https://backend-6ilwmwtze-ashartanveercs-dels-projects.vercel.app",
+        "https://frontend-6ilwmwtze-another-team.vercel.app",
+        "https://frontend-6ilwmwtze-ashartanveercs-dels-projects.vercel.app.evil.example",
+        "https://frontend-6ilwmwtze-ashartanveercs-dels-projects.vercel.app:443",
+        "https://frontend-6ilwmwtze-ashartanveercs-dels-projects.vercel.app/tree",
+    )
+
+    assert all(re.fullmatch(preview.allowed_origin_regex, origin) for origin in allowed)
+    assert not any(re.fullmatch(preview.allowed_origin_regex, origin) for origin in rejected)
+
+
+@pytest.mark.parametrize(
+    "invalid_origins",
+    [
+        "",
+        "*",
+        "http://example.com",
+        "https://*.example.com",
+        "https://example.com:443",
+        "https://example.com:bad",
+        "https://example..com",
+        "https://-bad.example",
+        "https://\u0131.example",
+        "https://\u017f.example",
+        "https://example.com/",
+        "https://example.com/path",
+        "https://example.com?query=true",
+        "https://example.com#fragment",
+    ],
+)
+def test_runtime_rejects_noncanonical_cors_origins(invalid_origins):
+    with pytest.raises(ValidationError, match="Invalid CORS_ALLOWED_ORIGINS"):
+        Settings(
+            app_env="preview",
+            **{**VALID_RUNTIME_SETTINGS, "cors_allowed_origins": invalid_origins},
+            _env_file=None,
+        )
+
+
+def test_vercel_environment_mismatch_is_read_only_and_uses_runtime_environment():
+    settings = Settings(
+        app_env="development",
+        vercel_env="production",
+        cors_allowed_origins="https://shajraheritage.vercel.app",
+        public_writes_enabled=True,
+        relationship_writes_enabled=True,
+        normalized_reads_enabled=True,
+        _env_file=None,
+    )
+
+    assert settings.runtime_environment == "production"
+    assert settings.environment_mismatch is True
+    assert settings.effective_public_writes_enabled is False
+    assert settings.effective_relationship_writes_enabled is False
+    assert settings.effective_normalized_reads_enabled is False
 
 
 def test_legacy_compatibility_exports_supply_current_v1_runtime_values():

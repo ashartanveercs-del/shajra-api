@@ -895,7 +895,7 @@ Run all commands from Step 2. Also run:
 
 ```powershell
 git diff --check
-rg -n "railway\.app|shajra-api-production|shajrasecure123|shajra-jwt-secret" . -g '!docs/superpowers/specs/**' -g '!docs/superpowers/plans/**'
+rg -n "railway\.app|shajra-api-production|<historical-admin-password-redacted>|shajra-jwt-secret" . -g '!docs/superpowers/specs/**' -g '!docs/superpowers/plans/**'
 ```
 
 Expected: all gates pass and the secret/fallback scan has no source matches.

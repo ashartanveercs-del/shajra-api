@@ -18,6 +18,7 @@ async function loadApi() {
 
 describe("frontend API contracts", () => {
   afterEach(() => {
+    sessionStorage.clear();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.resetModules();
@@ -53,6 +54,7 @@ describe("frontend API contracts", () => {
       groqConfigured: true,
       cloudinaryConfigured: false,
       coordinationConfigured: false,
+      datastoreMutationsEnabled: false,
     };
     const fetchSpy = vi.fn().mockResolvedValue(jsonResponse(integrations));
     vi.stubGlobal("fetch", fetchSpy);
@@ -65,6 +67,121 @@ describe("frontend API contracts", () => {
         "Content-Type": "application/json",
       },
     });
+  });
+
+  it("reuses an undo idempotency key after an uncertain network failure", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ active: false, idempotencyKey: null }))
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockResolvedValueOnce(jsonResponse({ active: false, idempotencyKey: null }))
+      .mockResolvedValueOnce(jsonResponse({ status: "replayed" }));
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.stubGlobal("crypto", { randomUUID: () => "undo-request-1" });
+    const { adminUndo } = await loadApi();
+
+    await expect(adminUndo("admin-token")).rejects.toThrow("network unavailable");
+    await expect(adminUndo("admin-token")).resolves.toEqual({ status: "replayed" });
+
+    const firstHeaders = fetchSpy.mock.calls[1][1].headers;
+    const secondHeaders = fetchSpy.mock.calls[3][1].headers;
+    expect(firstHeaders["X-Idempotency-Key"]).toBe("undo-request-1");
+    expect(secondHeaders["X-Idempotency-Key"]).toBe("undo-request-1");
+    expect(fetchSpy.mock.calls.map(([input]) => input)).toEqual([
+      `${TEST_API_BASE}/api/admin/undo/status`,
+      `${TEST_API_BASE}/api/admin/undo`,
+      `${TEST_API_BASE}/api/admin/undo/status`,
+      `${TEST_API_BASE}/api/admin/undo`,
+    ]);
+    expect(sessionStorage.getItem("shajra:admin-undo-request")).toBeNull();
+  });
+
+  it("recovers the server's active undo idempotency key in a new tab", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ active: true, idempotencyKey: "server-active-undo" }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ status: "replayed" }));
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.stubGlobal("crypto", { randomUUID: () => "unused-new-undo" });
+    const { adminUndo } = await loadApi();
+
+    await expect(adminUndo("admin-token")).resolves.toEqual({ status: "replayed" });
+
+    expect(fetchSpy).toHaveBeenNthCalledWith(
+      1,
+      `${TEST_API_BASE}/api/admin/undo/status`,
+      {
+        headers: {
+          Authorization: "Bearer admin-token",
+          "Content-Type": "application/json",
+        },
+      },
+    );
+    expect(fetchSpy.mock.calls[1][1].headers["X-Idempotency-Key"]).toBe(
+      "server-active-undo",
+    );
+    expect(sessionStorage.getItem("shajra:admin-undo-request")).toBeNull();
+  });
+
+  it("adopts a server-active undo nonce over a stale browser nonce", async () => {
+    sessionStorage.setItem("shajra:admin-undo-request", "stale-browser-undo");
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ active: true, idempotencyKey: "server-active-undo" }),
+      )
+      .mockRejectedValueOnce(new TypeError("network unavailable"));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { adminUndo } = await loadApi();
+
+    await expect(adminUndo("admin-token")).rejects.toThrow("network unavailable");
+
+    expect(fetchSpy.mock.calls.map(([input]) => input)).toEqual([
+      `${TEST_API_BASE}/api/admin/undo/status`,
+      `${TEST_API_BASE}/api/admin/undo`,
+    ]);
+    expect(fetchSpy.mock.calls[1][1].headers["X-Idempotency-Key"]).toBe(
+      "server-active-undo",
+    );
+    expect(sessionStorage.getItem("shajra:admin-undo-request")).toBe(
+      "server-active-undo",
+    );
+  });
+
+  it("clears a retained undo nonce after the definitive empty-history response", async () => {
+    sessionStorage.setItem("shajra:admin-undo-request", "completed-empty-undo");
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ active: false, idempotencyKey: null }))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            detail: {
+              code: "UNDO_EMPTY",
+              message: "There are no changes to undo.",
+            },
+          },
+          404,
+        ),
+      );
+    vi.stubGlobal("fetch", fetchSpy);
+    const { adminUndo } = await loadApi();
+
+    await expect(adminUndo("admin-token")).rejects.toMatchObject({
+      status: 404,
+      code: "UNDO_EMPTY",
+    });
+
+    expect(fetchSpy.mock.calls.map(([input]) => input)).toEqual([
+      `${TEST_API_BASE}/api/admin/undo/status`,
+      `${TEST_API_BASE}/api/admin/undo`,
+    ]);
+    expect(fetchSpy.mock.calls[1][1].headers["X-Idempotency-Key"]).toBe(
+      "completed-empty-undo",
+    );
+    expect(sessionStorage.getItem("shajra:admin-undo-request")).toBeNull();
   });
 
   it("does not export removed healing or credential-write capabilities", async () => {

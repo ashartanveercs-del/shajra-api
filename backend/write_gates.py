@@ -3,7 +3,7 @@ from fastapi import HTTPException
 
 
 def require_public_writes() -> None:
-    if not get_settings().public_writes_enabled:
+    if not get_settings().effective_public_writes_enabled:
         raise HTTPException(
             status_code=503,
             detail={
@@ -14,7 +14,7 @@ def require_public_writes() -> None:
 
 
 def require_relationship_writes() -> None:
-    if not get_settings().relationship_writes_enabled:
+    if not get_settings().effective_relationship_writes_enabled:
         raise HTTPException(
             status_code=503,
             detail={
